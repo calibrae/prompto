@@ -1,0 +1,32 @@
+[package]
+name = "prompto"
+version = "0.3.0"
+edition = "2024"
+description = "MCP server for homelab power & lifecycle (WOL, virsh) and typed SSH exec"
+license = "MIT"
+repository = "https://github.com/calibrae/prompto"
+
+[dependencies]
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "signal", "sync", "fs", "process", "net", "time"] }
+tokio-util = "0.7"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+schemars = "1.1"
+arc-swap = "1.7"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+mcp-gain = { git = "https://github.com/calibrae/mcp-gain", tag = "v0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

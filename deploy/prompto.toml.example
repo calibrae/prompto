@@ -1,0 +1,25 @@
+# /etc/prompto.toml — host inventory.
+# Each [host.<name>] block is one machine prompto is allowed to talk to.
+# Capabilities are an allowlist — a tool refuses if its capability isn't granted.
+#
+# IPs below use TEST-NET-1 (RFC 5737) — replace with your own.
+
+[host.gpu-rig]
+ip = "192.0.2.12"
+mac = "aa:bb:cc:dd:ee:ff"
+ssh_user = "admin"
+ssh_key  = "/etc/prompto/keys/id_rsa"
+ssh_port = 22
+capabilities = ["wake", "exec", "sudo_exec", "virt"]
+
+[host.workstation]
+ip = "192.0.2.13"
+ssh_user = "admin"
+ssh_key  = "/etc/prompto/keys/id_rsa"
+capabilities = ["exec", "sudo_exec"]
+
+[host.hypervisor]
+ip = "192.0.2.7"
+ssh_user = "admin"
+ssh_key  = "/etc/prompto/keys/id_rsa"
+capabilities = ["exec", "virt"]

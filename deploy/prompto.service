@@ -1,0 +1,44 @@
+[Unit]
+Description=prompto — homelab power/virt/exec MCP server
+Documentation=https://github.com/calibrae/prompto
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prompto
+Group=prompto
+ExecStart=/opt/prompto/bin/prompto
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+EnvironmentFile=-/etc/prompto/env
+Environment=RUST_LOG=prompto=info
+
+# Hardening — prompto needs:
+#  - read access to /etc/prompto/ (inventory + ssh keys)
+#  - exec on the system ssh binary
+#  - UDP broadcast for WOL
+# Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/prompto
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_NET_BROADCAST
+AmbientCapabilities=CAP_NET_BROADCAST
+
+[Install]
+WantedBy=multi-user.target

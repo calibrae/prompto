@@ -1,0 +1,12 @@
+/target
+CLAUDE.md
+resume.sh
+.claude/
+Cargo.lock.bak
+.DS_Store
+*.swp
+.idea/
+.vscode/
+inbox/
+# Local working copy of the deployed inventory — keep IPs/topology out of the public repo.
+deploy/prompto.toml

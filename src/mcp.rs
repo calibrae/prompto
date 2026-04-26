@@ -1,0 +1,540 @@
+//! rmcp tool router for prompto. Every tool body returns
+//! `anyhow::Result<impl Serialize>` and routes through `finish_tool`,
+//! which records one event per call into the gain tracker.
+
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use mcp_gain::Tracker;
+
+use crate::claudemgr::{self, Scope};
+use crate::host;
+use crate::inventory::{Capability, InventoryStore};
+use crate::ssh::SshClient;
+use crate::virt;
+
+#[derive(Clone)]
+pub struct Prompto {
+    inv: InventoryStore,
+    ssh: Arc<SshClient>,
+    tracker: Arc<Tracker>,
+    stop_vm_step: Duration,
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Prompto>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HostArgs {
+    /// Host name as defined in the inventory (e.g. "gpu-rig").
+    pub host: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VmArgs {
+    /// Hypervisor host name in the inventory.
+    pub host: String,
+    /// libvirt domain name (alphanumerics + `-`, `_`, `.` only).
+    pub vm: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VmStopArgs {
+    pub host: String,
+    pub vm: String,
+    /// Per-step timeout in seconds for the dompmsuspend → shutdown → destroy
+    /// chain. Defaults to the server's `PROMPTO_STOP_VM_STEP_SECS`.
+    #[serde(default)]
+    pub step_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VmEnsureUpArgs {
+    pub host: String,
+    pub vm: String,
+    /// Total timeout (seconds) for the host-wake + vm-start sequence to
+    /// succeed end-to-end. Defaults to 180.
+    #[serde(default)]
+    pub total_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExecArgs {
+    pub host: String,
+    /// Command to run on the remote host (interpreted by the remote shell).
+    pub cmd: String,
+    /// Per-command timeout (seconds). Defaults to the server's
+    /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GainArgs {
+    /// Optional lookback window in seconds. Omit to include every event
+    /// in the log.
+    #[serde(default)]
+    pub since_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpClientArgs {
+    /// Inventory host name with the `claude_admin` capability — the
+    /// machine prompto will SSH to in order to run `claude mcp …`.
+    pub client: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpGetArgs {
+    pub client: String,
+    /// MCP server name as registered in the client's `~/.claude.json`.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpAddArgs {
+    pub client: String,
+    /// Name to register the MCP under (e.g. "memqdrant").
+    pub name: String,
+    /// Transport — typically "http" for streamable-HTTP servers, or
+    /// "stdio" for child-process MCPs.
+    pub transport: String,
+    /// URL for HTTP transports, or full executable path for stdio.
+    pub url_or_cmd: String,
+    /// Scope: `user` (default), `project`, or `local`.
+    #[serde(default)]
+    pub scope: Option<Scope>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpRemoveArgs {
+    pub client: String,
+    pub name: String,
+    #[serde(default)]
+    pub scope: Option<Scope>,
+}
+
+#[derive(Serialize)]
+struct WakeResult {
+    host: String,
+    sent_to_mac: String,
+}
+
+#[derive(Serialize)]
+struct VmEnsureUpResult {
+    host_wake: bool,
+    vm_started: bool,
+    final_vm_state: String,
+}
+
+#[tool_router]
+impl Prompto {
+    pub fn new(
+        inv: InventoryStore,
+        ssh: Arc<SshClient>,
+        tracker: Arc<Tracker>,
+        stop_vm_step: Duration,
+    ) -> Self {
+        Self {
+            inv,
+            ssh,
+            tracker,
+            stop_vm_step,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Finalise a tool call: record the event and convert
+    /// `anyhow::Result<T>` to the `CallToolResult`/`McpError` rmcp expects.
+    fn finish_tool<T: serde::Serialize>(
+        &self,
+        tool: &'static str,
+        host: Option<&str>,
+        started: Instant,
+        res: anyhow::Result<T>,
+    ) -> Result<CallToolResult, McpError> {
+        let exec_ms = started.elapsed().as_millis() as u64;
+        match res {
+            Ok(v) => {
+                let payload = serde_json::to_value(&v).unwrap_or_default();
+                let body = payload.to_string();
+                self.tracker
+                    .record(tool, host, true, exec_ms, body.len() as u64);
+                Ok(CallToolResult::success(vec![Content::text(body)]))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.tracker
+                    .record(tool, host, false, exec_ms, msg.len() as u64);
+                Err(McpError::internal_error(msg, None))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Wake a host with a UDP magic packet (broadcast :9). The host's MAC must be in the inventory and the host must have the `wake` capability."
+    )]
+    async fn host_wake(
+        &self,
+        Parameters(args): Parameters<HostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Wake)?;
+            host::wake(host).await?;
+            Ok(WakeResult {
+                host: args.host.clone(),
+                sent_to_mac: host.mac.clone().unwrap_or_default(),
+            })
+        }
+        .await;
+        self.finish_tool("host_wake", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Probe the host's SSH port with a TCP connect. Returns `up` (connected), `unreachable` (refused), or `off` (timed out)."
+    )]
+    async fn host_status(
+        &self,
+        Parameters(args): Parameters<HostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.get(&args.host)?;
+            host::status(host, Duration::from_secs(2)).await
+        }
+        .await;
+        self.finish_tool("host_status", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Shutdown a host via `sudo -n shutdown -h now` over SSH. Requires the `sudo_exec` capability."
+    )]
+    async fn host_sleep(
+        &self,
+        Parameters(args): Parameters<HostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::SudoExec)?;
+            host::sleep(&self.ssh, host).await?;
+            Ok(serde_json::json!({ "host": host_name, "sent": "shutdown -h now" }))
+        }
+        .await;
+        self.finish_tool("host_sleep", Some(&args.host), started, res)
+    }
+
+    #[tool(
+        description = "List all libvirt domains on a host (`virsh list --all`). Requires the `virt` capability."
+    )]
+    async fn vm_list(
+        &self,
+        Parameters(args): Parameters<HostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Virt)?;
+            virt::list(&self.ssh, host).await
+        }
+        .await;
+        self.finish_tool("vm_list", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Get the libvirt state of a single domain (`virsh domstate`). Returns the raw state string (e.g. \"running\", \"shut off\", \"pmsuspended\")."
+    )]
+    async fn vm_state(
+        &self,
+        Parameters(args): Parameters<VmArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Virt)?;
+            let s = virt::domstate(&self.ssh, host, &args.vm).await?;
+            Ok(serde_json::json!({ "host": args.host, "vm": args.vm, "state": s }))
+        }
+        .await;
+        self.finish_tool("vm_state", Some(&host_name), started, res)
+    }
+
+    #[tool(description = "Start a libvirt domain (`virsh start`). Requires `virt`.")]
+    async fn vm_start(
+        &self,
+        Parameters(args): Parameters<VmArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Virt)?;
+            let out = virt::start(&self.ssh, host, &args.vm).await?;
+            Ok(serde_json::json!({ "host": args.host, "vm": args.vm, "stdout": out }))
+        }
+        .await;
+        self.finish_tool("vm_start", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Stop a libvirt domain via the fallback chain: `dompmsuspend disk` (S4 hibernate) → `shutdown` (ACPI) → `destroy` (force kill). Each step has its own timeout. Returns the outcome and the final state. Requires `virt`."
+    )]
+    async fn vm_stop(
+        &self,
+        Parameters(args): Parameters<VmStopArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let step = args
+            .step_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(self.stop_vm_step);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Virt)?;
+            virt::stop(&self.ssh, host, &args.vm, step).await
+        }
+        .await;
+        self.finish_tool("vm_stop", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Wake a host (if needed), start a VM (if needed), and wait until the host is SSH-reachable. Useful as a single call before issuing other work to a VM. Requires `wake` + `virt`."
+    )]
+    async fn vm_ensure_up(
+        &self,
+        Parameters(args): Parameters<VmEnsureUpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let total = Duration::from_secs(args.total_timeout_secs.unwrap_or(180));
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Virt)?;
+
+            let initial = host::status(host, Duration::from_secs(2)).await?;
+            let mut woke = false;
+            if initial.state != "up" {
+                inv.require(&args.host, Capability::Wake)?;
+                host::wake(host).await?;
+                woke = true;
+                host::wait_until_up(host, total).await?;
+            }
+
+            let state_before = virt::domstate(&self.ssh, host, &args.vm).await?;
+            let mut started_vm = false;
+            if state_before != "running" {
+                let _ = virt::start(&self.ssh, host, &args.vm).await?;
+                started_vm = true;
+            }
+            let state_after = virt::domstate(&self.ssh, host, &args.vm).await?;
+
+            Ok(VmEnsureUpResult {
+                host_wake: woke,
+                vm_started: started_vm,
+                final_vm_state: state_after,
+            })
+        }
+        .await;
+        self.finish_tool("vm_ensure_up", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Run a command on a host over SSH and return stdout, stderr, exit code, and timeout flag. Requires `exec`."
+    )]
+    async fn ssh_exec(
+        &self,
+        Parameters(args): Parameters<ExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            self.ssh.exec(host, &args.cmd, to, false).await
+        }
+        .await;
+        self.finish_tool("ssh_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Requires `sudo_exec`."
+    )]
+    async fn ssh_sudo_exec(
+        &self,
+        Parameters(args): Parameters<ExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::SudoExec)?;
+            self.ssh.exec(host, &args.cmd, to, true).await
+        }
+        .await;
+        self.finish_tool("ssh_sudo_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "List MCP servers registered in the target client's `~/.claude.json` (`claude mcp list`). Requires the `claude_admin` capability."
+    )]
+    async fn mcp_list(
+        &self,
+        Parameters(args): Parameters<McpClientArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let raw = claudemgr::list(&self.ssh, host).await?;
+            Ok(serde_json::json!({ "client": args.client, "stdout": raw }))
+        }
+        .await;
+        self.finish_tool("mcp_list", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Show full config for one registered MCP server on a client (`claude mcp get <name>`). Requires `claude_admin`."
+    )]
+    async fn mcp_get(
+        &self,
+        Parameters(args): Parameters<McpGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let raw = claudemgr::get(&self.ssh, host, &args.name).await?;
+            Ok(serde_json::json!({ "client": args.client, "name": args.name, "stdout": raw }))
+        }
+        .await;
+        self.finish_tool("mcp_get", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Register an MCP server on a client (`claude mcp add --transport <transport> --scope <scope> <name> <url|cmd>`). Affects the on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers like `claude -p` (claudecli's per-message path) pick up the change on their next invocation. Requires `claude_admin`."
+    )]
+    async fn mcp_add(
+        &self,
+        Parameters(args): Parameters<McpAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let scope = args.scope.unwrap_or(Scope::User);
+            let out = claudemgr::add(
+                &self.ssh,
+                host,
+                &args.name,
+                &args.transport,
+                &args.url_or_cmd,
+                scope,
+            )
+            .await?;
+            Ok(serde_json::json!({
+                "client": args.client,
+                "name": args.name,
+                "stdout": out,
+            }))
+        }
+        .await;
+        self.finish_tool("mcp_add", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Unregister an MCP server on a client (`claude mcp remove --scope <scope> <name>`). Requires `claude_admin`."
+    )]
+    async fn mcp_remove(
+        &self,
+        Parameters(args): Parameters<McpRemoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let scope = args.scope.unwrap_or(Scope::User);
+            let out = claudemgr::remove(&self.ssh, host, &args.name, scope).await?;
+            Ok(serde_json::json!({
+                "client": args.client,
+                "name": args.name,
+                "stdout": out,
+            }))
+        }
+        .await;
+        self.finish_tool("mcp_remove", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Restart claudecli (the Telegram bridge) on a client. Tries `systemctl --user restart claudecli` first, then falls back to re-spawning the tmux session. Best-effort. Requires `claude_admin`."
+    )]
+    async fn mcp_restart_claudecli(
+        &self,
+        Parameters(args): Parameters<McpClientArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let detail = claudemgr::restart_claudecli(&self.ssh, host).await?;
+            Ok(serde_json::json!({ "client": args.client, "result": detail }))
+        }
+        .await;
+        self.finish_tool("mcp_restart_claudecli", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Token-savings analytics — how much agent context this prompto instance has saved versus an estimated SSH+bash baseline. Pass `since_secs` to bound the lookback window (e.g. 86400 for the last 24h). Returns total + per-tool breakdown."
+    )]
+    async fn prompto_gain(
+        &self,
+        Parameters(args): Parameters<GainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let cutoff = args
+            .since_secs
+            .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s as i64));
+        let res = self.tracker.summary(cutoff);
+        self.finish_tool("prompto_gain", None, started, res)
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Prompto {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_instructions(
+                "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, prompto_gain. \
+                 Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
+                 vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
+                 The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
+                 prompto_gain returns the token-savings summary for this instance. \
+                 Reload the inventory live by sending SIGHUP to the server process."
+                    .to_string(),
+            )
+    }
+}
