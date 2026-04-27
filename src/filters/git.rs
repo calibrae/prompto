@@ -99,6 +99,190 @@ impl CommandFilter for GitShow {
     }
 }
 
+/// Match `git status [...]`. Drops the noisy `(use "git ...")` hint lines
+/// and collapses to `ok` when the working tree is clean. Pure parser —
+/// lifted from RTK (Apache-2.0/MIT, Patrick Szymkowiak).
+pub struct GitStatus;
+
+impl CommandFilter for GitStatus {
+    fn name(&self) -> &'static str {
+        "git_status"
+    }
+
+    fn matches(&self, cmd: &str) -> bool {
+        is_git_subcommand(cmd, "status")
+    }
+
+    fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
+        let mut kept = Vec::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("(use \"git")
+                || trimmed.starts_with("(create/copy files")
+                || trimmed.contains("(use \"git add")
+                || trimmed.contains("(use \"git restore")
+            {
+                continue;
+            }
+            if trimmed.contains("nothing to commit") && trimmed.contains("working tree clean") {
+                return Cow::Owned("ok".to_string());
+            }
+            kept.push(line);
+        }
+        if kept.is_empty() {
+            Cow::Owned("ok".to_string())
+        } else {
+            Cow::Owned(kept.join("\n"))
+        }
+    }
+}
+
+/// Match `git branch [-a|-r|...]`. Highlights current branch, separates
+/// local from remote-only, caps remote-only at 10. Lifted from RTK.
+pub struct GitBranch;
+
+impl CommandFilter for GitBranch {
+    fn name(&self) -> &'static str {
+        "git_branch"
+    }
+
+    fn matches(&self, cmd: &str) -> bool {
+        is_git_subcommand(cmd, "branch")
+    }
+
+    fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
+        let mut current = String::new();
+        let mut local: Vec<String> = Vec::new();
+        let mut remote: Vec<String> = Vec::new();
+        let mut seen_remote: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(branch) = line.strip_prefix("* ") {
+                current = branch.to_string();
+            } else if let Some(rest) = line.strip_prefix("remotes/") {
+                if let Some(slash) = rest.find('/') {
+                    let branch = &rest[slash + 1..];
+                    if branch.starts_with("HEAD ") {
+                        continue;
+                    }
+                    if seen_remote.insert(branch.to_string()) {
+                        remote.push(branch.to_string());
+                    }
+                }
+            } else {
+                local.push(line.to_string());
+            }
+        }
+
+        let mut out = Vec::new();
+        if !current.is_empty() {
+            out.push(format!("* {current}"));
+        }
+        for b in &local {
+            out.push(format!("  {b}"));
+        }
+        let remote_only: Vec<&String> = remote
+            .iter()
+            .filter(|r| *r != &current && !local.contains(r))
+            .collect();
+        if !remote_only.is_empty() {
+            out.push(format!("  remote-only ({}):", remote_only.len()));
+            for b in remote_only.iter().take(10) {
+                out.push(format!("    {b}"));
+            }
+            if remote_only.len() > 10 {
+                out.push(format!("    ... +{} more", remote_only.len() - 10));
+            }
+        }
+        Cow::Owned(out.join("\n"))
+    }
+
+    fn tier(&self, filtered: &str) -> u8 {
+        if filtered.contains("... +") { 2 } else { 1 }
+    }
+}
+
+/// Match `git stash list`. Strips the "WIP on <branch>:" prefix from each
+/// entry. Lifted from RTK.
+pub struct GitStashList;
+
+impl CommandFilter for GitStashList {
+    fn name(&self) -> &'static str {
+        "git_stash_list"
+    }
+
+    fn matches(&self, cmd: &str) -> bool {
+        if !is_git_subcommand(cmd, "stash") {
+            return false;
+        }
+        cmd.split_whitespace().any(|t| t == "list")
+    }
+
+    fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            if let Some(colon) = line.find(": ") {
+                let index = &line[..colon];
+                let rest = &line[colon + 2..];
+                let message = if let Some(second) = rest.find(": ") {
+                    rest[second + 2..].trim()
+                } else {
+                    rest.trim()
+                };
+                out.push(format!("{index}: {message}"));
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        Cow::Owned(out.join("\n"))
+    }
+}
+
+/// Match `git worktree list`. Joins the `path  hash  [branch]` columns
+/// into a normalized one-line-per-worktree shape. Lifted from RTK
+/// (without local-home-dir abbreviation, since prompto runs against
+/// remote hosts).
+pub struct GitWorktreeList;
+
+impl CommandFilter for GitWorktreeList {
+    fn name(&self) -> &'static str {
+        "git_worktree_list"
+    }
+
+    fn matches(&self, cmd: &str) -> bool {
+        if !is_git_subcommand(cmd, "worktree") {
+            return false;
+        }
+        cmd.split_whitespace().any(|t| t == "list")
+    }
+
+    fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let path = parts[0];
+                let hash = parts[1];
+                let branch = parts[2..].join(" ");
+                out.push(format!("{path} {hash} {branch}"));
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        Cow::Owned(out.join("\n"))
+    }
+}
+
 fn cap_lines<'a>(stdout: &'a str, cap: usize, unit: &str) -> Cow<'a, str> {
     let total = stdout.lines().count();
     if total <= cap {
@@ -202,5 +386,70 @@ mod tests {
         // header + 400 + lines = 401 kept (capped to 200), 401 total.
         assert!(out.contains("diff truncated"));
         assert!(out.contains("401 total"));
+    }
+
+    #[test]
+    fn git_status_clean_tree_collapses_to_ok() {
+        let s = "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n";
+        let out = GitStatus.filter("git status", s);
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn git_status_strips_hint_lines() {
+        let s = "On branch main\n\
+                 Changes not staged for commit:\n\
+                   (use \"git add <file>...\" to update what will be committed)\n\
+                   (use \"git restore <file>...\" to discard changes in working directory)\n\
+                 \tmodified:   src/main.rs\n";
+        let out = GitStatus.filter("git status", s);
+        assert!(out.contains("modified:   src/main.rs"));
+        assert!(!out.contains("(use \"git"));
+        assert!(!out.contains("\n\n"));
+    }
+
+    #[test]
+    fn git_branch_groups_remote_only() {
+        let s = "* main\n  feature/x\n  remotes/origin/HEAD -> origin/main\n  remotes/origin/main\n  remotes/origin/feature/y\n";
+        let out = GitBranch.filter("git branch -a", s);
+        assert!(out.contains("* main"));
+        assert!(out.contains("  feature/x"));
+        assert!(out.contains("remote-only (1)"));
+        assert!(out.contains("    feature/y"));
+    }
+
+    #[test]
+    fn git_branch_caps_remote_only_at_10() {
+        let mut s = String::from("* main\n");
+        for i in 0..15 {
+            s.push_str(&format!("  remotes/origin/branch-{i}\n"));
+        }
+        let out = GitBranch.filter("git branch -a", &s);
+        assert!(out.contains("remote-only (15)"));
+        assert!(out.contains("... +5 more"));
+        assert_eq!(GitBranch.tier(&out), 2);
+    }
+
+    #[test]
+    fn git_stash_list_strips_wip_prefix() {
+        let s = "stash@{0}: WIP on main: abc1234 some change\nstash@{1}: On feature: def5678 another change\n";
+        let out = GitStashList.filter("git stash list", s);
+        assert!(out.contains("stash@{0}: abc1234 some change"));
+        assert!(out.contains("stash@{1}: def5678 another change"));
+        assert!(!out.contains("WIP on"));
+    }
+
+    #[test]
+    fn git_stash_list_only_matches_list_subcommand() {
+        assert!(GitStashList.matches("git stash list"));
+        assert!(!GitStashList.matches("git stash"));
+        assert!(!GitStashList.matches("git stash pop"));
+    }
+
+    #[test]
+    fn git_worktree_list_normalizes_columns() {
+        let s = "/repo/main             abc1234 [main]\n/repo/feature-x        def5678 [feature/x]\n";
+        let out = GitWorktreeList.filter("git worktree list", s);
+        assert_eq!(out, "/repo/main abc1234 [main]\n/repo/feature-x def5678 [feature/x]");
     }
 }
