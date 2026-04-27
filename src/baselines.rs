@@ -28,6 +28,10 @@ pub const BASELINES: &[(&str, u32)] = &[
     // back below the baseline, restoring honest savings %.
     ("ssh_exec", 1200),
     ("ssh_sudo_exec", 1300),
+    // script_*: piped-stdin interpreter invocation. Baseline includes the
+    // typical "I tried to ssh+heredoc this and got mangled" round-trip
+    // an agent does today (failed attempt + retry + traceback noise).
+    ("python_exec", 800),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

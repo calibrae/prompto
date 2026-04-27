@@ -104,6 +104,85 @@ impl SshClient {
             }),
         }
     }
+
+    /// Run a remote command and feed `stdin_bytes` into its stdin. Used by
+    /// `script::run` to pipe interpreter scripts (Python, Node, bash, …)
+    /// through SSH without going through shell-argument quoting hell.
+    pub async fn exec_stdin(
+        &self,
+        host: &HostConfig,
+        cmd: &str,
+        stdin_bytes: &[u8],
+        cmd_timeout: Option<Duration>,
+        sudo: bool,
+    ) -> Result<ExecOutput> {
+        use tokio::io::AsyncWriteExt;
+        if cmd.trim().is_empty() {
+            bail!("empty command");
+        }
+        let remote = if sudo {
+            format!("sudo -n -- {cmd}")
+        } else {
+            cmd.to_string()
+        };
+
+        let mut command = Command::new(&self.ssh_bin);
+        command
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!(
+                "ConnectTimeout={}",
+                self.connect_timeout.as_secs().max(1)
+            ))
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-i")
+            .arg(&host.ssh_key)
+            .arg("-p")
+            .arg(host.ssh_port.to_string())
+            .arg(format!("{}@{}", host.ssh_user, host.ip))
+            .arg("--")
+            .arg(&remote)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let dur = cmd_timeout.unwrap_or(self.default_timeout);
+        let mut child = command.spawn().context("spawn ssh")?;
+
+        // Pipe the script in, then close stdin so the interpreter sees EOF.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(stdin_bytes).await {
+                return Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: format!("ssh stdin write failed: {e}"),
+                    exit_code: None,
+                    timed_out: false,
+                });
+            }
+            // Drop closes the pipe.
+            drop(stdin);
+        }
+
+        let waited = timeout(dur, child.wait_with_output()).await;
+        match waited {
+            Ok(Ok(out)) => Ok(ExecOutput {
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                exit_code: out.status.code(),
+                timed_out: false,
+            }),
+            Ok(Err(e)) => Err(e).context("ssh wait_with_output"),
+            Err(_) => Ok(ExecOutput {
+                stdout: String::new(),
+                stderr: format!("ssh command timed out after {}s", dur.as_secs()),
+                exit_code: None,
+                timed_out: true,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

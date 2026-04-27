@@ -19,6 +19,7 @@ use crate::filters::FilterChain;
 use crate::host;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
+use crate::script;
 use crate::ssh::SshClient;
 use crate::virt;
 
@@ -124,6 +125,25 @@ pub struct McpRemoveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PythonExecArgs {
+    /// Inventory host with the `exec` capability.
+    pub host: String,
+    /// Python source code. Sent through SSH stdin, not interpolated into
+    /// a shell — quotes, heredocs, embedded JSON all survive untouched.
+    pub script: String,
+    /// Optional positional arguments. Become `sys.argv[1:]` inside the
+    /// script. Each arg is validated against shell metacharacters and
+    /// must not contain whitespace — pass complex inputs via the script
+    /// body or stdin instead.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Per-command timeout (seconds). Defaults to the server's
+    /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpLogsArgs {
     /// Inventory host where the MCP daemon's systemd unit lives. Must
     /// have the `sudo_exec` capability so journalctl can read the unit
@@ -140,6 +160,21 @@ pub struct McpLogsArgs {
 struct WakeResult {
     host: String,
     sent_to_mac: String,
+}
+
+#[derive(Serialize)]
+struct PythonExecResult {
+    stdout: String,
+    /// Compacted via `script::compact_python_traceback` when a traceback
+    /// is detected — falls back to verbatim stderr otherwise.
+    stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    timed_out: bool,
+    /// `true` if the stderr was compacted from a longer traceback.
+    traceback_compacted: bool,
+    original_stderr_bytes: usize,
+    final_stderr_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -422,6 +457,48 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Run a Python script on a remote host. The script body is piped through SSH stdin, NOT interpolated into a shell — embedded quotes, heredocs, JSON literals, etc. survive untouched, eliminating the quoting hell of `ssh_exec \"python3 -c '...'\"`. Optional `args` become `sys.argv[1:]` inside the script. stderr is auto-compacted to `ExceptionType: message (N frames; last: file:line)` when a Python traceback is detected. Requires `exec`."
+    )]
+    async fn python_exec(
+        &self,
+        Parameters(args): Parameters<PythonExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw = script::run(
+                &self.ssh,
+                host,
+                "python3",
+                &args.script,
+                &args.args,
+                to,
+                false,
+            )
+            .await?;
+            let original_stderr = raw.stderr.len();
+            let compacted = script::compact_python_traceback(&raw.stderr);
+            let traceback_compacted = compacted.len() != original_stderr;
+            let stderr = compacted.into_owned();
+            let final_stderr = stderr.len();
+            Ok(PythonExecResult {
+                stdout: raw.stdout,
+                stderr,
+                exit_code: raw.exit_code,
+                timed_out: raw.timed_out,
+                traceback_compacted,
+                original_stderr_bytes: original_stderr,
+                final_stderr_bytes: final_stderr,
+            })
+        }
+        .await;
+        self.finish_tool("python_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Output is run through the same filter chain as `ssh_exec`. Requires `sudo_exec`."
     )]
     async fn ssh_sudo_exec(
@@ -660,7 +737,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
