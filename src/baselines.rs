@@ -30,6 +30,9 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("mcp_add", 180),
     ("mcp_remove", 140),
     ("mcp_restart_claudecli", 200),
+    ("mcp_status", 280),
+    ("mcp_logs", 600),
+    ("mcp_reconnect_hint", 200),
     // self — no SSH equivalent, baseline 0 → saved 0
     ("prompto_gain", 0),
 ];

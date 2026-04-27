@@ -17,6 +17,7 @@ use mcp_gain::Tracker;
 use crate::claudemgr::{self, Scope};
 use crate::host;
 use crate::inventory::{Capability, InventoryStore};
+use crate::mcpprobe;
 use crate::ssh::SshClient;
 use crate::virt;
 
@@ -118,6 +119,19 @@ pub struct McpRemoveArgs {
     pub name: String,
     #[serde(default)]
     pub scope: Option<Scope>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpLogsArgs {
+    /// Inventory host where the MCP daemon's systemd unit lives. Must
+    /// have the `sudo_exec` capability so journalctl can read the unit
+    /// scope.
+    pub host: String,
+    /// systemd unit name (e.g. "memqdrant", "bucciarati", "prompto").
+    pub unit: String,
+    /// Lines to tail. Clamped server-side to 1..=1000. Default 50.
+    #[serde(default)]
+    pub lines: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -505,6 +519,88 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Health-check every MCP server registered on a client. Reads `claude mcp list` from the client, then probes each entry's URL directly from prompto's host (TCP connect within ~500ms). Distinguishes 'configured but unreachable' (real outage — daemon down or network broken) from 'configured and reachable' (just a stale session — `/mcp` or a fresh `claude -p` will fix it). Requires `claude_admin` on the target client."
+    )]
+    async fn mcp_status(
+        &self,
+        Parameters(args): Parameters<McpClientArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let client = args.client.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let raw = claudemgr::list(&self.ssh, host).await?;
+            let entries = mcpprobe::parse_mcp_list(&raw);
+
+            let mut probes = Vec::with_capacity(entries.len());
+            for e in &entries {
+                probes.push(mcpprobe::probe(e, Duration::from_millis(500)).await);
+            }
+
+            let total = probes.len();
+            let reachable = probes.iter().filter(|p| p.tcp_reachable).count();
+            let unreachable = probes
+                .iter()
+                .filter(|p| !p.tcp_reachable && !p.skipped)
+                .count();
+            let skipped = probes.iter().filter(|p| p.skipped).count();
+            Ok(serde_json::json!({
+                "client": args.client,
+                "total": total,
+                "reachable": reachable,
+                "unreachable": unreachable,
+                "skipped": skipped,
+                "servers": probes,
+            }))
+        }
+        .await;
+        self.finish_tool("mcp_status", Some(&client), started, res)
+    }
+
+    #[tool(
+        description = "Tail the systemd journal of a service on a host (`sudo -n journalctl -u <unit> -n <lines> --no-pager`). Use this to inspect why an MCP daemon (memqdrant, bucciarati, prompto, etc.) is misbehaving. Requires the `sudo_exec` capability on the target. `lines` defaults to 50 and is clamped to 1..=1000."
+    )]
+    async fn mcp_logs(
+        &self,
+        Parameters(args): Parameters<McpLogsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let lines = args.lines.unwrap_or(50);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::SudoExec)?;
+            let stdout = claudemgr::journalctl_tail(&self.ssh, host, &args.unit, lines).await?;
+            Ok(serde_json::json!({
+                "host": args.host,
+                "unit": args.unit,
+                "lines": lines,
+                "stdout": stdout,
+            }))
+        }
+        .await;
+        self.finish_tool("mcp_logs", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Returns advice on how to recover from an MCP-server disconnect. There is no in-session re-handshake API in Claude Code today — interactive sessions need `/mcp`, while stateless callers (claudecli's `claude -p`) refresh on every message. Surface this hint to the user when `mcp_status` reports a server as reachable but their tool calls still fail."
+    )]
+    async fn mcp_reconnect_hint(&self) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let hint = "If an MCP server appears disconnected:\n\
+            1. Run `mcp_status <client>` first — distinguishes 'daemon down' from 'session stale'.\n\
+            2. Daemon down: check `mcp_logs <host> <unit>`; if needed, restart via `ssh_sudo_exec`.\n\
+            3. Session stale (probe says reachable, but your tool calls still fail):\n\
+               • Interactive Claude Code session: type `/mcp` and reconnect the server.\n\
+               • Telegram via claudecli: ask me to call `mcp_restart_claudecli <client>` — claudecli\n\
+                 runs `claude -p` per message, so the next message handshakes fresh.\n\
+               • There is no in-session re-handshake hook today; this hint is the honest answer.";
+        let res: anyhow::Result<serde_json::Value> = Ok(serde_json::json!({ "hint": hint }));
+        self.finish_tool("mcp_reconnect_hint", None, started, res)
+    }
+
+    #[tool(
         description = "Token-savings analytics — how much agent context this prompto instance has saved versus an estimated SSH+bash baseline. Pass `since_secs` to bound the lookback window (e.g. 86400 for the last 24h). Returns total + per-tool breakdown."
     )]
     async fn prompto_gain(
@@ -528,7 +624,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

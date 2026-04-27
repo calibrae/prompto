@@ -8,6 +8,7 @@ pub mod claudemgr;
 pub mod host;
 pub mod inventory;
 pub mod mcp;
+pub mod mcpprobe;
 pub mod ssh;
 pub mod virt;
 pub mod wol;
