@@ -8,7 +8,7 @@
 //! `baseline_source` in the response carries the version so the numbers
 //! stay auditable.
 
-pub const SOURCE: &str = "estimate@v1";
+pub const SOURCE: &str = "estimate@v2";
 
 pub const BASELINES: &[(&str, u32)] = &[
     // host_*
@@ -21,9 +21,13 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("vm_start", 110),
     ("vm_stop", 360),
     ("vm_ensure_up", 420),
-    // ssh_*
-    ("ssh_exec", 200),
-    ("ssh_sudo_exec", 220),
+    // ssh_* — bumped from 200/220 in v0.5 to match observed v0.4 reality:
+    // post-deploy data showed ssh_exec calls average ~1200 tokens of raw
+    // remote stdout. The new built-in filter chain compacts common cases
+    // (cargo test/build, git log/diff/show, journalctl, find, ls -l)
+    // back below the baseline, restoring honest savings %.
+    ("ssh_exec", 1200),
+    ("ssh_sudo_exec", 1300),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

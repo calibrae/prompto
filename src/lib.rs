@@ -5,6 +5,7 @@
 
 pub mod baselines;
 pub mod claudemgr;
+pub mod filters;
 pub mod host;
 pub mod inventory;
 pub mod mcp;

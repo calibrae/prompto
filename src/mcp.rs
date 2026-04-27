@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use mcp_gain::Tracker;
 
 use crate::claudemgr::{self, Scope};
+use crate::filters::FilterChain;
 use crate::host;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
@@ -26,6 +27,7 @@ pub struct Prompto {
     inv: InventoryStore,
     ssh: Arc<SshClient>,
     tracker: Arc<Tracker>,
+    filters: Arc<FilterChain>,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -141,6 +143,22 @@ struct WakeResult {
 }
 
 #[derive(Serialize)]
+struct FilteredExecOutput {
+    stdout: String,
+    stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    timed_out: bool,
+    /// Name of the filter that compacted stdout, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<&'static str>,
+    /// Original stdout byte count before filtering. Equal to the filtered
+    /// count when no filter applied.
+    original_bytes: usize,
+    filtered_bytes: usize,
+}
+
+#[derive(Serialize)]
 struct VmEnsureUpResult {
     host_wake: bool,
     vm_started: bool,
@@ -159,8 +177,24 @@ impl Prompto {
             inv,
             ssh,
             tracker,
+            filters: Arc::new(FilterChain::default()),
             stop_vm_step,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Run the filter chain on an `ExecOutput.stdout` and bundle the
+    /// result into a serializable shape the MCP tool returns.
+    fn apply_filters(&self, cmd: &str, raw: crate::ssh::ExecOutput) -> FilteredExecOutput {
+        let (stdout, report) = self.filters.apply(cmd, &raw.stdout);
+        FilteredExecOutput {
+            stdout: stdout.into_owned(),
+            stderr: raw.stderr,
+            exit_code: raw.exit_code,
+            timed_out: raw.timed_out,
+            filter: report.applied,
+            original_bytes: report.original_bytes,
+            filtered_bytes: report.filtered_bytes,
         }
     }
 
@@ -368,7 +402,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command on a host over SSH and return stdout, stderr, exit code, and timeout flag. Requires `exec`."
+        description = "Run a command on a host over SSH and return stdout, stderr, exit code, and timeout flag. Output is run through the built-in filter chain (cargo test/build, git log/diff/show, journalctl, find, ls -l) — the response includes a `filter` field naming whichever filter compacted stdout, plus original/filtered byte counts. Requires `exec`."
     )]
     async fn ssh_exec(
         &self,
@@ -380,14 +414,15 @@ impl Prompto {
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::Exec)?;
-            self.ssh.exec(host, &args.cmd, to, false).await
+            let raw = self.ssh.exec(host, &args.cmd, to, false).await?;
+            Ok(self.apply_filters(&args.cmd, raw))
         }
         .await;
         self.finish_tool("ssh_exec", Some(&host_name), started, res)
     }
 
     #[tool(
-        description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Requires `sudo_exec`."
+        description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Output is run through the same filter chain as `ssh_exec`. Requires `sudo_exec`."
     )]
     async fn ssh_sudo_exec(
         &self,
@@ -399,7 +434,8 @@ impl Prompto {
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::SudoExec)?;
-            self.ssh.exec(host, &args.cmd, to, true).await
+            let raw = self.ssh.exec(host, &args.cmd, to, true).await?;
+            Ok(self.apply_filters(&args.cmd, raw))
         }
         .await;
         self.finish_tool("ssh_sudo_exec", Some(&host_name), started, res)
