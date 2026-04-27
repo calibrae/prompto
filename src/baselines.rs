@@ -43,6 +43,13 @@ pub const BASELINES: &[(&str, u32)] = &[
     // systemctl --failed + uname etc. Equivalent to ~5 separate ssh_exec
     // calls — that's the baseline we're measuring against.
     ("host_diagnose", 1500),
+    // v0.6.7 additions
+    ("ruby_exec", 600),
+    ("perl_exec", 500),
+    ("deno_exec", 700),
+    ("file_list", 600),
+    ("file_stat", 250),
+    ("port_scan", 200),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

@@ -97,6 +97,94 @@ pub async fn write(
     Ok(res)
 }
 
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct FileEntry {
+    pub name: String,
+    /// 10-char mode string from `ls -l` (e.g. `drwxr-xr-x`).
+    pub mode: String,
+    pub size: u64,
+    pub owner: String,
+    pub group: String,
+    /// Modification time, raw string from `ls -la --time-style=long-iso`.
+    pub mtime: String,
+    pub is_dir: bool,
+    pub is_link: bool,
+}
+
+/// Parse `ls -la --time-style=long-iso` output. Tolerates a `total N`
+/// header and skips it; ignores lines that don't fit the expected
+/// column count.
+pub fn parse_ls_long(stdout: &str) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("total ") {
+            continue;
+        }
+        // Expect: mode links owner group size YYYY-MM-DD HH:MM name…
+        // split_whitespace collapses runs of spaces; the name (which can
+        // include spaces) is reconstructed from tokens[7..].
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        if toks.len() < 8 {
+            continue;
+        }
+        let mode = toks[0];
+        if mode.len() != 10 {
+            continue;
+        }
+        let owner = toks[2].to_string();
+        let group = toks[3].to_string();
+        let size: u64 = match toks[4].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let mtime = format!("{} {}", toks[5], toks[6]);
+        let name = toks[7..].join(" ");
+        let is_dir = mode.starts_with('d');
+        let is_link = mode.starts_with('l');
+        out.push(FileEntry {
+            name,
+            mode: mode.to_string(),
+            size,
+            owner,
+            group,
+            mtime,
+            is_dir,
+            is_link,
+        });
+    }
+    out
+}
+
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct FileStat {
+    pub path: String,
+    pub mode: String, // octal
+    pub size: u64,
+    pub owner: String,
+    pub group: String,
+    pub mtime: String,
+    pub kind: String,
+}
+
+pub fn parse_stat(stdout: &str) -> Option<FileStat> {
+    // We invoke stat -c '%a|%s|%U|%G|%y|%F|%n'
+    let line = stdout.lines().find(|l| !l.is_empty())?;
+    let parts: Vec<&str> = line.splitn(7, '|').collect();
+    if parts.len() != 7 {
+        return None;
+    }
+    Some(FileStat {
+        mode: parts[0].to_string(),
+        size: parts[1].parse().ok()?,
+        owner: parts[2].to_string(),
+        group: parts[3].to_string(),
+        mtime: parts[4].to_string(),
+        kind: parts[5].to_string(),
+        path: parts[6].to_string(),
+    })
+}
+
 /// Optional chmod after a write. No-op if `mode` is `None`.
 pub async fn chmod(
     ssh: &SshClient,
@@ -152,6 +240,40 @@ mod tests {
         validate_mode("0644").unwrap();
         validate_mode("0755").unwrap();
         validate_mode("01777").unwrap();
+    }
+
+    #[test]
+    fn parse_ls_long_extracts_entries() {
+        let s = "total 12\n\
+                 drwxr-xr-x 2 cali staff   64 2026-04-27 12:00 .\n\
+                 drwxr-xr-x 5 cali staff  160 2026-04-27 11:00 ..\n\
+                 -rw-r--r-- 1 cali staff   42 2026-04-27 11:30 file.txt\n\
+                 lrwxrwxrwx 1 cali staff    7 2026-04-27 11:31 link -> target\n";
+        let entries = parse_ls_long(s);
+        assert_eq!(entries.len(), 4);
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[2].name, "file.txt");
+        assert_eq!(entries[2].size, 42);
+        assert!(!entries[2].is_dir);
+        assert!(entries[3].is_link);
+    }
+
+    #[test]
+    fn parse_stat_one_line() {
+        let s =
+            "0644|42|cali|staff|2026-04-27 11:30:00.000000 +0000|regular file|/home/cali/x.txt\n";
+        let st = parse_stat(s).unwrap();
+        assert_eq!(st.mode, "0644");
+        assert_eq!(st.size, 42);
+        assert_eq!(st.owner, "cali");
+        assert_eq!(st.kind, "regular file");
+        assert_eq!(st.path, "/home/cali/x.txt");
+    }
+
+    #[test]
+    fn parse_stat_rejects_malformed() {
+        assert!(parse_stat("nonsense\n").is_none());
+        assert!(parse_stat("").is_none());
     }
 
     #[test]

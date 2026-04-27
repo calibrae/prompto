@@ -21,6 +21,7 @@ use crate::filters::FilterChain;
 use crate::host;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
+use crate::portscan;
 use crate::script;
 use crate::ssh::SshClient;
 use crate::virt;
@@ -159,6 +160,22 @@ pub struct PythonExecArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PathArgs {
+    pub host: String,
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PortScanArgs {
+    pub host: String,
+    /// List of TCP ports to probe (e.g. [22, 80, 443, 6337]).
+    pub ports: Vec<u16>,
+    /// Per-port probe budget in milliseconds. Default 500, clamped 50..=5000.
+    #[serde(default)]
+    pub probe_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ServiceControlArgs {
     pub host: String,
     /// systemd unit name (e.g. "memqdrant", "nginx", "doppio-mqtt").
@@ -282,6 +299,46 @@ impl Prompto {
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Shared body for the trivial interpreter wrappers (ruby/perl/deno
+    /// at present). No language-specific compactor — pass-through with
+    /// the standard ScriptExecResult shape.
+    async fn script_exec_simple(
+        &self,
+        tool: &'static str,
+        interpreter: &'static str,
+        args: ScriptExecArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw = script::run(
+                &self.ssh,
+                host,
+                interpreter,
+                &args.script,
+                &args.args,
+                to,
+                false,
+            )
+            .await?;
+            let len = raw.stderr.len();
+            Ok(ScriptExecResult {
+                stdout: raw.stdout,
+                stderr: raw.stderr,
+                exit_code: raw.exit_code,
+                timed_out: raw.timed_out,
+                stderr_compacted: false,
+                original_stderr_bytes: len,
+                final_stderr_bytes: len,
+            })
+        }
+        .await;
+        self.finish_tool(tool, Some(&host_name), started, res)
     }
 
     /// Run the filter chain on an `ExecOutput.stdout` and bundle the
@@ -596,6 +653,139 @@ impl Prompto {
         }
         .await;
         self.finish_tool("node_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Run a Ruby script on a remote host. Body piped through SSH stdin (no quoting hell). Output passes through unchanged. Requires `exec`."
+    )]
+    async fn ruby_exec(
+        &self,
+        Parameters(args): Parameters<ScriptExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.script_exec_simple("ruby_exec", "ruby", args).await
+    }
+
+    #[tool(
+        description = "Run a Perl script on a remote host. Body piped through SSH stdin. Output passes through unchanged. Requires `exec`."
+    )]
+    async fn perl_exec(
+        &self,
+        Parameters(args): Parameters<ScriptExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.script_exec_simple("perl_exec", "perl", args).await
+    }
+
+    #[tool(
+        description = "Run a Deno (TypeScript/JavaScript) script on a remote host via `deno run -`. Body piped through SSH stdin. Output passes through unchanged. Requires `exec`."
+    )]
+    async fn deno_exec(
+        &self,
+        Parameters(args): Parameters<ScriptExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.script_exec_simple("deno_exec", "deno", args).await
+    }
+
+    #[tool(
+        description = "List a directory on a remote host (`ls -la --time-style=long-iso <path>`) and return parsed entries: { name, mode, size, owner, group, mtime, is_dir, is_link }. Requires `exec`."
+    )]
+    async fn file_list(
+        &self,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            files::validate_path(&args.path)?;
+            let cmd = format!("ls -la --time-style=long-iso -- {}", args.path);
+            let raw = self
+                .ssh
+                .exec(host, &cmd, Some(Duration::from_secs(10)), false)
+                .await?;
+            if !raw.ok() {
+                anyhow::bail!(
+                    "ls failed (exit={:?}): {}",
+                    raw.exit_code,
+                    raw.stderr.trim()
+                );
+            }
+            let entries = files::parse_ls_long(&raw.stdout);
+            Ok(serde_json::json!({
+                "host": args.host,
+                "path": args.path,
+                "entries": entries,
+                "count": entries.len(),
+            }))
+        }
+        .await;
+        self.finish_tool("file_list", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Stat a file on a remote host (`stat -c '%a|%s|%U|%G|%y|%F|%n' <path>`) and return typed { path, mode (octal), size, owner, group, mtime, kind }. Requires `exec`."
+    )]
+    async fn file_stat(
+        &self,
+        Parameters(args): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            files::validate_path(&args.path)?;
+            let cmd = format!("stat -c '%a|%s|%U|%G|%y|%F|%n' -- {}", args.path);
+            let raw = self
+                .ssh
+                .exec(host, &cmd, Some(Duration::from_secs(10)), false)
+                .await?;
+            if !raw.ok() {
+                anyhow::bail!(
+                    "stat failed (exit={:?}): {}",
+                    raw.exit_code,
+                    raw.stderr.trim()
+                );
+            }
+            let parsed = files::parse_stat(&raw.stdout);
+            Ok(serde_json::json!({
+                "host": args.host,
+                "stat": parsed,
+                "raw": raw.stdout,
+            }))
+        }
+        .await;
+        self.finish_tool("file_stat", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "TCP-probe a list of ports against a host from prompto's vantage point (no SSH). Returns per-port reachability + latency_ms. Useful for verifying which services are actually listening before touching them. Per-probe timeout default 500ms. Capability: none beyond inventory presence."
+    )]
+    async fn port_scan(
+        &self,
+        Parameters(args): Parameters<PortScanArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.get(&args.host)?;
+            let probe = Duration::from_millis(args.probe_ms.unwrap_or(500).clamp(50, 5000));
+            let mut results = Vec::with_capacity(args.ports.len());
+            for port in &args.ports {
+                results.push(portscan::probe_one(&host.ip, *port, probe).await);
+            }
+            let reachable = results.iter().filter(|r| r.reachable).count();
+            Ok(serde_json::json!({
+                "host": args.host,
+                "ip": host.ip,
+                "total": args.ports.len(),
+                "reachable": reachable,
+                "results": results,
+            }))
+        }
+        .await;
+        self.finish_tool("port_scan", Some(&host_name), started, res)
     }
 
     #[tool(
@@ -1022,7 +1212,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, port_scan, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

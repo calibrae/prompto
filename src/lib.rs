@@ -12,6 +12,7 @@ pub mod host;
 pub mod inventory;
 pub mod mcp;
 pub mod mcpprobe;
+pub mod portscan;
 pub mod script;
 pub mod ssh;
 pub mod virt;
