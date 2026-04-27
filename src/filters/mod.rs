@@ -13,9 +13,11 @@ use std::borrow::Cow;
 
 pub mod cargo;
 pub mod git;
+pub mod k8s;
 pub mod node;
 pub mod ops;
 pub mod python;
+pub mod sys;
 pub mod system;
 
 pub trait CommandFilter: Send + Sync {
@@ -59,6 +61,12 @@ impl Default for FilterChain {
                 Box::new(ops::DockerPs),
                 Box::new(ops::SystemctlStatus),
                 Box::new(ops::PsCmd),
+                Box::new(k8s::Kubectl),
+                Box::new(k8s::Helm),
+                Box::new(sys::Lsof),
+                Box::new(sys::Du),
+                Box::new(sys::Dmesg),
+                Box::new(sys::Vmstat),
                 Box::new(system::Journalctl),
                 Box::new(system::FindCmd),
                 Box::new(system::LsLong),
