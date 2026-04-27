@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use mcp_gain::Tracker;
 
 use crate::claudemgr::{self, Scope};
+use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
 use crate::inventory::{Capability, InventoryStore};
@@ -154,6 +155,34 @@ pub struct PythonExecArgs {
     /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileReadArgs {
+    pub host: String,
+    /// Absolute or relative path on the remote host. Must contain no
+    /// shell metacharacters or whitespace.
+    pub path: String,
+    /// Max bytes to read. Defaults to 65_536 (64 KB). Clamped to 1 MB.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileWriteArgs {
+    pub host: String,
+    pub path: String,
+    /// Bytes to write. Stored verbatim — pipes through SSH stdin to
+    /// avoid shell quoting on the content.
+    pub content: String,
+    /// Optional octal mode (`"0644"`, `"755"`, …). Applied via `chmod`
+    /// after the write.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Set to `true` to write via `sudo -n tee` (requires the host to
+    /// have the `sudo_exec` capability). Default `false`.
+    #[serde(default)]
+    pub sudo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -559,6 +588,72 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Read a file from a remote host (`head -c <max_bytes> -- <path>`). Default max_bytes 65_536; clamped to 1 MB. Path is validated against shell metacharacters. Returns the bytes plus a `truncated` flag set when the read hit the cap (file may be larger). Requires `exec`."
+    )]
+    async fn file_read(
+        &self,
+        Parameters(args): Parameters<FileReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(files::DEFAULT_READ_BYTES)
+            .clamp(1, files::MAX_READ_BYTES);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw = files::read(&self.ssh, host, &args.path, max_bytes).await?;
+            let bytes = raw.stdout.len();
+            let truncated = bytes as u64 >= max_bytes;
+            Ok(serde_json::json!({
+                "host": args.host,
+                "path": args.path,
+                "content": raw.stdout,
+                "bytes": bytes,
+                "truncated": truncated,
+                "max_bytes": max_bytes,
+            }))
+        }
+        .await;
+        self.finish_tool("file_read", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Write bytes to a file on a remote host (`tee -- <path>`, content piped via SSH stdin so no shell quoting applies to the body). Optional `mode` runs `chmod <mode>` after. Set `sudo=true` to use `sudo -n tee` (requires `sudo_exec` capability — otherwise `exec` is enough). Path is validated against shell metacharacters."
+    )]
+    async fn file_write(
+        &self,
+        Parameters(args): Parameters<FileWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let sudo = args.sudo.unwrap_or(false);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let cap = if sudo {
+                Capability::SudoExec
+            } else {
+                Capability::Exec
+            };
+            let host = inv.require(&args.host, cap)?;
+            files::write(&self.ssh, host, &args.path, args.content.as_bytes(), sudo).await?;
+            if let Some(mode) = &args.mode {
+                files::chmod(&self.ssh, host, &args.path, mode, sudo).await?;
+            }
+            Ok(serde_json::json!({
+                "host": args.host,
+                "path": args.path,
+                "bytes_written": args.content.len(),
+                "sudo": sudo,
+                "mode": args.mode,
+            }))
+        }
+        .await;
+        self.finish_tool("file_write", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Run a Bash script on a remote host. Body piped through SSH stdin (no quoting hell). Output is NOT auto-compacted — bash errors are usually short enough that any compaction would risk dropping context. Requires `exec`."
     )]
     async fn bash_exec(
@@ -827,7 +922,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

@@ -34,6 +34,10 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("python_exec", 800),
     ("node_exec", 700),
     ("bash_exec", 500),
+    // file_*: typical SSH+cat / SSH+tee leaks banner + file content;
+    // a typed wrapper returns just the bytes plus a tight envelope.
+    ("file_read", 500),
+    ("file_write", 250),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),
