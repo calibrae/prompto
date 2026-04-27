@@ -57,6 +57,9 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("inventory_remove_host", 100),
     ("inventory_grant_capability", 100),
     ("inventory_revoke_capability", 100),
+    // rsync_sync: equivalent to a hand-rolled "ssh src 'rsync -av … dst'"
+    // dance with full progress lines; baseline assumes ~30 files synced.
+    ("rsync_sync", 1500),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

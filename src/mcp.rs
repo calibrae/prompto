@@ -23,6 +23,7 @@ use crate::inventory::HostConfig;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
 use crate::portscan;
+use crate::rsync;
 use crate::script;
 use crate::ssh::SshClient;
 use crate::virt;
@@ -164,6 +165,36 @@ pub struct PythonExecArgs {
 pub struct PathArgs {
     pub host: String,
     pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RsyncSyncArgs {
+    /// Inventory host name where the source files live. Must have `exec`.
+    pub source_host: String,
+    /// Path on `source_host`. Trailing `/` matters per rsync semantics
+    /// (`/foo/` → "contents of foo", `/foo` → "the foo dir").
+    pub source_path: String,
+    /// Inventory host name to push to. Must have `exec`. Source host must
+    /// already have an SSH key for this dest host (typical homelab
+    /// setup where every box carries the same admin key).
+    pub dest_host: String,
+    pub dest_path: String,
+    /// `-a` (archive: recursive, preserve perms/links/times). Default true.
+    #[serde(default)]
+    pub archive: Option<bool>,
+    /// `--delete`. Default false.
+    #[serde(default)]
+    pub delete: Option<bool>,
+    /// `--dry-run`. Default false. Pairs well with `--stats` to preview.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// rsync `--exclude=PATTERN` values. Each is shell-meta validated.
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    /// Per-command timeout (seconds). Defaults to 300 (5 min) — rsync
+    /// can take a while on big trees.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -979,6 +1010,55 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Sync files between two inventory hosts via rsync. prompto SSHs to source_host and runs rsync there, targeting dest_host. Both hosts need `exec` capability AND source_host must have its own SSH key for dest_host (typical homelab: every box carries the same admin key). Trailing `/` on paths matters per rsync convention. Output is auto-compacted to just the --stats block — drops the per-file progress lines. Timeout default 300s. Replaces the 'copy 30 files one-by-one with file_write' anti-pattern (~17K tokens) with a single call (~150 tokens)."
+    )]
+    async fn rsync_sync(
+        &self,
+        Parameters(args): Parameters<RsyncSyncArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.source_host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let source_host = inv.require(&args.source_host, Capability::Exec)?;
+            let dest_host = inv.require(&args.dest_host, Capability::Exec)?;
+            let opts = rsync::RsyncOptions {
+                archive: args.archive.unwrap_or(true),
+                delete: args.delete.unwrap_or(false),
+                dry_run: args.dry_run.unwrap_or(false),
+                excludes: &args.excludes,
+            };
+            let raw = rsync::run(
+                &self.ssh,
+                source_host,
+                &args.source_path,
+                dest_host,
+                &args.dest_path,
+                &opts,
+                to,
+            )
+            .await?;
+            // Compact via the chain so the stats block is what comes back.
+            let (stdout, report) = self.filters.apply("rsync", &raw.stdout);
+            Ok(serde_json::json!({
+                "source_host": args.source_host,
+                "source_path": args.source_path,
+                "dest_host": args.dest_host,
+                "dest_path": args.dest_path,
+                "stdout": stdout,
+                "stderr": raw.stderr,
+                "exit_code": raw.exit_code,
+                "filter": report.applied,
+                "original_bytes": report.original_bytes,
+                "filtered_bytes": report.filtered_bytes,
+            }))
+        }
+        .await;
+        self.finish_tool("rsync_sync", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "TCP-probe a list of ports against a host from prompto's vantage point (no SSH). Returns per-port reachability + latency_ms. Useful for verifying which services are actually listening before touching them. Per-probe timeout default 500ms. Capability: none beyond inventory presence."
     )]
     async fn port_scan(
@@ -1432,7 +1512,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, port_scan, service_control, inventory_list, inventory_get_host, inventory_add_host, inventory_remove_host, inventory_grant_capability, inventory_revoke_capability, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, inventory_add_host, inventory_remove_host, inventory_grant_capability, inventory_revoke_capability, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
