@@ -16,6 +16,7 @@ pub mod git;
 pub mod k8s;
 pub mod node;
 pub mod ops;
+pub mod pkg;
 pub mod python;
 pub mod rsync;
 pub mod sys;
@@ -68,6 +69,9 @@ impl Default for FilterChain {
                 Box::new(sys::Du),
                 Box::new(sys::Dmesg),
                 Box::new(sys::Vmstat),
+                Box::new(pkg::PkgList),
+                Box::new(pkg::SystemctlUnits),
+                Box::new(pkg::Dnf),
                 Box::new(rsync::Rsync),
                 Box::new(system::Journalctl),
                 Box::new(system::FindCmd),
