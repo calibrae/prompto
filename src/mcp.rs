@@ -158,6 +158,16 @@ pub struct PythonExecArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ServiceControlArgs {
+    pub host: String,
+    /// systemd unit name (e.g. "memqdrant", "nginx", "doppio-mqtt").
+    pub unit: String,
+    /// One of: start, stop, restart, reload, enable, disable, status,
+    /// is-active, is-enabled.
+    pub action: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileReadArgs {
     pub host: String,
     /// Absolute or relative path on the remote host. Must contain no
@@ -588,6 +598,61 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Drive a systemd unit on a remote host (`sudo -n systemctl <action> <unit>`). Action must be one of: start, stop, restart, reload, enable, disable, status, is-active, is-enabled. unit name is validated against shell metacharacters before interpolation. For `status`, stdout is auto-compacted to header + Loaded/Active/Memory/etc lines (the journal tail is dropped — use `mcp_logs` for logs). Requires `sudo_exec`."
+    )]
+    async fn service_control(
+        &self,
+        Parameters(args): Parameters<ServiceControlArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        const ACTIONS: &[&str] = &[
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "enable",
+            "disable",
+            "status",
+            "is-active",
+            "is-enabled",
+        ];
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            if !ACTIONS.contains(&args.action.as_str()) {
+                anyhow::bail!(
+                    "action {:?} not in allow-list (allowed: {:?})",
+                    args.action,
+                    ACTIONS
+                );
+            }
+            crate::claudemgr::validate_unit_name(&args.unit)?;
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::SudoExec)?;
+            let cmd = format!("systemctl {} -- {}", args.action, args.unit);
+            let raw = self
+                .ssh
+                .exec(host, &cmd, Some(Duration::from_secs(15)), true)
+                .await?;
+            let stdout = if args.action == "status" {
+                let (compacted, _report) = self.filters.apply("systemctl status", &raw.stdout);
+                compacted.into_owned()
+            } else {
+                raw.stdout
+            };
+            Ok(serde_json::json!({
+                "host": args.host,
+                "unit": args.unit,
+                "action": args.action,
+                "exit_code": raw.exit_code,
+                "stdout": stdout,
+                "stderr": raw.stderr,
+            }))
+        }
+        .await;
+        self.finish_tool("service_control", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Read a file from a remote host (`head -c <max_bytes> -- <path>`). Default max_bytes 65_536; clamped to 1 MB. Path is validated against shell metacharacters. Returns the bytes plus a `truncated` flag set when the read hit the cap (file may be larger). Requires `exec`."
     )]
     async fn file_read(
@@ -922,7 +987,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

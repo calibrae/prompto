@@ -38,6 +38,7 @@ pub const BASELINES: &[(&str, u32)] = &[
     // a typed wrapper returns just the bytes plus a tight envelope.
     ("file_read", 500),
     ("file_write", 250),
+    ("service_control", 350),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),
