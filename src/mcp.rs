@@ -125,6 +125,19 @@ pub struct McpRemoveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScriptExecArgs {
+    pub host: String,
+    /// Source code, sent through SSH stdin verbatim.
+    pub script: String,
+    /// Optional positional arguments — become argv after the script.
+    /// No whitespace or shell metacharacters.
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PythonExecArgs {
     /// Inventory host with the `exec` capability.
     pub host: String,
@@ -160,6 +173,19 @@ pub struct McpLogsArgs {
 struct WakeResult {
     host: String,
     sent_to_mac: String,
+}
+
+#[derive(Serialize)]
+struct ScriptExecResult {
+    stdout: String,
+    stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    timed_out: bool,
+    /// `true` if stderr was compacted from a longer trace.
+    stderr_compacted: bool,
+    original_stderr_bytes: usize,
+    final_stderr_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -499,6 +525,70 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Run a Node.js script on a remote host. Same stdin-piping shape as `python_exec` — embedded quotes, JSON literals, multi-line code all survive. stderr is auto-compacted to `Error: message (N frames; last: file:line)` when a V8 stack trace is detected. Requires `exec`."
+    )]
+    async fn node_exec(
+        &self,
+        Parameters(args): Parameters<ScriptExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw =
+                script::run(&self.ssh, host, "node", &args.script, &args.args, to, false).await?;
+            let original = raw.stderr.len();
+            let compacted = script::compact_node_stack(&raw.stderr);
+            let was_compacted = compacted.len() != original;
+            let stderr = compacted.into_owned();
+            let final_len = stderr.len();
+            Ok(ScriptExecResult {
+                stdout: raw.stdout,
+                stderr,
+                exit_code: raw.exit_code,
+                timed_out: raw.timed_out,
+                stderr_compacted: was_compacted,
+                original_stderr_bytes: original,
+                final_stderr_bytes: final_len,
+            })
+        }
+        .await;
+        self.finish_tool("node_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Run a Bash script on a remote host. Body piped through SSH stdin (no quoting hell). Output is NOT auto-compacted — bash errors are usually short enough that any compaction would risk dropping context. Requires `exec`."
+    )]
+    async fn bash_exec(
+        &self,
+        Parameters(args): Parameters<ScriptExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let to = args.timeout_secs.map(Duration::from_secs);
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw =
+                script::run(&self.ssh, host, "bash", &args.script, &args.args, to, false).await?;
+            let len = raw.stderr.len();
+            Ok(ScriptExecResult {
+                stdout: raw.stdout,
+                stderr: raw.stderr,
+                exit_code: raw.exit_code,
+                timed_out: raw.timed_out,
+                stderr_compacted: false,
+                original_stderr_bytes: len,
+                final_stderr_bytes: len,
+            })
+        }
+        .await;
+        self.finish_tool("bash_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Output is run through the same filter chain as `ssh_exec`. Requires `sudo_exec`."
     )]
     async fn ssh_sudo_exec(
@@ -737,7 +827,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

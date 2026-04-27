@@ -32,6 +32,8 @@ pub const BASELINES: &[(&str, u32)] = &[
     // typical "I tried to ssh+heredoc this and got mangled" round-trip
     // an agent does today (failed attempt + retry + traceback noise).
     ("python_exec", 800),
+    ("node_exec", 700),
+    ("bash_exec", 500),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

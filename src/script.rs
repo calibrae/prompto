@@ -92,6 +92,59 @@ pub async fn run(
         .await
 }
 
+/// Compact a Node.js / V8 stack trace to "ExceptionType: message
+/// (N frames; last: file:line)". Conservative: returns verbatim stderr
+/// when no stack-frame lines (`    at func (file:line:col)`) are found.
+pub fn compact_node_stack(stderr: &str) -> Cow<'_, str> {
+    let lines: Vec<&str> = stderr.lines().collect();
+    if lines.is_empty() {
+        return Cow::Borrowed(stderr);
+    }
+    let mut frames: Vec<&str> = Vec::new();
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("at ") {
+            frames.push(trimmed);
+        }
+    }
+    if frames.is_empty() {
+        return Cow::Borrowed(stderr);
+    }
+
+    // Find the exception line: typically the first non-empty,
+    // non-frame, non-source-context line that contains "Error:" or
+    // "Exception:" or similar.
+    let mut exc: Option<&str> = None;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if line.trim_start().starts_with("at ") {
+            continue;
+        }
+        if trimmed.contains("Error:")
+            || trimmed.contains("Error ")
+            || trimmed.ends_with("Error")
+            || trimmed.contains("Exception:")
+        {
+            exc = Some(trimmed);
+            break;
+        }
+    }
+
+    let last_frame = frames.last().copied().unwrap_or("");
+    let frame_count = frames.len();
+
+    match exc {
+        Some(e) => Cow::Owned(format!(
+            "{} ({} frames; last: {})\n",
+            e, frame_count, last_frame,
+        )),
+        None => Cow::Borrowed(stderr),
+    }
+}
+
 /// Compact a Python traceback to "ExceptionType: message (at file:line in
 /// func, N frames)". Conservative: if stderr doesn't contain a
 /// recognisable traceback header, returns the original verbatim.
@@ -218,6 +271,30 @@ mod tests {
         let stderr = "warning: deprecated thing\n";
         let out = compact_python_traceback(stderr);
         assert_eq!(out, "warning: deprecated thing\n");
+    }
+
+    #[test]
+    fn compact_node_stack_collapses_v8_trace() {
+        let stderr = "/home/cali/x.js:3\n\
+                      throw new TypeError('foo');\n\
+                      ^\n\
+                      \n\
+                      TypeError: foo\n\
+                      \x20\x20\x20\x20at fn (/home/cali/x.js:3:11)\n\
+                      \x20\x20\x20\x20at /home/cali/x.js:5:1\n\
+                      \x20\x20\x20\x20at Script.runInThisContext (node:vm:144:12)\n";
+        let out = compact_node_stack(stderr);
+        let s = out.as_ref();
+        assert!(s.contains("TypeError: foo"));
+        assert!(s.contains("3 frames"));
+        assert!(s.contains("Script.runInThisContext"));
+    }
+
+    #[test]
+    fn compact_node_stack_passes_through_when_no_frames() {
+        let stderr = "/usr/local/bin/node: bad option\n";
+        let out = compact_node_stack(stderr);
+        assert_eq!(out, "/usr/local/bin/node: bad option\n");
     }
 
     #[test]
