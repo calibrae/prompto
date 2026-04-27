@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use mcp_gain::Tracker;
 
 use crate::claudemgr::{self, Scope};
+use crate::diagnose;
 use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
@@ -598,6 +599,40 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Composite health probe for a host. Runs a single bash pipeline that gathers uptime, load average, memory (MB), root-disk usage, last-boot time, kernel version, listening sockets (top 30), and failed systemd units. Parses everything into a tight typed report. Replaces ~5 sequential ssh_exec calls with one round-trip. Requires `exec`."
+    )]
+    async fn host_diagnose(
+        &self,
+        Parameters(args): Parameters<HostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let raw = script::run(
+                &self.ssh,
+                host,
+                "bash",
+                diagnose::DIAGNOSE_SCRIPT,
+                &[],
+                Some(Duration::from_secs(15)),
+                false,
+            )
+            .await?;
+            let report = diagnose::parse(&raw.stdout);
+            Ok(serde_json::json!({
+                "host": args.host,
+                "report": report,
+                "stderr": raw.stderr,
+                "exit_code": raw.exit_code,
+            }))
+        }
+        .await;
+        self.finish_tool("host_diagnose", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Drive a systemd unit on a remote host (`sudo -n systemctl <action> <unit>`). Action must be one of: start, stop, restart, reload, enable, disable, status, is-active, is-enabled. unit name is validated against shell metacharacters before interpolation. For `status`, stdout is auto-compacted to header + Loaded/Active/Memory/etc lines (the journal tail is dropped — use `mcp_logs` for logs). Requires `sudo_exec`."
     )]
     async fn service_control(
@@ -987,7 +1022,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, file_read, file_write, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \

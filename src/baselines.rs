@@ -39,6 +39,10 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("file_read", 500),
     ("file_write", 250),
     ("service_control", 350),
+    // host_diagnose: composite of uptime + free -m + df -h + ss -tln +
+    // systemctl --failed + uname etc. Equivalent to ~5 separate ssh_exec
+    // calls — that's the baseline we're measuring against.
+    ("host_diagnose", 1500),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),

@@ -5,6 +5,7 @@
 
 pub mod baselines;
 pub mod claudemgr;
+pub mod diagnose;
 pub mod files;
 pub mod filters;
 pub mod host;
