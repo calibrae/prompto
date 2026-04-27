@@ -13,6 +13,9 @@ use std::borrow::Cow;
 
 pub mod cargo;
 pub mod git;
+pub mod node;
+pub mod ops;
+pub mod python;
 pub mod system;
 
 pub trait CommandFilter: Send + Sync {
@@ -51,6 +54,11 @@ impl Default for FilterChain {
                 Box::new(git::GitLog),
                 Box::new(git::GitDiff),
                 Box::new(git::GitShow),
+                Box::new(python::Pytest),
+                Box::new(node::NpmTest),
+                Box::new(ops::DockerPs),
+                Box::new(ops::SystemctlStatus),
+                Box::new(ops::PsCmd),
                 Box::new(system::Journalctl),
                 Box::new(system::FindCmd),
                 Box::new(system::LsLong),
