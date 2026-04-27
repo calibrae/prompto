@@ -157,6 +157,37 @@ impl InventoryStore {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// Apply a closure to a mutable copy of the current inventory, write
+    /// it back to disk atomically (tmp file + rename), and update the
+    /// in-memory snapshot. Re-parses after write to ensure round-trip
+    /// validity. Comments and key ordering in the source TOML are NOT
+    /// preserved — this is a known tradeoff for v0.6.8 simplicity.
+    pub fn edit<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Inventory) -> Result<()>,
+    {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow!("no inventory path configured — cannot persist edits"))?;
+        let mut inv = (*self.snapshot()).clone();
+        f(&mut inv)?;
+        // Validate the modified inventory before writing.
+        for (name, host) in &inv.hosts {
+            host.validate(name)?;
+        }
+        let serialized = toml::to_string_pretty(&inv).context("serialize inventory to TOML")?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &serialized).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+        // Re-read to populate the snapshot from a freshly-parsed file
+        // (catches any silent serialize/deserialize asymmetries).
+        let reloaded = Inventory::from_path(path)?;
+        self.inner.store(Arc::new(reloaded));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use crate::diagnose;
 use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
+use crate::inventory::HostConfig;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
 use crate::portscan;
@@ -173,6 +174,33 @@ pub struct PortScanArgs {
     /// Per-port probe budget in milliseconds. Default 500, clamped 50..=5000.
     #[serde(default)]
     pub probe_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InventoryAddHostArgs {
+    /// Inventory key (e.g. "doppio", "alpha"). Validated against
+    /// alphanumerics + `-`/`_`.
+    pub name: String,
+    pub ip: String,
+    pub ssh_user: String,
+    pub ssh_key: String,
+    #[serde(default)]
+    pub mac: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InventoryHostNameArgs {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InventoryCapabilityArgs {
+    pub name: String,
+    pub capability: Capability,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -759,6 +787,198 @@ impl Prompto {
     }
 
     #[tool(
+        description = "List every host in the inventory with its capabilities. ssh_key paths are NOT exposed (they're server-side filesystem details). Read-only — no inventory mutation."
+    )]
+    async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let hosts: Vec<serde_json::Value> = inv
+                .hosts
+                .iter()
+                .map(|(name, h)| {
+                    serde_json::json!({
+                        "name": name,
+                        "ip": h.ip,
+                        "mac": h.mac,
+                        "ssh_user": h.ssh_user,
+                        "ssh_port": h.ssh_port,
+                        "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "count": hosts.len(),
+                "hosts": hosts,
+            }))
+        }
+        .await;
+        self.finish_tool("inventory_list", None, started, res)
+    }
+
+    #[tool(
+        description = "Get one host's full configuration from the inventory. ssh_key path is NOT exposed."
+    )]
+    async fn inventory_get_host(
+        &self,
+        Parameters(args): Parameters<InventoryHostNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.name.clone();
+        let res: anyhow::Result<_> = async {
+            let inv = self.inv.snapshot();
+            let h = inv.get(&args.name)?;
+            Ok(serde_json::json!({
+                "name": args.name,
+                "ip": h.ip,
+                "mac": h.mac,
+                "ssh_user": h.ssh_user,
+                "ssh_port": h.ssh_port,
+                "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            }))
+        }
+        .await;
+        self.finish_tool("inventory_get_host", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Add a new host to the inventory and persist to disk (atomic tmp+rename). The prompto user must have write permission on the inventory file. Validates the host config before persisting and refuses to write an inventory that wouldn't parse back. NOTE: comments and key ordering in the source TOML are NOT preserved across edits."
+    )]
+    async fn inventory_add_host(
+        &self,
+        Parameters(args): Parameters<InventoryAddHostArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.name.clone();
+        let res: anyhow::Result<_> = async {
+            validate_inventory_name(&args.name)?;
+            let host = HostConfig {
+                ip: args.ip,
+                mac: args.mac,
+                ssh_user: args.ssh_user,
+                ssh_key: args.ssh_key.into(),
+                ssh_port: args.ssh_port.unwrap_or(22),
+                capabilities: args.capabilities,
+            };
+            self.inv.edit(|inv| {
+                if inv.hosts.contains_key(&args.name) {
+                    anyhow::bail!(
+                        "host {:?} already exists — use inventory_remove_host first",
+                        args.name
+                    );
+                }
+                inv.hosts.insert(args.name.clone(), host);
+                Ok(())
+            })?;
+            Ok(serde_json::json!({
+                "name": args.name,
+                "added": true,
+                "host_count": self.inv.snapshot().hosts.len(),
+            }))
+        }
+        .await;
+        self.finish_tool("inventory_add_host", Some(&host_name), started, res)
+    }
+
+    #[tool(description = "Remove a host from the inventory and persist to disk.")]
+    async fn inventory_remove_host(
+        &self,
+        Parameters(args): Parameters<InventoryHostNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.name.clone();
+        let res: anyhow::Result<_> = async {
+            validate_inventory_name(&args.name)?;
+            let mut removed = false;
+            self.inv.edit(|inv| {
+                removed = inv.hosts.remove(&args.name).is_some();
+                if !removed {
+                    anyhow::bail!("host {:?} not found", args.name);
+                }
+                Ok(())
+            })?;
+            Ok(serde_json::json!({
+                "name": args.name,
+                "removed": removed,
+                "host_count": self.inv.snapshot().hosts.len(),
+            }))
+        }
+        .await;
+        self.finish_tool("inventory_remove_host", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Add a capability to a host's allowlist (e.g. grant `wake` to a newly-discovered MAC-known host). Idempotent — granting an already-present capability is a no-op."
+    )]
+    async fn inventory_grant_capability(
+        &self,
+        Parameters(args): Parameters<InventoryCapabilityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.name.clone();
+        let res: anyhow::Result<_> = async {
+            validate_inventory_name(&args.name)?;
+            let mut already_present = false;
+            self.inv.edit(|inv| {
+                let h = inv
+                    .hosts
+                    .get_mut(&args.name)
+                    .ok_or_else(|| anyhow::anyhow!("host {:?} not found", args.name))?;
+                if h.capabilities.contains(&args.capability) {
+                    already_present = true;
+                } else {
+                    h.capabilities.push(args.capability);
+                }
+                Ok(())
+            })?;
+            Ok(serde_json::json!({
+                "name": args.name,
+                "capability": args.capability.as_str(),
+                "already_present": already_present,
+            }))
+        }
+        .await;
+        self.finish_tool("inventory_grant_capability", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Remove a capability from a host's allowlist. Idempotent — revoking an absent capability is a no-op."
+    )]
+    async fn inventory_revoke_capability(
+        &self,
+        Parameters(args): Parameters<InventoryCapabilityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.name.clone();
+        let res: anyhow::Result<_> = async {
+            validate_inventory_name(&args.name)?;
+            let mut was_present = false;
+            self.inv.edit(|inv| {
+                let h = inv
+                    .hosts
+                    .get_mut(&args.name)
+                    .ok_or_else(|| anyhow::anyhow!("host {:?} not found", args.name))?;
+                let before = h.capabilities.len();
+                h.capabilities.retain(|c| *c != args.capability);
+                was_present = h.capabilities.len() != before;
+                Ok(())
+            })?;
+            Ok(serde_json::json!({
+                "name": args.name,
+                "capability": args.capability.as_str(),
+                "was_present": was_present,
+            }))
+        }
+        .await;
+        self.finish_tool(
+            "inventory_revoke_capability",
+            Some(&host_name),
+            started,
+            res,
+        )
+    }
+
+    #[tool(
         description = "TCP-probe a list of ports against a host from prompto's vantage point (no SSH). Returns per-port reachability + latency_ms. Useful for verifying which services are actually listening before touching them. Per-probe timeout default 500ms. Capability: none beyond inventory presence."
     )]
     async fn port_scan(
@@ -1212,7 +1432,7 @@ impl ServerHandler for Prompto {
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, port_scan, service_control, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_sudo_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, port_scan, service_control, inventory_list, inventory_get_host, inventory_add_host, inventory_remove_host, inventory_grant_capability, inventory_revoke_capability, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`). \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
@@ -1221,4 +1441,22 @@ impl ServerHandler for Prompto {
                     .to_string(),
             )
     }
+}
+
+/// Inventory keys are alphanumerics + `-`/`_`/`.`, max 64. Validated
+/// before the value reaches TOML serialization or the persisted file.
+fn validate_inventory_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("inventory name is empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("inventory name too long");
+    }
+    let ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        anyhow::bail!("inventory name {name:?} must be alphanumerics + - _ .");
+    }
+    Ok(())
 }

@@ -50,6 +50,13 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("file_list", 600),
     ("file_stat", 250),
     ("port_scan", 200),
+    // inventory_*
+    ("inventory_list", 400),
+    ("inventory_get_host", 200),
+    ("inventory_add_host", 150),
+    ("inventory_remove_host", 100),
+    ("inventory_grant_capability", 100),
+    ("inventory_revoke_capability", 100),
     // mcp_* — wrappers around `claude mcp …`
     ("mcp_list", 200),
     ("mcp_get", 150),
