@@ -23,6 +23,10 @@ impl CommandFilter for GitLog {
     fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
         cap_lines(stdout, LOG_LINE_CAP, "commits")
     }
+
+    fn tier(&self, filtered: &str) -> u8 {
+        if filtered.contains("… truncated") { 2 } else { 1 }
+    }
 }
 
 /// Match `git diff [...]`. Caps to N lines and drops pure-context lines
@@ -67,6 +71,10 @@ impl CommandFilter for GitDiff {
         }
         Cow::Owned(out)
     }
+
+    fn tier(&self, filtered: &str) -> u8 {
+        if filtered.contains("diff truncated") { 2 } else { 1 }
+    }
 }
 
 /// Match `git show [...]`. Same shape as diff with the commit header
@@ -84,6 +92,10 @@ impl CommandFilter for GitShow {
 
     fn filter<'a>(&self, _cmd: &str, stdout: &'a str) -> Cow<'a, str> {
         cap_lines(stdout, SHOW_LINE_CAP, "lines")
+    }
+
+    fn tier(&self, filtered: &str) -> u8 {
+        if filtered.contains("… truncated") { 2 } else { 1 }
     }
 }
 
@@ -164,6 +176,20 @@ mod tests {
         assert!(out.contains("+new line"));
         assert!(out.contains("-old line"));
         assert!(!out.contains("unchanged context line"));
+    }
+
+    #[test]
+    fn tier_full_when_under_cap() {
+        let s = "abc one\nabc two\n";
+        let out = GitLog.filter("git log", s);
+        assert_eq!(GitLog.tier(&out), 1);
+    }
+
+    #[test]
+    fn tier_degraded_when_truncated() {
+        let s: String = (0..80).map(|i| format!("commit-{i}\n")).collect();
+        let out = GitLog.filter("git log", &s);
+        assert_eq!(GitLog.tier(&out), 2);
     }
 
     #[test]

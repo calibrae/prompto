@@ -11,6 +11,11 @@
 
 use std::borrow::Cow;
 
+/// Re-export of [`tier_parse`]'s structured-parsing primitives. Filters that
+/// produce typed output (rather than compacted text) should return a
+/// [`ParseResult<T>`] and surface its tier through [`CommandFilter::tier`].
+pub use tier_parse::{ParseResult, OutputParser, extract_json_object, truncate_output};
+
 pub mod cargo;
 pub mod git;
 pub mod k8s;
@@ -34,6 +39,19 @@ pub trait CommandFilter: Send + Sync {
     /// output doesn't match the expected shape (don't drop data on
     /// surprises).
     fn filter<'a>(&self, cmd: &str, stdout: &'a str) -> Cow<'a, str>;
+
+    /// Tier of the filter's output, in the `tier-parse` sense:
+    ///
+    /// - `1` = Full — clean structured transform, no data dropped.
+    /// - `2` = Degraded — heuristic kicked in (line cap, truncation,
+    ///   filter-by-pattern); some content was elided.
+    /// - `3` = Passthrough — filter declined to transform; output is the
+    ///   raw stdout verbatim.
+    ///
+    /// Default: Full. Override to expose degradation to callers.
+    fn tier(&self, _filtered: &str) -> u8 {
+        1
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -43,6 +61,15 @@ pub struct FilterReport {
     pub applied: Option<&'static str>,
     pub original_bytes: usize,
     pub filtered_bytes: usize,
+    /// `tier-parse` tier: 1 = Full, 2 = Degraded, 3 = Passthrough. Defaults
+    /// to 1 when no filter matched (untransformed output is "full" in the
+    /// sense that nothing was elided).
+    #[serde(default = "default_tier")]
+    pub tier: u8,
+}
+
+fn default_tier() -> u8 {
+    1
 }
 
 pub struct FilterChain {
@@ -95,10 +122,12 @@ impl FilterChain {
         for f in &self.filters {
             if f.matches(cmd) {
                 let out = f.filter(cmd, stdout);
+                let tier = f.tier(&out);
                 let report = FilterReport {
                     applied: Some(f.name()),
                     original_bytes: original,
                     filtered_bytes: out.len(),
+                    tier,
                 };
                 return (out, report);
             }
@@ -109,6 +138,7 @@ impl FilterChain {
                 applied: None,
                 original_bytes: original,
                 filtered_bytes: original,
+                tier: 1,
             },
         )
     }
