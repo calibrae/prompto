@@ -77,10 +77,8 @@ pub struct VmEnsureUpArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecArgs {
     pub host: String,
-    /// Command to run on the remote host (interpreted by the remote shell).
+    /// Command, interpreted by the remote shell.
     pub cmd: String,
-    /// Per-command timeout (seconds). Defaults to the server's
-    /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -88,55 +86,43 @@ pub struct ExecArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchArgs {
     pub host: String,
-    /// List of shell commands to run in order, in a single SSH session.
-    /// Each runs under `bash -c` on the remote so pipes, redirects, and
-    /// shell expansions all work normally. There is no length cap, but
-    /// keep it sensible — this is "batch a handful of related ops",
-    /// not "stream thousands of commands".
+    /// Shell commands to run in order. Each runs under `bash -c`.
     pub commands: Vec<String>,
-    /// Stop on first non-zero exit. Default `true`. Skipped commands
-    /// are recorded with `exit_code: null` and `skipped: true`.
+    /// Stop on first non-zero exit. Default true; skipped entries get exit_code=null.
     #[serde(default)]
     pub fail_fast: Option<bool>,
-    /// Total timeout for the whole batch (seconds). Defaults to the
-    /// server's `PROMPTO_DEFAULT_TIMEOUT_SECS` × max(commands.len(), 1).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GainArgs {
-    /// Optional lookback window in seconds. Omit to include every event
-    /// in the log.
+    /// Lookback window in seconds. Omit for all-time.
     #[serde(default)]
     pub since_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpClientArgs {
-    /// Inventory host name with the `claude_admin` capability — the
-    /// machine prompto will SSH to in order to run `claude mcp …`.
+    /// Inventory host with `claude_admin`.
     pub client: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpGetArgs {
     pub client: String,
-    /// MCP server name as registered in the client's `~/.claude.json`.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpAddArgs {
     pub client: String,
-    /// Name to register the MCP under (e.g. "memqdrant").
     pub name: String,
-    /// Transport — typically "http" for streamable-HTTP servers, or
-    /// "stdio" for child-process MCPs.
+    /// "http" for streamable-HTTP, "stdio" for child-process.
     pub transport: String,
-    /// URL for HTTP transports, or full executable path for stdio.
+    /// URL for http, executable path for stdio.
     pub url_or_cmd: String,
-    /// Scope: `user` (default), `project`, or `local`.
+    /// user (default) | project | local.
     #[serde(default)]
     pub scope: Option<Scope>,
 }
@@ -152,10 +138,9 @@ pub struct McpRemoveArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScriptExecArgs {
     pub host: String,
-    /// Source code, sent through SSH stdin verbatim.
+    /// Source code, piped via SSH stdin.
     pub script: String,
-    /// Optional positional arguments — become argv after the script.
-    /// No whitespace or shell metacharacters.
+    /// Positional args (no whitespace, no shell metas).
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -164,19 +149,12 @@ pub struct ScriptExecArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PythonExecArgs {
-    /// Inventory host with the `exec` capability.
     pub host: String,
-    /// Python source code. Sent through SSH stdin, not interpolated into
-    /// a shell — quotes, heredocs, embedded JSON all survive untouched.
+    /// Python source, piped via SSH stdin.
     pub script: String,
-    /// Optional positional arguments. Become `sys.argv[1:]` inside the
-    /// script. Each arg is validated against shell metacharacters and
-    /// must not contain whitespace — pass complex inputs via the script
-    /// body or stdin instead.
+    /// argv tail (no whitespace, no shell metas).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Per-command timeout (seconds). Defaults to the server's
-    /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -189,30 +167,24 @@ pub struct PathArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RsyncSyncArgs {
-    /// Inventory host name where the source files live. Must have `exec`.
     pub source_host: String,
-    /// Path on `source_host`. Trailing `/` matters per rsync semantics
-    /// (`/foo/` → "contents of foo", `/foo` → "the foo dir").
+    /// Trailing `/` matters: `/foo/` → contents, `/foo` → the dir.
     pub source_path: String,
-    /// Inventory host name to push to. Must have `exec`. Source host must
-    /// already have an SSH key for this dest host (typical homelab
-    /// setup where every box carries the same admin key).
     pub dest_host: String,
     pub dest_path: String,
-    /// `-a` (archive: recursive, preserve perms/links/times). Default true.
+    /// `-a` (archive). Default true.
     #[serde(default)]
     pub archive: Option<bool>,
     /// `--delete`. Default false.
     #[serde(default)]
     pub delete: Option<bool>,
-    /// `--dry-run`. Default false. Pairs well with `--stats` to preview.
+    /// `--dry-run`. Default false.
     #[serde(default)]
     pub dry_run: Option<bool>,
-    /// rsync `--exclude=PATTERN` values. Each is shell-meta validated.
+    /// `--exclude=PATTERN` values.
     #[serde(default)]
     pub excludes: Vec<String>,
-    /// Per-command timeout (seconds). Defaults to 300 (5 min) — rsync
-    /// can take a while on big trees.
+    /// Default 300s.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -220,17 +192,15 @@ pub struct RsyncSyncArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PortScanArgs {
     pub host: String,
-    /// List of TCP ports to probe (e.g. [22, 80, 443, 6337]).
     pub ports: Vec<u16>,
-    /// Per-port probe budget in milliseconds. Default 500, clamped 50..=5000.
+    /// Per-port budget (ms). Default 500, clamped 50..5000.
     #[serde(default)]
     pub probe_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InventoryAddHostArgs {
-    /// Inventory key (e.g. "doppio", "alpha"). Validated against
-    /// alphanumerics + `-`/`_`.
+    /// Inventory key (alnum + -_).
     pub name: String,
     pub ip: String,
     pub ssh_user: String,
@@ -257,20 +227,17 @@ pub struct InventoryCapabilityArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ServiceControlArgs {
     pub host: String,
-    /// systemd unit name (e.g. "memqdrant", "nginx", "doppio-mqtt").
     pub unit: String,
-    /// One of: start, stop, restart, reload, enable, disable, status,
-    /// is-active, is-enabled.
+    /// start | stop | restart | reload | enable | disable | status | is-active | is-enabled.
     pub action: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileReadArgs {
     pub host: String,
-    /// Absolute or relative path on the remote host. Must contain no
-    /// shell metacharacters or whitespace.
+    /// No shell metas, no whitespace.
     pub path: String,
-    /// Max bytes to read. Defaults to 65_536 (64 KB). Clamped to 1 MB.
+    /// Default 64 KB, clamped to 1 MB.
     #[serde(default)]
     pub max_bytes: Option<u64>,
 }
@@ -279,28 +246,21 @@ pub struct FileReadArgs {
 pub struct FileWriteArgs {
     pub host: String,
     pub path: String,
-    /// Bytes to write. Stored verbatim — pipes through SSH stdin to
-    /// avoid shell quoting on the content.
+    /// Piped via SSH stdin (no shell quoting).
     pub content: String,
-    /// Optional octal mode (`"0644"`, `"755"`, …). Applied via `chmod`
-    /// after the write.
+    /// Octal mode applied via chmod after write.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Set to `true` to write via `sudo -n tee` (requires the host to
-    /// have the `sudo_exec` capability). Default `false`.
+    /// Use `sudo -n tee`. Default false.
     #[serde(default)]
     pub sudo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpLogsArgs {
-    /// Inventory host where the MCP daemon's systemd unit lives. Must
-    /// have the `sudo_exec` capability so journalctl can read the unit
-    /// scope.
     pub host: String,
-    /// systemd unit name (e.g. "memqdrant", "bucciarati", "prompto").
     pub unit: String,
-    /// Lines to tail. Clamped server-side to 1..=1000. Default 50.
+    /// Default 50, clamped 1..1000.
     #[serde(default)]
     pub lines: Option<u32>,
 }
@@ -463,7 +423,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Wake a host with a UDP magic packet (broadcast :9). The host's MAC must be in the inventory and the host must have the `wake` capability."
+        description = "Wake a host via WOL magic packet."
     )]
     async fn host_wake(
         &self,
@@ -485,7 +445,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Probe the host's SSH port with a TCP connect. Returns `up` (connected), `unreachable` (refused), or `off` (timed out)."
+        description = "TCP-probe a host's SSH port. Returns up | unreachable | off."
     )]
     async fn host_status(
         &self,
@@ -503,7 +463,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Shutdown a host via `sudo -n shutdown -h now` over SSH. Requires the `sudo_exec` capability."
+        description = "Shutdown a host (`sudo -n shutdown -h now`)."
     )]
     async fn host_sleep(
         &self,
@@ -522,7 +482,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List all libvirt domains on a host (`virsh list --all`). Requires the `virt` capability."
+        description = "List libvirt domains on a host (`virsh list --all`)."
     )]
     async fn vm_list(
         &self,
@@ -540,7 +500,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Get the libvirt state of a single domain (`virsh domstate`). Returns the raw state string (e.g. \"running\", \"shut off\", \"pmsuspended\")."
+        description = "Get libvirt domain state (`virsh domstate`): running | shut off | pmsuspended | …"
     )]
     async fn vm_state(
         &self,
@@ -558,7 +518,7 @@ impl Prompto {
         self.finish_tool("vm_state", Some(&host_name), started, res)
     }
 
-    #[tool(description = "Start a libvirt domain (`virsh start`). Requires `virt`.")]
+    #[tool(description = "Start a libvirt domain (`virsh start`).")]
     async fn vm_start(
         &self,
         Parameters(args): Parameters<VmArgs>,
@@ -576,7 +536,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Stop a libvirt domain via the fallback chain: `dompmsuspend disk` (S4 hibernate) → `shutdown` (ACPI) → `destroy` (force kill). Each step has its own timeout. Returns the outcome and the final state. Requires `virt`."
+        description = "Stop a libvirt domain via dompmsuspend → shutdown → destroy fallback chain."
     )]
     async fn vm_stop(
         &self,
@@ -598,7 +558,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Wake a host (if needed), start a VM (if needed), and wait until the host is SSH-reachable. Useful as a single call before issuing other work to a VM. Requires `wake` + `virt`."
+        description = "Wake host (if down) + start VM (if not running) + wait for SSH-ready. One call before issuing VM work."
     )]
     async fn vm_ensure_up(
         &self,
@@ -639,7 +599,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command on a host over SSH and return stdout, stderr, exit code, and timeout flag. Output is run through the built-in filter chain (cargo test/build, git log/diff/show, journalctl, find, ls -l) — the response includes a `filter` field naming whichever filter compacted stdout, plus original/filtered byte counts. Requires `exec`."
+        description = "Run a command on a host over SSH. Returns stdout/stderr/exit. stdout passes through a 26-filter chain (cargo, git, journalctl, find, pkg, k8s, …) that names the applied filter in the response. For N commands on the same host, prefer ssh_batch."
     )]
     async fn ssh_exec(
         &self,
@@ -659,7 +619,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a list of commands on a host in a SINGLE SSH session and return one structured result with per-command exit code, output, and timing. Use this instead of calling `ssh_exec` N times when the operations are independent and on the same host (destroying multiple ZFS snapshots, restarting a list of services, querying a fleet of paths, batched cleanups, fan-out checks). Saves N-1 round trips, the JSON envelope per call, AND the conversation accumulation cost of N tool_use blocks in context — the dominant cost for sequential ops. By default `fail_fast=true`: a non-zero exit halts the batch and remaining commands are recorded as `skipped: true`. Set `fail_fast=false` to run them all regardless. Each command runs under `bash -c` on the remote (full shell features). Commands are NOT individually filtered through the output filter chain — keep batch commands tight (`zfs destroy`, `systemctl restart`, etc.) rather than batching big-output greps. Requires `exec`."
+        description = "Run N commands on one host in a single SSH session. PREFER OVER repeated ssh_exec for same-host sequences (snapshot destroys, service restarts, fan-out checks) — saves N-1 round trips and the conversation accumulation cost. Returns per-command exit/output/timing. fail_fast (default true) skips remaining on first failure. Keep commands tight; batch stdout is not filter-chained."
     )]
     async fn ssh_batch(
         &self,
@@ -695,7 +655,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Python script on a remote host. The script body is piped through SSH stdin, NOT interpolated into a shell — embedded quotes, heredocs, JSON literals, etc. survive untouched, eliminating the quoting hell of `ssh_exec \"python3 -c '...'\"`. Optional `args` become `sys.argv[1:]` inside the script. stderr is auto-compacted to `ExceptionType: message (N frames; last: file:line)` when a Python traceback is detected. Requires `exec`."
+        description = "Run Python on a remote host. Script body piped via SSH stdin — no shell quoting hell. args → sys.argv[1:]. Tracebacks auto-compacted."
     )]
     async fn python_exec(
         &self,
@@ -737,7 +697,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Node.js script on a remote host. Same stdin-piping shape as `python_exec` — embedded quotes, JSON literals, multi-line code all survive. stderr is auto-compacted to `Error: message (N frames; last: file:line)` when a V8 stack trace is detected. Requires `exec`."
+        description = "Run Node.js on a remote host. Script body via SSH stdin. Stack traces auto-compacted."
     )]
     async fn node_exec(
         &self,
@@ -771,7 +731,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Ruby script on a remote host. Body piped through SSH stdin (no quoting hell). Output passes through unchanged. Requires `exec`."
+        description = "Run Ruby on a remote host. Script body via SSH stdin."
     )]
     async fn ruby_exec(
         &self,
@@ -781,7 +741,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Perl script on a remote host. Body piped through SSH stdin. Output passes through unchanged. Requires `exec`."
+        description = "Run Perl on a remote host. Script body via SSH stdin."
     )]
     async fn perl_exec(
         &self,
@@ -791,7 +751,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Deno (TypeScript/JavaScript) script on a remote host via `deno run -`. Body piped through SSH stdin. Output passes through unchanged. Requires `exec`."
+        description = "Run Deno (TS/JS) on a remote host via `deno run -`. Script body via SSH stdin."
     )]
     async fn deno_exec(
         &self,
@@ -801,7 +761,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List a directory on a remote host (`ls -la --time-style=long-iso <path>`) and return parsed entries: { name, mode, size, owner, group, mtime, is_dir, is_link }. Requires `exec`."
+        description = "List a directory on a remote host. Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link }."
     )]
     async fn file_list(
         &self,
@@ -838,7 +798,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Stat a file on a remote host (`stat -c '%a|%s|%U|%G|%y|%F|%n' <path>`) and return typed { path, mode (octal), size, owner, group, mtime, kind }. Requires `exec`."
+        description = "Stat a remote file. Returns typed { path, mode (octal), size, owner, group, mtime, kind }."
     )]
     async fn file_stat(
         &self,
@@ -874,7 +834,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List every host in the inventory with its capabilities. ssh_key paths are NOT exposed (they're server-side filesystem details). Read-only — no inventory mutation."
+        description = "List inventory hosts with their capabilities. Read-only."
     )]
     async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
@@ -904,7 +864,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Get one host's full configuration from the inventory. ssh_key path is NOT exposed."
+        description = "Get one host's inventory config (ssh_key path elided)."
     )]
     async fn inventory_get_host(
         &self,
@@ -929,7 +889,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Add a new host to the inventory and persist to disk (atomic tmp+rename). The prompto user must have write permission on the inventory file. Validates the host config before persisting and refuses to write an inventory that wouldn't parse back. NOTE: comments and key ordering in the source TOML are NOT preserved across edits."
+        description = "Add a host to the inventory and persist (atomic). Validates before write. NOTE: TOML comments/ordering are NOT preserved across edits."
     )]
     async fn inventory_add_host(
         &self,
@@ -995,7 +955,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Add a capability to a host's allowlist (e.g. grant `wake` to a newly-discovered MAC-known host). Idempotent — granting an already-present capability is a no-op."
+        description = "Grant a capability to a host. Idempotent."
     )]
     async fn inventory_grant_capability(
         &self,
@@ -1029,7 +989,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Remove a capability from a host's allowlist. Idempotent — revoking an absent capability is a no-op."
+        description = "Revoke a capability from a host. Idempotent."
     )]
     async fn inventory_revoke_capability(
         &self,
@@ -1066,7 +1026,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Sync files between two inventory hosts via rsync. prompto SSHs to source_host and runs rsync there, targeting dest_host. Both hosts need `exec` capability AND source_host must have its own SSH key for dest_host (typical homelab: every box carries the same admin key). Trailing `/` on paths matters per rsync convention. Output is auto-compacted to just the --stats block — drops the per-file progress lines. Timeout default 300s. Replaces the 'copy 30 files one-by-one with file_write' anti-pattern (~17K tokens) with a single call (~150 tokens)."
+        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). source_host SSHs to dest_host (needs key already trusted). Trailing `/` on paths matters. Output is the --stats block."
     )]
     async fn rsync_sync(
         &self,
@@ -1115,7 +1075,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "TCP-probe a list of ports against a host from prompto's vantage point (no SSH). Returns per-port reachability + latency_ms. Useful for verifying which services are actually listening before touching them. Per-probe timeout default 500ms. Capability: none beyond inventory presence."
+        description = "TCP-probe a list of ports on a host (no SSH). Returns per-port reachable + latency_ms."
     )]
     async fn port_scan(
         &self,
@@ -1145,7 +1105,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Composite health probe for a host. Runs a single bash pipeline that gathers uptime, load average, memory (MB), root-disk usage, last-boot time, kernel version, listening sockets (top 30), and failed systemd units. Parses everything into a tight typed report. Replaces ~5 sequential ssh_exec calls with one round-trip. Requires `exec`."
+        description = "Composite host health: uptime, load, mem (MB), disk, last-boot, kernel, listening ports (top 30), failed units. One round-trip; replaces ~5 ssh_exec calls."
     )]
     async fn host_diagnose(
         &self,
@@ -1179,7 +1139,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Drive a systemd unit on a remote host (`sudo -n systemctl <action> <unit>`). Action must be one of: start, stop, restart, reload, enable, disable, status, is-active, is-enabled. unit name is validated against shell metacharacters before interpolation. For `status`, stdout is auto-compacted to header + Loaded/Active/Memory/etc lines (the journal tail is dropped — use `mcp_logs` for logs). Requires `sudo_exec`."
+        description = "Drive a systemd unit (start/stop/restart/reload/enable/disable/status/is-active/is-enabled). status output is auto-compacted (journal tail dropped — use mcp_logs for logs)."
     )]
     async fn service_control(
         &self,
@@ -1234,7 +1194,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Read a file from a remote host (`head -c <max_bytes> -- <path>`). Default max_bytes 65_536; clamped to 1 MB. Path is validated against shell metacharacters. Returns the bytes plus a `truncated` flag set when the read hit the cap (file may be larger). Requires `exec`."
+        description = "Read a remote file. max_bytes default 64 KB, clamped to 1 MB. Returns content + `truncated` flag."
     )]
     async fn file_read(
         &self,
@@ -1266,7 +1226,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Write bytes to a file on a remote host (`tee -- <path>`, content piped via SSH stdin so no shell quoting applies to the body). Optional `mode` runs `chmod <mode>` after. Set `sudo=true` to use `sudo -n tee` (requires `sudo_exec` capability — otherwise `exec` is enough). Path is validated against shell metacharacters."
+        description = "Write a remote file (content via SSH stdin, no shell quoting). Optional mode runs chmod after. sudo=true uses sudo -n tee."
     )]
     async fn file_write(
         &self,
@@ -1300,7 +1260,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a Bash script on a remote host. Body piped through SSH stdin (no quoting hell). Output is NOT auto-compacted — bash errors are usually short enough that any compaction would risk dropping context. Requires `exec`."
+        description = "Run Bash on a remote host. Script body via SSH stdin."
     )]
     async fn bash_exec(
         &self,
@@ -1330,7 +1290,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command via `sudo -n` over SSH (passwordless sudo only — fails fast if a password would be required). Output is run through the same filter chain as `ssh_exec`. Requires `sudo_exec`."
+        description = "Run a command via `sudo -n` over SSH. Passwordless sudo only. Same filter chain as ssh_exec."
     )]
     async fn ssh_sudo_exec(
         &self,
@@ -1350,7 +1310,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List MCP servers registered in the target client's `~/.claude.json` (`claude mcp list`). Requires the `claude_admin` capability."
+        description = "List MCP servers registered on a client (`claude mcp list`)."
     )]
     async fn mcp_list(
         &self,
@@ -1369,7 +1329,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Show full config for one registered MCP server on a client (`claude mcp get <name>`). Requires `claude_admin`."
+        description = "Show one MCP server's config on a client (`claude mcp get <name>`)."
     )]
     async fn mcp_get(
         &self,
@@ -1388,7 +1348,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Register an MCP server on a client (`claude mcp add --transport <transport> --scope <scope> <name> <url|cmd>`). Affects the on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers like `claude -p` (claudecli's per-message path) pick up the change on their next invocation. Requires `claude_admin`."
+        description = "Register an MCP server on a client. Edits on-disk config; interactive sessions need /mcp to refresh."
     )]
     async fn mcp_add(
         &self,
@@ -1420,7 +1380,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Unregister an MCP server on a client (`claude mcp remove --scope <scope> <name>`). Requires `claude_admin`."
+        description = "Unregister an MCP server on a client."
     )]
     async fn mcp_remove(
         &self,
@@ -1444,7 +1404,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Restart claudecli (the Telegram bridge) on a client. Tries `systemctl --user restart claudecli` first, then falls back to re-spawning the tmux session. Best-effort. Requires `claude_admin`."
+        description = "Restart claudecli (Telegram bridge) on a client. systemctl-then-tmux fallback. Best-effort."
     )]
     async fn mcp_restart_claudecli(
         &self,
@@ -1463,7 +1423,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Health-check every MCP server registered on a client. Reads `claude mcp list` from the client, then probes each entry's URL directly from prompto's host (TCP connect within ~500ms). Distinguishes 'configured but unreachable' (real outage — daemon down or network broken) from 'configured and reachable' (just a stale session — `/mcp` or a fresh `claude -p` will fix it). Requires `claude_admin` on the target client."
+        description = "Health-check every MCP server on a client. Distinguishes 'unreachable' (real outage) from 'reachable but session stale' (/mcp will fix)."
     )]
     async fn mcp_status(
         &self,
@@ -1503,7 +1463,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Tail the systemd journal of a service on a host (`sudo -n journalctl -u <unit> -n <lines> --no-pager`). Use this to inspect why an MCP daemon (memqdrant, bucciarati, prompto, etc.) is misbehaving. Requires the `sudo_exec` capability on the target. `lines` defaults to 50 and is clamped to 1..=1000."
+        description = "Tail systemd journal for a unit. lines default 50, clamped 1..1000."
     )]
     async fn mcp_logs(
         &self,
@@ -1528,7 +1488,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Returns advice on how to recover from an MCP-server disconnect. There is no in-session re-handshake API in Claude Code today — interactive sessions need `/mcp`, while stateless callers (claudecli's `claude -p`) refresh on every message. Surface this hint to the user when `mcp_status` reports a server as reachable but their tool calls still fail."
+        description = "Advice for recovering from MCP-server disconnects (interactive sessions need /mcp; claude -p refreshes per-message)."
     )]
     async fn mcp_reconnect_hint(&self) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
@@ -1545,7 +1505,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Token-savings analytics — how much agent context this prompto instance has saved versus an estimated SSH+bash baseline. Pass `since_secs` to bound the lookback window (e.g. 86400 for the last 24h). Returns total + per-tool breakdown."
+        description = "Token-savings analytics vs an SSH+bash baseline. Optional since_secs lookback. Returns total + per-tool breakdown."
     )]
     async fn prompto_gain(
         &self,
