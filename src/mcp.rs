@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use mcp_gain::Tracker;
 
+use crate::batch;
 use crate::claudemgr::{self, Scope};
 use crate::diagnose;
 use crate::files;
@@ -80,6 +81,25 @@ pub struct ExecArgs {
     pub cmd: String,
     /// Per-command timeout (seconds). Defaults to the server's
     /// `PROMPTO_DEFAULT_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchArgs {
+    pub host: String,
+    /// List of shell commands to run in order, in a single SSH session.
+    /// Each runs under `bash -c` on the remote so pipes, redirects, and
+    /// shell expansions all work normally. There is no length cap, but
+    /// keep it sensible — this is "batch a handful of related ops",
+    /// not "stream thousands of commands".
+    pub commands: Vec<String>,
+    /// Stop on first non-zero exit. Default `true`. Skipped commands
+    /// are recorded with `exit_code: null` and `skipped: true`.
+    #[serde(default)]
+    pub fail_fast: Option<bool>,
+    /// Total timeout for the whole batch (seconds). Defaults to the
+    /// server's `PROMPTO_DEFAULT_TIMEOUT_SECS` × max(commands.len(), 1).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -636,6 +656,42 @@ impl Prompto {
         }
         .await;
         self.finish_tool("ssh_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
+        description = "Run a list of commands on a host in a SINGLE SSH session and return one structured result with per-command exit code, output, and timing. Use this instead of calling `ssh_exec` N times when the operations are independent and on the same host (destroying multiple ZFS snapshots, restarting a list of services, querying a fleet of paths, batched cleanups, fan-out checks). Saves N-1 round trips, the JSON envelope per call, AND the conversation accumulation cost of N tool_use blocks in context — the dominant cost for sequential ops. By default `fail_fast=true`: a non-zero exit halts the batch and remaining commands are recorded as `skipped: true`. Set `fail_fast=false` to run them all regardless. Each command runs under `bash -c` on the remote (full shell features). Commands are NOT individually filtered through the output filter chain — keep batch commands tight (`zfs destroy`, `systemctl restart`, etc.) rather than batching big-output greps. Requires `exec`."
+    )]
+    async fn ssh_batch(
+        &self,
+        Parameters(args): Parameters<BatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let res: anyhow::Result<_> = async {
+            if args.commands.is_empty() {
+                anyhow::bail!("commands list is empty");
+            }
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::Exec)?;
+            let fail_fast = args.fail_fast.unwrap_or(true);
+            let n = args.commands.len() as u64;
+            let to = args
+                .timeout_secs
+                .map(Duration::from_secs)
+                .or_else(|| Some(self.ssh.default_timeout * n.max(1) as u32));
+            let script = batch::build_script(&args.commands, fail_fast);
+            let raw = self
+                .ssh
+                .exec_stdin(host, "bash", script.as_bytes(), to, false)
+                .await?;
+            if raw.timed_out {
+                anyhow::bail!("batch timed out (>{:?})", to.unwrap_or_default());
+            }
+            let parsed = batch::parse_output(&raw.stdout, &args.commands)?;
+            Ok(parsed)
+        }
+        .await;
+        self.finish_tool("ssh_batch", Some(&host_name), started, res)
     }
 
     #[tool(

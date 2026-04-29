@@ -28,6 +28,11 @@ pub const BASELINES: &[(&str, u32)] = &[
     // back below the baseline, restoring honest savings %.
     ("ssh_exec", 1200),
     ("ssh_sudo_exec", 1300),
+    // ssh_batch: equivalent to N sequential ssh_exec calls. Baseline
+    // assumes a modest 5-command batch — that's the median use case
+    // (destroying a few snapshots, restarting a handful of services).
+    // Heavier batches save proportionally more.
+    ("ssh_batch", 6000),
     // script_*: piped-stdin interpreter invocation. Baseline includes the
     // typical "I tried to ssh+heredoc this and got mangled" round-trip
     // an agent does today (failed attempt + retry + traceback noise).

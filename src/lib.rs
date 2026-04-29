@@ -4,6 +4,7 @@
 //! binary uses.
 
 pub mod baselines;
+pub mod batch;
 pub mod claudemgr;
 pub mod diagnose;
 pub mod files;
