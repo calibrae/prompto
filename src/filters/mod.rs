@@ -26,6 +26,7 @@ pub mod python;
 pub mod rsync;
 pub mod sys;
 pub mod system;
+pub mod zfs;
 
 pub trait CommandFilter: Send + Sync {
     /// Stable identifier used in the response so callers can see which
@@ -104,6 +105,10 @@ impl Default for FilterChain {
                 Box::new(pkg::SystemctlUnits),
                 Box::new(pkg::Dnf),
                 Box::new(rsync::Rsync),
+                Box::new(zfs::ZfsList),
+                Box::new(zfs::ZfsGet),
+                Box::new(zfs::ZpoolStatus),
+                Box::new(zfs::ZpoolList),
                 Box::new(system::Journalctl),
                 Box::new(system::FindCmd),
                 Box::new(system::LsLong),

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use mcp_gain::Tracker;
 
+use crate::advisor::Advisor;
 use crate::batch;
 use crate::claudemgr::{self, Scope};
 use crate::diagnose;
@@ -35,6 +36,7 @@ pub struct Prompto {
     ssh: Arc<SshClient>,
     tracker: Arc<Tracker>,
     filters: Arc<FilterChain>,
+    advisor: Arc<Advisor>,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -335,6 +337,7 @@ impl Prompto {
             ssh,
             tracker,
             filters: Arc::new(FilterChain::default()),
+            advisor: Arc::new(Advisor::new()),
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
@@ -405,13 +408,18 @@ impl Prompto {
         res: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
         let exec_ms = started.elapsed().as_millis() as u64;
+        let hint = self.advisor.record(tool, host);
         match res {
             Ok(v) => {
                 let payload = serde_json::to_value(&v).unwrap_or_default();
                 let body = payload.to_string();
                 self.tracker
                     .record(tool, host, true, exec_ms, body.len() as u64);
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                let mut blocks = vec![Content::text(body)];
+                if let Some(h) = hint {
+                    blocks.push(Content::text(format!("[advisor] {h}")));
+                }
+                Ok(CallToolResult::success(blocks))
             }
             Err(e) => {
                 let msg = e.to_string();

@@ -3,6 +3,7 @@
 //! Library surface so integration tests can drive the same code paths the
 //! binary uses.
 
+pub mod advisor;
 pub mod baselines;
 pub mod batch;
 pub mod claudemgr;

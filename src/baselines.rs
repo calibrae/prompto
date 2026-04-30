@@ -8,7 +8,7 @@
 //! `baseline_source` in the response carries the version so the numbers
 //! stay auditable.
 
-pub const SOURCE: &str = "estimate@v2";
+pub const SOURCE: &str = "estimate@v3";
 
 pub const BASELINES: &[(&str, u32)] = &[
     // host_*
@@ -56,7 +56,9 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("file_stat", 250),
     ("port_scan", 200),
     // inventory_*
-    ("inventory_list", 400),
+    // v3 recalibration: returning all 24 hosts is ~5 KB of JSON ≈ 1300
+    // tokens. Old 400 baseline was leaking -61% gain.
+    ("inventory_list", 1400),
     ("inventory_get_host", 200),
     ("inventory_add_host", 150),
     ("inventory_remove_host", 100),
@@ -71,7 +73,9 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("mcp_add", 180),
     ("mcp_remove", 140),
     ("mcp_restart_claudecli", 200),
-    ("mcp_status", 280),
+    // v3: probes ALL servers on the client (~3-6 entries) → ~1.3 KB of
+    // structured JSON. Old 280 baseline was leaking -16% gain.
+    ("mcp_status", 700),
     ("mcp_logs", 600),
     ("mcp_reconnect_hint", 200),
     // self — no SSH equivalent, baseline 0 → saved 0
