@@ -18,6 +18,10 @@ pub enum Capability {
     /// Add to hosts where you want prompto to manage MCP server registration
     /// remotely — typically the macOS boxes that have npm-installed `claude`.
     ClaudeAdmin,
+    /// Host runs an [apytti](https://github.com/calibrae/apytti) gateway
+    /// reachable from prompto. Required to use `claude_exec` against this
+    /// host. The host's `apytti_url` must be set.
+    ClaudeExec,
 }
 
 impl Capability {
@@ -28,6 +32,7 @@ impl Capability {
             Capability::SudoExec => "sudo_exec",
             Capability::Virt => "virt",
             Capability::ClaudeAdmin => "claude_admin",
+            Capability::ClaudeExec => "claude_exec",
         }
     }
 }
@@ -45,6 +50,10 @@ pub struct HostConfig {
     pub ssh_key: PathBuf,
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
+    /// URL of the apytti gateway running on this host (e.g. `http://10.10.0.2:7781`).
+    /// Required when the `claude_exec` capability is granted.
+    #[serde(default)]
+    pub apytti_url: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 }
@@ -64,6 +73,9 @@ impl HostConfig {
         }
         if self.has(Capability::Wake) && self.mac.is_none() {
             bail!("host {name}: wake capability requires `mac`");
+        }
+        if self.has(Capability::ClaudeExec) && self.apytti_url.is_none() {
+            bail!("host {name}: claude_exec capability requires `apytti_url`");
         }
         if let Some(mac) = &self.mac {
             crate::wol::parse_mac(mac).with_context(|| format!("host {name}: invalid mac"))?;

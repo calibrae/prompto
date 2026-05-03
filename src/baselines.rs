@@ -33,6 +33,11 @@ pub const BASELINES: &[(&str, u32)] = &[
     // (destroying a few snapshots, restarting a handful of services).
     // Heavier batches save proportionally more.
     ("ssh_batch", 6000),
+    // claude_exec: agent-as-tool, intelligent compaction. Baseline assumes
+    // the equivalent task done via ssh_exec would have pulled ~5 KB of raw
+    // output the caller then has to parse — vs the remote agent returning
+    // ~200 chars of summary.
+    ("claude_exec", 5000),
     // script_*: piped-stdin interpreter invocation. Baseline includes the
     // typical "I tried to ssh+heredoc this and got mangled" round-trip
     // an agent does today (failed attempt + retry + traceback noise).

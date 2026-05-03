@@ -4,6 +4,7 @@
 //! binary uses.
 
 pub mod advisor;
+pub mod apytti_client;
 pub mod baselines;
 pub mod batch;
 pub mod claudemgr;
@@ -15,6 +16,7 @@ pub mod inventory;
 pub mod mcp;
 pub mod mcpprobe;
 pub mod portscan;
+pub mod router;
 pub mod rsync;
 pub mod script;
 pub mod ssh;

@@ -15,8 +15,10 @@ use std::time::{Duration, Instant};
 use mcp_gain::Tracker;
 
 use crate::advisor::Advisor;
+use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::batch;
 use crate::claudemgr::{self, Scope};
+use crate::router::{self, Tier};
 use crate::diagnose;
 use crate::files;
 use crate::filters::FilterChain;
@@ -93,6 +95,35 @@ pub struct BatchArgs {
     /// Stop on first non-zero exit. Default true; skipped entries get exit_code=null.
     #[serde(default)]
     pub fail_fast: Option<bool>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaudeExecArgs {
+    /// Inventory host with `claude_exec` (apytti gateway must be reachable).
+    pub host: String,
+    /// What you want the remote agent to do, in plain language.
+    /// The agent runs ON the target host and can use its tools (Bash,
+    /// Read, etc.) to investigate before answering.
+    pub task: String,
+    /// Semantic resource hint: fast (Haiku, triage) | balanced (Sonnet,
+    /// diagnostic) | deep (Opus, real fuckeries). Default: balanced.
+    #[serde(default)]
+    pub tier: Option<Tier>,
+    /// Override apytti backend (claude / gemini / copilot / ollama).
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Override model within the chosen backend.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Override effort (low / medium / high).
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Resume an earlier remote-agent conversation.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Hard wall-time cap for the whole call (seconds). Default 120.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -663,6 +694,58 @@ impl Prompto {
     }
 
     #[tool(
+        description = "Delegate a task to a Claude agent running on the target host (intelligent compaction). The remote agent reads verbose output, runs whatever commands it needs, and returns one tight summary — vs ssh_exec where YOU pull raw output and parse it. Best for triage, log analysis, multi-step diagnostics. Routes through apytti gateway on the host. Tier hint (fast/balanced/deep) maps to model+effort; explicit backend/model/effort fields override. Slower than ssh_exec (3-30s) and non-deterministic — don't use for structured tasks where filters already do the job."
+    )]
+    async fn claude_exec(
+        &self,
+        Parameters(args): Parameters<ClaudeExecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let host_name = args.host.clone();
+        let total_timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
+        let res: anyhow::Result<_> = async {
+            if args.task.trim().is_empty() {
+                anyhow::bail!("task is empty");
+            }
+            let inv = self.inv.snapshot();
+            let host = inv.require(&args.host, Capability::ClaudeExec)?;
+            let url = host
+                .apytti_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("host {} has no apytti_url", args.host))?;
+
+            let route = router::route(
+                args.tier,
+                args.backend.as_deref(),
+                args.model.as_deref(),
+                args.effort.as_deref(),
+            );
+
+            let client = ApyttiClient::new(url.to_string());
+            let req = ApyttiAsk {
+                prompt: &args.task,
+                backend: Some(route.backend.as_str()),
+                model: Some(route.model.as_str()),
+                effort: Some(route.effort.as_str()),
+                session_id: args.session_id.as_deref(),
+            };
+            let resp = client.ask(req, total_timeout).await?;
+            Ok(serde_json::json!({
+                "host": args.host,
+                "response": resp.response,
+                "session_id": resp.session_id,
+                "cost_usd": resp.cost_usd,
+                "backend": resp.backend.unwrap_or_else(|| route.backend.clone()),
+                "model": route.model,
+                "effort": route.effort,
+                "tier": route.tier,
+            }))
+        }
+        .await;
+        self.finish_tool("claude_exec", Some(&host_name), started, res)
+    }
+
+    #[tool(
         description = "Run Python on a remote host. Script body piped via SSH stdin — no shell quoting hell. args → sys.argv[1:]. Tracebacks auto-compacted."
     )]
     async fn python_exec(
@@ -913,6 +996,7 @@ impl Prompto {
                 ssh_user: args.ssh_user,
                 ssh_key: args.ssh_key.into(),
                 ssh_port: args.ssh_port.unwrap_or(22),
+                apytti_url: None,
                 capabilities: args.capabilities,
             };
             self.inv.edit(|inv| {

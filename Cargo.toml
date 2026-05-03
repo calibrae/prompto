@@ -1,6 +1,6 @@
 [package]
 name = "prompto"
-version = "0.6.15"
+version = "0.6.16"
 edition = "2024"
 description = "MCP server for homelab power & lifecycle (WOL, virsh) and typed SSH exec"
 license = "MIT"
@@ -24,6 +24,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 mcp-gain = { git = "https://github.com/calibrae/mcp-gain", tag = "v0.1.0" }
 tier-parse = { git = "https://github.com/calibrae/tier-parse" }
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
