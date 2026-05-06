@@ -61,7 +61,7 @@ impl ApyttiClient {
             .timeout(total_timeout)
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?;
+            .map_err(|e| anyhow::anyhow!("POST {url}: {e:#}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
