@@ -196,8 +196,9 @@ async fn main() -> Result<()> {
             .with_context(|| format!("bind {}", cfg.bind))?;
         let cancel = CancellationToken::new();
 
-        let mut http_config =
-            StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token());
+        let mut http_config = StreamableHttpServerConfig::default()
+            .with_cancellation_token(cancel.child_token())
+            .with_accept_unknown_sessions(true);
         match std::env::var("PROMPTO_ALLOWED_HOSTS") {
             Ok(raw) if raw.trim() == "*" => {
                 tracing::warn!(
