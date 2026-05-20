@@ -65,10 +65,6 @@ pub const BASELINES: &[(&str, u32)] = &[
     // tokens. Old 400 baseline was leaking -61% gain.
     ("inventory_list", 1400),
     ("inventory_get_host", 200),
-    ("inventory_add_host", 150),
-    ("inventory_remove_host", 100),
-    ("inventory_grant_capability", 100),
-    ("inventory_revoke_capability", 100),
     // rsync_sync: equivalent to a hand-rolled "ssh src 'rsync -av … dst'"
     // dance with full progress lines; baseline assumes ~30 files synced.
     ("rsync_sync", 1500),
