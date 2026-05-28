@@ -145,12 +145,6 @@ impl Inventory {
         cap: Capability,
     ) -> Result<&HostConfig> {
         let host = self.require(name, cap)?;
-        tracing::warn!(
-            target = name,
-            target_ip = %host.ip,
-            caller_ip = ?caller_ip,
-            "require_remote self-check"
-        );
         if let Some(caller) = caller_ip
             && let Ok(target_ip) = host.ip.parse::<std::net::IpAddr>()
             && caller == target_ip
