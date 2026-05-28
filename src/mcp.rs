@@ -17,7 +17,6 @@ use mcp_gain::Tracker;
 use crate::advisor::Advisor;
 use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::batch;
-use crate::caller;
 use crate::claudemgr::{self, Scope};
 use crate::router::{self, Tier};
 use crate::diagnose;
@@ -39,6 +38,12 @@ pub struct Prompto {
     tracker: Arc<Tracker>,
     filters: Arc<FilterChain>,
     advisor: Arc<Advisor>,
+    /// Source IP of the MCP client that opened this session, captured
+    /// at session-init time from the axum middleware's task-local. Once
+    /// rmcp spawns the per-session service (see rmcp 1.5
+    /// `streamable_http_server::tower:657`), the task-local is gone —
+    /// hence the eager snapshot. None on stdio / tests.
+    caller_ip: Option<std::net::IpAddr>,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -342,12 +347,27 @@ impl Prompto {
         tracker: Arc<Tracker>,
         stop_vm_step: Duration,
     ) -> Self {
+        Self::new_with_caller(inv, ssh, tracker, stop_vm_step, None)
+    }
+
+    /// Variant of [`new`] that captures the MCP caller's source IP at
+    /// session-init time. Used by the streamable-http transport factory
+    /// closure to snapshot the task-local before rmcp's internal spawn
+    /// detaches the work.
+    pub fn new_with_caller(
+        inv: InventoryStore,
+        ssh: Arc<SshClient>,
+        tracker: Arc<Tracker>,
+        stop_vm_step: Duration,
+        caller_ip: Option<std::net::IpAddr>,
+    ) -> Self {
         Self {
             inv,
             ssh,
             tracker,
             filters: Arc::new(FilterChain::default()),
             advisor: Arc::new(Advisor::new()),
+            caller_ip,
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
@@ -628,7 +648,7 @@ impl Prompto {
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
-            let host = inv.require_remote(&args.host, caller::current(), Capability::Exec)?;
+            let host = inv.require_remote(&args.host, self.caller_ip, Capability::Exec)?;
             let raw = self.ssh.exec(host, &args.cmd, to, false).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }
@@ -650,7 +670,7 @@ impl Prompto {
                 anyhow::bail!("commands list is empty");
             }
             let inv = self.inv.snapshot();
-            let host = inv.require_remote(&args.host, caller::current(), Capability::Exec)?;
+            let host = inv.require_remote(&args.host, self.caller_ip, Capability::Exec)?;
             let fail_fast = args.fail_fast.unwrap_or(true);
             let n = args.commands.len() as u64;
             let to = args
@@ -1235,7 +1255,7 @@ impl Prompto {
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
             let host =
-                inv.require_remote(&args.host, caller::current(), Capability::SudoExec)?;
+                inv.require_remote(&args.host, self.caller_ip, Capability::SudoExec)?;
             let raw = self.ssh.exec(host, &args.cmd, to, true).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }

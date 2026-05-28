@@ -242,11 +242,18 @@ async fn main() -> Result<()> {
         let stop_vm_step = cfg.stop_vm_step;
         let service = StreamableHttpService::new(
             move || {
-                Ok(Prompto::new(
+                // The factory runs inside the request handler's task chain
+                // (rmcp calls `get_service()` before its per-session
+                // `tokio::spawn`), so the axum middleware's caller IP
+                // task-local is still set here. Snapshot it onto the
+                // Prompto instance — tool handlers can't read the
+                // task-local from inside the spawned task.
+                Ok(Prompto::new_with_caller(
                     store.clone(),
                     ssh.clone(),
                     tracker.clone(),
                     stop_vm_step,
+                    caller::current(),
                 ))
             },
             LocalSessionManager::default().into(),
