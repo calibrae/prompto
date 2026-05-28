@@ -2,11 +2,16 @@
 //! and the `gain` CLI subcommand.
 
 use anyhow::{Context, Result};
+use axum::extract::ConnectInfo;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use mcp_gain::Tracker;
 use prompto::baselines::BASELINES;
+use prompto::caller;
 use prompto::inventory::InventoryStore;
 use prompto::mcp::Prompto;
 use prompto::ssh::SshClient;
+use std::net::SocketAddr;
 use rmcp::{
     ServiceExt,
     transport::{
@@ -21,6 +26,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+/// axum middleware: capture the per-request peer IP from `ConnectInfo`
+/// and stash it in [`caller::CALLER_IP`] for the duration of the
+/// downstream handler. Tools that want to refuse self-targeting read
+/// it via [`caller::current`].
+async fn capture_caller_ip(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    caller::scoped(addr.ip(), next.run(req)).await
+}
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -236,7 +253,9 @@ async fn main() -> Result<()> {
             http_config,
         );
 
-        let app = axum::Router::new().nest_service("/mcp", service);
+        let app = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn(capture_caller_ip));
 
         let cancel_for_signal = cancel.clone();
         tokio::spawn(async move {
@@ -244,10 +263,13 @@ async fn main() -> Result<()> {
             cancel_for_signal.cancel();
         });
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { cancel.cancelled().await })
-            .await
-            .context("http serve")?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { cancel.cancelled().await })
+        .await
+        .context("http serve")?;
     }
 
     Ok(())

@@ -17,6 +17,7 @@ use mcp_gain::Tracker;
 use crate::advisor::Advisor;
 use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::batch;
+use crate::caller;
 use crate::claudemgr::{self, Scope};
 use crate::router::{self, Tier};
 use crate::diagnose;
@@ -627,7 +628,7 @@ impl Prompto {
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let host = inv.require_remote(&args.host, caller::current(), Capability::Exec)?;
             let raw = self.ssh.exec(host, &args.cmd, to, false).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }
@@ -649,7 +650,7 @@ impl Prompto {
                 anyhow::bail!("commands list is empty");
             }
             let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let host = inv.require_remote(&args.host, caller::current(), Capability::Exec)?;
             let fail_fast = args.fail_fast.unwrap_or(true);
             let n = args.commands.len() as u64;
             let to = args
@@ -1233,7 +1234,8 @@ impl Prompto {
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::SudoExec)?;
+            let host =
+                inv.require_remote(&args.host, caller::current(), Capability::SudoExec)?;
             let raw = self.ssh.exec(host, &args.cmd, to, true).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }

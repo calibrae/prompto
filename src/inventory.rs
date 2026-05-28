@@ -126,6 +126,37 @@ impl Inventory {
         }
         Ok(host)
     }
+
+    /// Like [`require`], but ALSO refuses if the MCP caller's IP equals
+    /// the target host's IP — i.e. the calling agent is asking prompto
+    /// to SSH back to its own box. Wasteful (the agent has local Bash)
+    /// and a self-escalation vector on prompto's own host (the SSH
+    /// session runs as the inventory's `ssh_user`, sidestepping
+    /// prompto's systemd hardening).
+    ///
+    /// `caller_ip` is `None` on transports that don't expose source
+    /// addresses (stdio, tests). In that case the self-check is
+    /// skipped and only the capability check applies — so legitimate
+    /// code paths that don't carry caller info aren't broken.
+    pub fn require_remote(
+        &self,
+        name: &str,
+        caller_ip: Option<std::net::IpAddr>,
+        cap: Capability,
+    ) -> Result<&HostConfig> {
+        let host = self.require(name, cap)?;
+        if let Some(caller) = caller_ip
+            && let Ok(target_ip) = host.ip.parse::<std::net::IpAddr>()
+            && caller == target_ip
+        {
+            bail!(
+                "refused: target {name:?} is the calling agent's own host (source IP {caller}). \
+                 Use your local shell tool instead — routing a same-host shell call through SSH \
+                 wastes a round trip and bypasses any local sandboxing."
+            );
+        }
+        Ok(host)
+    }
 }
 
 /// Atomically-swappable wrapper around an `Inventory` so SIGHUP can replace
@@ -227,6 +258,44 @@ capabilities = ["exec", "sudo_exec"]
         let inv = Inventory::from_toml_str(sample()).unwrap();
         let err = inv.require("nonexistent", Capability::Exec).unwrap_err();
         assert!(err.to_string().contains("unknown host"));
+    }
+
+    #[test]
+    fn require_remote_allows_when_caller_differs_from_target() {
+        let inv = Inventory::from_toml_str(sample()).unwrap();
+        let caller: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        inv.require_remote("alpha", Some(caller), Capability::Exec)
+            .unwrap();
+    }
+
+    #[test]
+    fn require_remote_blocks_when_caller_equals_target() {
+        let inv = Inventory::from_toml_str(sample()).unwrap();
+        // alpha's IP is 192.0.2.12 (per sample)
+        let caller: std::net::IpAddr = "192.0.2.12".parse().unwrap();
+        let err = inv
+            .require_remote("alpha", Some(caller), Capability::Exec)
+            .unwrap_err();
+        assert!(err.to_string().contains("calling agent's own host"));
+        assert!(err.to_string().contains("192.0.2.12"));
+    }
+
+    #[test]
+    fn require_remote_skips_check_when_caller_is_none() {
+        let inv = Inventory::from_toml_str(sample()).unwrap();
+        // Falls back to plain require: capability still enforced,
+        // self-check skipped because the transport doesn't expose it.
+        inv.require_remote("alpha", None, Capability::Exec).unwrap();
+    }
+
+    #[test]
+    fn require_remote_still_enforces_capability() {
+        let inv = Inventory::from_toml_str(sample()).unwrap();
+        let caller: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let err = inv
+            .require_remote("bravo", Some(caller), Capability::Wake)
+            .unwrap_err();
+        assert!(err.to_string().contains("lacks capability"));
     }
 
     #[test]
