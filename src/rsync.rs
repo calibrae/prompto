@@ -111,7 +111,7 @@ pub async fn run(
     let cmd = build_command(
         source_path,
         &dest_host.ssh_user,
-        &dest_host.ip,
+        &dest_host.ip.to_string(),
         dest_host.ssh_port,
         dest_key,
         dest_path,

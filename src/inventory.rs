@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,7 +44,12 @@ fn default_ssh_port() -> u16 {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
-    pub ip: String,
+    /// Literal IPv4/IPv6 address — NOT a hostname. Typed as [`IpAddr`] on
+    /// purpose: [`Inventory::require_remote`]'s self-targeting guard compares
+    /// this against the MCP caller's source IP, and a value it can't compare
+    /// would silently disable that guard. Parsing at load time makes the
+    /// unguardable state unrepresentable rather than merely discouraged.
+    pub ip: IpAddr,
     #[serde(default)]
     pub mac: Option<String>,
     pub ssh_user: String,
@@ -64,10 +70,10 @@ impl HostConfig {
     }
 
     /// Validate self-consistency (called once per load).
+    ///
+    /// `ip` needs no check here — it is an [`IpAddr`], so deserialization
+    /// already rejected anything unparseable.
     pub fn validate(&self, name: &str) -> Result<()> {
-        if self.ip.trim().is_empty() {
-            bail!("host {name}: ip is empty");
-        }
         if self.ssh_user.trim().is_empty() {
             bail!("host {name}: ssh_user is empty");
         }
@@ -138,16 +144,22 @@ impl Inventory {
     /// addresses (stdio, tests). In that case the self-check is
     /// skipped and only the capability check applies — so legitimate
     /// code paths that don't carry caller info aren't broken.
+    ///
+    /// That `None` is the *only* way to skip the comparison. Until
+    /// v0.6.20 `ip` was a `String` parsed here, and an unparseable value
+    /// made the `if let` chain fall through — silently disabling the
+    /// guard for that host with no error and no log. `ip` is now an
+    /// [`IpAddr`], so the comparison can never be skipped by inventory
+    /// content.
     pub fn require_remote(
         &self,
         name: &str,
-        caller_ip: Option<std::net::IpAddr>,
+        caller_ip: Option<IpAddr>,
         cap: Capability,
     ) -> Result<&HostConfig> {
         let host = self.require(name, cap)?;
         if let Some(caller) = caller_ip
-            && let Ok(target_ip) = host.ip.parse::<std::net::IpAddr>()
-            && caller == target_ip
+            && caller == host.ip
         {
             bail!(
                 "refused: target {name:?} is the calling agent's own host (source IP {caller}). \
@@ -230,7 +242,7 @@ capabilities = ["exec", "sudo_exec"]
         let inv = Inventory::from_toml_str(sample()).unwrap();
         assert_eq!(inv.hosts.len(), 2);
         let d = inv.get("alpha").unwrap();
-        assert_eq!(d.ip, "192.0.2.12");
+        assert_eq!(d.ip, "192.0.2.12".parse::<IpAddr>().unwrap());
         assert_eq!(d.ssh_port, 22);
         assert!(d.has(Capability::Wake));
         assert!(d.has(Capability::Virt));
@@ -296,6 +308,44 @@ capabilities = ["exec", "sudo_exec"]
             .require_remote("bravo", Some(caller), Capability::Wake)
             .unwrap_err();
         assert!(err.to_string().contains("lacks capability"));
+    }
+
+    /// Regression: a hostname in `ip` used to load fine and then silently
+    /// disable the self-targeting guard for that host (the parse in
+    /// `require_remote` failed, the `if let` chain fell through, the call
+    /// was allowed). Rejecting at load time is what makes that impossible.
+    #[test]
+    fn rejects_hostname_in_ip_field() {
+        let bad = r#"
+[host.x]
+ip = "formaggio"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["exec"]
+"#;
+        let err = Inventory::from_toml_str(bad).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid IP address syntax") || msg.contains("IP address"),
+            "error should name the IP-syntax problem, got: {msg}"
+        );
+    }
+
+    /// The whole point of the type change: every host in a loadable
+    /// inventory is comparable against a caller IP, so a self-targeting
+    /// call cannot slip through on any of them.
+    #[test]
+    fn every_loadable_host_is_guardable() {
+        let inv = Inventory::from_toml_str(sample()).unwrap();
+        for (name, host) in &inv.hosts {
+            let err = inv
+                .require_remote(name, Some(host.ip), Capability::Exec)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("calling agent's own host"),
+                "host {name} was not self-guarded"
+            );
+        }
     }
 
     #[test]

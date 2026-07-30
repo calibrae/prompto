@@ -1041,8 +1041,9 @@ impl Prompto {
             let host = inv.get(&args.host)?;
             let probe = Duration::from_millis(args.probe_ms.unwrap_or(500).clamp(50, 5000));
             let mut results = Vec::with_capacity(args.ports.len());
+            let ip = host.ip.to_string();
             for port in &args.ports {
-                results.push(portscan::probe_one(&host.ip, *port, probe).await);
+                results.push(portscan::probe_one(&ip, *port, probe).await);
             }
             let reachable = results.iter().filter(|r| r.reachable).count();
             Ok(serde_json::json!({
