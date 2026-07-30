@@ -146,22 +146,22 @@ mod tests {
 
     #[test]
     fn journalctl_dedupes_consecutive_repeats() {
-        let s = "Apr 27 08:37:27 doppio doppio-mqtt.sh[1265]: Error: No route to host\n\
-                 Apr 27 08:37:30 doppio doppio-mqtt.sh[1267]: Error: No route to host\n\
-                 Apr 27 08:37:33 doppio doppio-mqtt.sh[1268]: Error: No route to host\n\
-                 Apr 27 08:37:36 doppio systemd[1]: Started doppio-mqtt.service\n";
-        let out = Journalctl.filter("journalctl -u doppio-mqtt", s);
+        let s = "Apr 27 08:37:27 host1 relay.sh[1265]: Error: No route to host\n\
+                 Apr 27 08:37:30 host1 relay.sh[1267]: Error: No route to host\n\
+                 Apr 27 08:37:33 host1 relay.sh[1268]: Error: No route to host\n\
+                 Apr 27 08:37:36 host1 systemd[1]: Started relay.service\n";
+        let out = Journalctl.filter("journalctl -u relay", s);
         // First "No route" line stays, next two collapse, then the Started line.
         assert!(out.contains("Error: No route to host"));
         assert!(out.contains("repeated 2 more times"));
-        assert!(out.contains("Started doppio-mqtt"));
+        assert!(out.contains("Started relay"));
     }
 
     #[test]
     fn journalctl_passes_through_when_no_repeats() {
-        let s = "Apr 27 08:37:27 doppio app[1]: a\n\
-                 Apr 27 08:37:28 doppio app[1]: b\n\
-                 Apr 27 08:37:29 doppio app[1]: c\n";
+        let s = "Apr 27 08:37:27 host1 app[1]: a\n\
+                 Apr 27 08:37:28 host1 app[1]: b\n\
+                 Apr 27 08:37:29 host1 app[1]: c\n";
         let out = Journalctl.filter("journalctl", s);
         assert_eq!(out, s);
     }

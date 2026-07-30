@@ -162,9 +162,9 @@ mod tests {
                  \x20    Memory: 2.7M (peak: 3.3M)\n\
                  \x20       CPU: 32ms\n\
                  \n\
-                 Apr 27 11:00:00 mista prompto[12345]: log line 1\n\
-                 Apr 27 11:00:01 mista prompto[12345]: log line 2\n\
-                 Apr 27 11:00:02 mista prompto[12345]: log line 3\n";
+                 Apr 27 11:00:00 host1 prompto[12345]: log line 1\n\
+                 Apr 27 11:00:01 host1 prompto[12345]: log line 2\n\
+                 Apr 27 11:00:02 host1 prompto[12345]: log line 3\n";
         let out = SystemctlStatus.filter("systemctl status prompto", s);
         let s = out.as_ref();
         assert!(s.contains("● prompto.service"));

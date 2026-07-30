@@ -56,7 +56,7 @@ pub struct HostConfig {
     pub ssh_key: PathBuf,
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
-    /// URL of the apytti gateway running on this host (e.g. `http://10.10.0.2:7781`).
+    /// URL of the apytti gateway running on this host (e.g. `http://192.0.2.20:7781`).
     /// Required when the `claude_exec` capability is granted.
     #[serde(default)]
     pub apytti_url: Option<String>,
@@ -318,7 +318,7 @@ capabilities = ["exec", "sudo_exec"]
     fn rejects_hostname_in_ip_field() {
         let bad = r#"
 [host.x]
-ip = "formaggio"
+ip = "not-an-ip"
 ssh_user = "x"
 ssh_key = "/k"
 capabilities = ["exec"]
