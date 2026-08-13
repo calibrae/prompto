@@ -5,7 +5,7 @@
 use anyhow::{Result, bail};
 use std::time::Duration;
 
-use crate::inventory::HostConfig;
+use crate::inventory::{HostConfig, Platform};
 use crate::ssh::{ExecOutput, SshClient};
 
 /// Default + max read size. Operators can ask for less via `max_bytes`;
@@ -111,6 +111,99 @@ pub struct FileEntry {
     pub is_link: bool,
 }
 
+/// `ls` invocation for a platform.
+///
+/// GNU's `--time-style=long-iso` gives `YYYY-MM-DD HH:MM` in two tokens.
+/// BSD has no such flag; `-T` is the closest, yielding a four-token
+/// `Mon DD HH:MM:SS YYYY`. Different token counts, hence two parsers —
+/// see [`parse_ls_long`] and [`parse_ls_long_bsd`].
+pub fn ls_command(platform: Platform, path: &str) -> String {
+    if platform.is_gnu() {
+        format!("ls -la --time-style=long-iso -- {path}")
+    } else {
+        format!("ls -laT -- {path}")
+    }
+}
+
+/// Parse `ls` output for `platform`, normalising both dialects to the
+/// same [`FileEntry`] shape — including an ISO `YYYY-MM-DD HH:MM` mtime,
+/// so a caller never has to know which kind of host it asked.
+pub fn parse_ls(platform: Platform, stdout: &str) -> Vec<FileEntry> {
+    if platform.is_gnu() {
+        parse_ls_long(stdout)
+    } else {
+        parse_ls_long_bsd(stdout)
+    }
+}
+
+fn month_to_num(m: &str) -> Option<&'static str> {
+    Some(match m {
+        "Jan" => "01",
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => return None,
+    })
+}
+
+/// Parse BSD `ls -laT`:
+/// `mode links owner group size Mon DD HH:MM:SS YYYY name…`
+///
+/// Rebuilds the date into `YYYY-MM-DD HH:MM` so the `mtime` field matches
+/// what the GNU path produces. Seconds are dropped for exactly that
+/// reason — GNU's `long-iso` has none.
+pub fn parse_ls_long_bsd(stdout: &str) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("total ") {
+            continue;
+        }
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        if toks.len() < 10 {
+            continue;
+        }
+        let mode = toks[0];
+        if mode.len() != 10 {
+            continue;
+        }
+        let size: u64 = match toks[4].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let (Some(month), Ok(day), Some(hhmm), year) = (
+            month_to_num(toks[5]),
+            toks[6].parse::<u32>(),
+            toks[7].get(..5),
+            toks[8],
+        ) else {
+            continue;
+        };
+        if year.len() != 4 || !year.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        out.push(FileEntry {
+            name: toks[9..].join(" "),
+            mode: mode.to_string(),
+            size,
+            owner: toks[2].to_string(),
+            group: toks[3].to_string(),
+            mtime: format!("{year}-{month}-{day:02} {hhmm}"),
+            is_dir: mode.starts_with('d'),
+            is_link: mode.starts_with('l'),
+        });
+    }
+    out
+}
+
 /// Parse `ls -la --time-style=long-iso` output. Tolerates a `total N`
 /// header and skips it; ignores lines that don't fit the expected
 /// column count.
@@ -167,8 +260,35 @@ pub struct FileStat {
     pub kind: String,
 }
 
+/// `stat` invocation for a platform, emitting the same pipe-delimited
+/// 7-field shape either way so [`parse_stat`] stays single.
+///
+/// GNU and BSD `stat` share no flags at all — `-c` is "format" on GNU and
+/// an illegal option on BSD. The field codes differ too, so this is a
+/// genuine translation rather than a flag tweak:
+///
+/// | field | GNU  | BSD              |
+/// |-------|------|------------------|
+/// | mode  | `%a` | `%Lp`            |
+/// | size  | `%s` | `%z`             |
+/// | owner | `%U` | `%Su`            |
+/// | group | `%G` | `%Sg`            |
+/// | mtime | `%y` | `%Sm` (+ `-t`)   |
+/// | kind  | `%F` | `%HT`            |
+/// | name  | `%n` | `%N`             |
+pub fn stat_command(platform: Platform, path: &str) -> String {
+    if platform.is_gnu() {
+        format!("stat -c '%a|%s|%U|%G|%y|%F|%n' -- {path}")
+    } else {
+        // `-t` sets the strftime used by %Sm, so mtime comes back in the
+        // same ISO-ish shape GNU's %y gives instead of BSD's default
+        // "Aug 13 14:23:45 2026".
+        format!("stat -f '%Lp|%z|%Su|%Sg|%Sm|%HT|%N' -t '%Y-%m-%d %H:%M:%S' -- {path}")
+    }
+}
+
 pub fn parse_stat(stdout: &str) -> Option<FileStat> {
-    // We invoke stat -c '%a|%s|%U|%G|%y|%F|%n'
+    // Both platforms emit '%a|%s|%U|%G|%y|%F|%n' order — see stat_command.
     let line = stdout.lines().find(|l| !l.is_empty())?;
     let parts: Vec<&str> = line.splitn(7, '|').collect();
     if parts.len() != 7 {
@@ -180,7 +300,10 @@ pub fn parse_stat(stdout: &str) -> Option<FileStat> {
         owner: parts[2].to_string(),
         group: parts[3].to_string(),
         mtime: parts[4].to_string(),
-        kind: parts[5].to_string(),
+        // GNU %F yields "regular file"; BSD %HT yields "Regular File".
+        // Lowercase so callers get one vocabulary regardless of target.
+        // Idempotent on GNU.
+        kind: parts[5].to_lowercase(),
         path: parts[6].to_string(),
     })
 }
@@ -212,6 +335,90 @@ pub async fn chmod(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the whole point of `Platform`: prompto used to send
+    /// GNU syntax everywhere, so `file_stat` against a Mac returned
+    /// `stat: illegal option -- c` and `file_list` returned a raw BSD
+    /// usage string.
+    #[test]
+    fn commands_use_the_right_dialect_per_platform() {
+        let gnu_stat = stat_command(Platform::Linux, "/etc/hosts");
+        assert!(gnu_stat.contains("stat -c"), "{gnu_stat}");
+        for p in [Platform::Macos, Platform::Freebsd] {
+            let bsd = stat_command(p, "/etc/hosts");
+            assert!(bsd.contains("stat -f"), "{p:?}: {bsd}");
+            assert!(!bsd.contains("-c "), "BSD stat must not use -c: {bsd}");
+        }
+
+        let gnu_ls = ls_command(Platform::Linux, "/tmp");
+        assert!(gnu_ls.contains("--time-style=long-iso"), "{gnu_ls}");
+        for p in [Platform::Macos, Platform::Freebsd] {
+            let bsd = ls_command(p, "/tmp");
+            assert!(
+                !bsd.contains("--time-style"),
+                "BSD ls has no --time-style: {bsd}"
+            );
+            assert!(bsd.contains("-laT"), "{p:?}: {bsd}");
+        }
+    }
+
+    /// Both dialects must yield the SAME `FileEntry` shape — notably an
+    /// ISO `YYYY-MM-DD HH:MM` mtime — so a caller never has to know what
+    /// kind of host answered.
+    #[test]
+    fn bsd_and_gnu_ls_normalise_to_one_shape() {
+        let gnu = "total 8\n\
+                   drwxr-xr-x 3 cali staff 96 2026-08-13 14:23 somedir\n\
+                   -rw-r--r-- 1 cali staff 42 2026-08-13 09:05 a file.txt\n";
+        let bsd = "total 8\n\
+                   drwxr-xr-x 3 cali staff 96 Aug 13 14:23:07 2026 somedir\n\
+                   -rw-r--r-- 1 cali staff 42 Aug 13 09:05:59 2026 a file.txt\n";
+
+        let g = parse_ls(Platform::Linux, gnu);
+        let b = parse_ls(Platform::Macos, bsd);
+        assert_eq!(g.len(), 2, "gnu parse: {g:?}");
+        assert_eq!(b.len(), 2, "bsd parse: {b:?}");
+
+        for (x, y) in g.iter().zip(b.iter()) {
+            assert_eq!(x.name, y.name);
+            assert_eq!(x.mode, y.mode);
+            assert_eq!(x.size, y.size);
+            assert_eq!(x.owner, y.owner);
+            assert_eq!(x.group, y.group);
+            assert_eq!(x.is_dir, y.is_dir);
+            assert_eq!(
+                x.mtime, y.mtime,
+                "mtime must normalise identically across dialects"
+            );
+        }
+        // Names containing spaces survive both parsers.
+        assert_eq!(b[1].name, "a file.txt");
+        assert_eq!(b[0].mtime, "2026-08-13 14:23");
+    }
+
+    /// BSD `%HT` yields "Regular File"; GNU `%F` yields "regular file".
+    /// Callers get one vocabulary.
+    #[test]
+    fn stat_kind_is_lowercased_for_both() {
+        let bsd = "755|4096|cali|staff|2026-08-13 14:23:07|Directory|/tmp";
+        let gnu = "755|4096|cali|staff|2026-08-13 14:23:07|directory|/tmp";
+        assert_eq!(parse_stat(bsd).unwrap().kind, "directory");
+        assert_eq!(parse_stat(gnu).unwrap().kind, "directory");
+    }
+
+    #[test]
+    fn platform_capability_matrix() {
+        assert!(Platform::Linux.is_gnu());
+        assert!(!Platform::Macos.is_gnu());
+        assert!(!Platform::Freebsd.is_gnu());
+        // macOS ships bash 3.2 — ssh_batch works there. OPNsense does not.
+        assert!(Platform::Macos.has_bash());
+        assert!(!Platform::Freebsd.has_bash());
+        // systemd is Linux-only; launchd/rc.d are a different model.
+        assert!(Platform::Linux.has_systemd());
+        assert!(!Platform::Macos.has_systemd());
+        assert!(!Platform::Freebsd.has_systemd());
+    }
 
     #[test]
     fn validate_path_accepts_normal_inputs() {

@@ -31,6 +31,31 @@ use crate::script;
 use crate::ssh::SshClient;
 use crate::virt;
 
+/// Refuse a systemd-only tool on a host that hasn't got systemd.
+///
+/// These tools are NOT adapted the way `file_stat`/`file_list` are:
+/// launchd and rc.d are different service models, not different flags,
+/// so a translation would be a guess dressed as support. Better to say
+/// what's missing and point at the tool that does work.
+fn require_systemd(
+    host: &crate::inventory::HostConfig,
+    name: &str,
+    tool: &str,
+) -> anyhow::Result<()> {
+    if host.platform.has_systemd() {
+        return Ok(());
+    }
+    let alt = match host.platform {
+        crate::inventory::Platform::Macos => "launchctl",
+        _ => "service(8) / rc.d",
+    };
+    anyhow::bail!(
+        "{tool} drives systemd, and {name:?} is {} — no systemctl/journalctl there. \
+         Use ssh_exec with {alt} instead.",
+        host.platform.as_str()
+    )
+}
+
 #[derive(Clone)]
 pub struct Prompto {
     inv: InventoryStore,
@@ -701,6 +726,19 @@ impl Prompto {
             }
             let inv = self.inv.snapshot();
             let host = inv.require_remote(&args.host, self.caller_ip, Capability::Exec)?;
+            // The batch wire protocol runs each entry under `bash -c`.
+            // Without bash the remote shell mangles the script and the
+            // failure surfaces as "missing record for command 0 — remote
+            // bash may have crashed", which blames the protocol rather
+            // than the absent shell. Say the real thing instead.
+            if !host.platform.has_bash() {
+                anyhow::bail!(
+                    "ssh_batch needs bash, and {:?} is {} (no bash — OPNsense ships csh/tcsh). \
+                     Use ssh_exec instead, one call per command.",
+                    args.host,
+                    host.platform.as_str()
+                );
+            }
             let fail_fast = args.fail_fast.unwrap_or(true);
             let n = args.commands.len() as u64;
             let to = args
@@ -893,7 +931,7 @@ impl Prompto {
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::Exec)?;
             files::validate_path(&args.path)?;
-            let cmd = format!("ls -la --time-style=long-iso -- {}", args.path);
+            let cmd = files::ls_command(host.platform, &args.path);
             let raw = self
                 .ssh
                 .exec(host, &cmd, Some(Duration::from_secs(10)), false)
@@ -905,7 +943,7 @@ impl Prompto {
                     raw.stderr.trim()
                 );
             }
-            let entries = files::parse_ls_long(&raw.stdout);
+            let entries = files::parse_ls(host.platform, &raw.stdout);
             Ok(serde_json::json!({
                 "host": args.host,
                 "path": args.path,
@@ -930,7 +968,7 @@ impl Prompto {
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::Exec)?;
             files::validate_path(&args.path)?;
-            let cmd = format!("stat -c '%a|%s|%U|%G|%y|%F|%n' -- {}", args.path);
+            let cmd = files::stat_command(host.platform, &args.path);
             let raw = self
                 .ssh
                 .exec(host, &cmd, Some(Duration::from_secs(10)), false)
@@ -970,6 +1008,8 @@ impl Prompto {
                         "mac": h.mac,
                         "ssh_user": h.ssh_user,
                         "ssh_port": h.ssh_port,
+                "platform": h.platform.as_str(),
+                        "platform": h.platform.as_str(),
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     })
                 })
@@ -1001,6 +1041,7 @@ impl Prompto {
                 "mac": h.mac,
                 "ssh_user": h.ssh_user,
                 "ssh_port": h.ssh_port,
+                "platform": h.platform.as_str(),
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             }))
         }
@@ -1154,6 +1195,7 @@ impl Prompto {
             crate::claudemgr::validate_unit_name(&args.unit)?;
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::SudoExec)?;
+            require_systemd(host, &args.host, "service_control")?;
             let cmd = format!("systemctl {} -- {}", args.action, args.unit);
             let raw = self
                 .ssh
@@ -1493,6 +1535,7 @@ impl Prompto {
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
             let host = inv.require(&args.host, Capability::SudoExec)?;
+            require_systemd(host, &args.host, tool)?;
             let stdout = claudemgr::journalctl_tail(&self.ssh, host, &args.unit, lines).await?;
             Ok(serde_json::json!({
                 "host": args.host,

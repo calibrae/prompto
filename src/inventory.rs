@@ -42,6 +42,60 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+/// Target operating system, declared per host in the inventory.
+///
+/// prompto's tools shell out to real commands, and those commands differ
+/// across platforms in ways that produce *confusing* failures rather than
+/// clear ones. Before this existed, `file_stat` against a Mac returned
+/// `stat: illegal option -- c` and `file_list` returned a raw BSD usage
+/// string — the caller got a shell error with no hint that the tool
+/// simply assumed GNU coreutils.
+///
+/// Defaults to [`Platform::Linux`], which is 24 of the 27 homelab hosts,
+/// so existing inventories keep working untouched.
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    /// GNU coreutils + systemd + bash.
+    #[default]
+    Linux,
+    /// BSD userland, launchd, bash present (3.2) but no systemd.
+    Macos,
+    /// BSD userland, no systemd. On OPNsense the login shell is csh, so
+    /// even `a || b` and `2>&1` behave differently from POSIX sh.
+    Freebsd,
+}
+
+impl Platform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Platform::Linux => "linux",
+            Platform::Macos => "macos",
+            Platform::Freebsd => "freebsd",
+        }
+    }
+
+    /// GNU coreutils, i.e. `stat -c`, `ls --time-style`, `free -m`.
+    /// False on both BSD platforms, which need `stat -f` / `ls -T`.
+    pub fn is_gnu(self) -> bool {
+        matches!(self, Platform::Linux)
+    }
+
+    /// `bash` is on PATH. macOS ships bash 3.2, so `ssh_batch` works
+    /// there; OPNsense/FreeBSD has only csh and tcsh, so it cannot.
+    pub fn has_bash(self) -> bool {
+        matches!(self, Platform::Linux | Platform::Macos)
+    }
+
+    /// `systemctl` / `journalctl` exist. launchd is a different model,
+    /// not a flag difference, so those tools refuse rather than adapt.
+    pub fn has_systemd(self) -> bool {
+        matches!(self, Platform::Linux)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
     /// Literal IPv4/IPv6 address — NOT a hostname. Typed as [`IpAddr`] on
@@ -56,6 +110,12 @@ pub struct HostConfig {
     pub ssh_key: PathBuf,
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
+    /// Target OS. Defaults to `linux`; set `platform = "macos"` or
+    /// `platform = "freebsd"` for hosts with a BSD userland. Tools adapt
+    /// where an equivalent command exists and refuse legibly where one
+    /// doesn't.
+    #[serde(default)]
+    pub platform: Platform,
     /// URL of the apytti gateway running on this host (e.g. `http://192.0.2.20:7781`).
     /// Required when the `claude_exec` capability is granted.
     #[serde(default)]
