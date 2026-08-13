@@ -287,6 +287,33 @@ pub fn stat_command(platform: Platform, path: &str) -> String {
     }
 }
 
+/// Trim a stat mtime to `YYYY-MM-DD HH:MM:SS`.
+///
+/// GNU `%y` is `2025-07-25 02:00:00.000000000 +0200` — nanoseconds and a
+/// UTC offset. BSD `%Sm` with our `-t` is already `2026-08-03 15:12:18`.
+/// Without this the two platforms return visibly different strings for
+/// the same field, which defeats the point of adapting at all. Both are
+/// local time, so dropping the offset loses nothing the BSD side ever
+/// carried.
+///
+/// Anything that doesn't look like a leading ISO timestamp is passed
+/// through untouched rather than mangled.
+fn normalise_mtime(raw: &str) -> String {
+    let b = raw.as_bytes();
+    let iso_shaped = b.len() >= 19
+        && b[..19].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b' ',
+            13 | 16 => *c == b':',
+            _ => c.is_ascii_digit(),
+        });
+    if iso_shaped {
+        raw[..19].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 pub fn parse_stat(stdout: &str) -> Option<FileStat> {
     // Both platforms emit '%a|%s|%U|%G|%y|%F|%n' order — see stat_command.
     let line = stdout.lines().find(|l| !l.is_empty())?;
@@ -299,7 +326,7 @@ pub fn parse_stat(stdout: &str) -> Option<FileStat> {
         size: parts[1].parse().ok()?,
         owner: parts[2].to_string(),
         group: parts[3].to_string(),
-        mtime: parts[4].to_string(),
+        mtime: normalise_mtime(parts[4]),
         // GNU %F yields "regular file"; BSD %HT yields "Regular File".
         // Lowercase so callers get one vocabulary regardless of target.
         // Idempotent on GNU.
@@ -404,6 +431,31 @@ mod tests {
         let gnu = "755|4096|cali|staff|2026-08-13 14:23:07|directory|/tmp";
         assert_eq!(parse_stat(bsd).unwrap().kind, "directory");
         assert_eq!(parse_stat(gnu).unwrap().kind, "directory");
+    }
+
+    /// Caught in production on the v0.9.0 deploy: `kind` normalised but
+    /// `mtime` did not, so macOS returned `2026-08-03 15:12:18` while
+    /// Linux returned `2025-07-25 02:00:00.000000000 +0200` for the same
+    /// field. Adapting the command is only half the job — the *output*
+    /// has to land on one shape too.
+    #[test]
+    fn stat_mtime_normalises_across_platforms() {
+        let gnu = "644|293|root|root|2025-07-25 02:00:00.000000000 +0200|regular file|/etc/hosts";
+        let bsd = "644|293|root|wheel|2025-07-25 02:00:00|Regular File|/etc/hosts";
+        assert_eq!(parse_stat(gnu).unwrap().mtime, "2025-07-25 02:00:00");
+        assert_eq!(parse_stat(bsd).unwrap().mtime, "2025-07-25 02:00:00");
+        assert_eq!(
+            parse_stat(gnu).unwrap().mtime,
+            parse_stat(bsd).unwrap().mtime
+        );
+    }
+
+    #[test]
+    fn normalise_mtime_passes_through_unrecognised_shapes() {
+        // Don't mangle something we don't understand.
+        assert_eq!(normalise_mtime("not a timestamp"), "not a timestamp");
+        assert_eq!(normalise_mtime(""), "");
+        assert_eq!(normalise_mtime("2026-08-13"), "2026-08-13");
     }
 
     #[test]
