@@ -1513,15 +1513,21 @@ impl ServerHandler for Prompto {
             // `supported_protocol_versions()` is left at its default of
             // ProtocolVersion::KNOWN_VERSIONS.
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
-            .with_instructions(
-                "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
+            .with_instructions(instructions().to_string())
+    }
+}
+
+/// The advertised tool surface and usage notes handed to clients.
+///
+/// Split out of [`ServerHandler::get_info`] so `baselines.rs` can parse
+/// the `Tools: …` list and assert every advertised tool has a gain
+/// baseline — a tool with no entry silently records as pure cost.
+pub const fn instructions() -> &'static str {
+    "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
                  Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, claude_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`, `claude_exec`). Inventory is operator-managed — edit /etc/prompto.toml and SIGHUP to reload. \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
                  prompto_gain returns the token-savings summary for this instance. \
                  Reload the inventory live by sending SIGHUP to the server process."
-                    .to_string(),
-            )
-    }
 }
