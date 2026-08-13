@@ -347,17 +347,40 @@ impl Prompto {
         tracker: Arc<Tracker>,
         stop_vm_step: Duration,
     ) -> Self {
-        Self::new_with_caller(inv, ssh, tracker, stop_vm_step, None)
+        Self::new_with_caller(
+            inv,
+            ssh,
+            tracker,
+            Arc::new(FilterChain::default()),
+            Arc::new(Advisor::new()),
+            stop_vm_step,
+            None,
+        )
     }
 
-    /// Variant of [`new`] that captures the MCP caller's source IP at
-    /// session-init time. Used by the streamable-http transport factory
-    /// closure to snapshot the task-local before rmcp's internal spawn
-    /// detaches the work.
+    /// Variant of [`new`] that captures the MCP caller's source IP and
+    /// takes process-wide shared state.
+    ///
+    /// Used by the streamable-http transport factory closure. rmcp 3.x
+    /// calls the factory **once per request** (inline in the request
+    /// future, before any `tokio::spawn`), which is why the caller IP
+    /// can still be read from the axum task-local here and snapshotted
+    /// onto the instance.
+    ///
+    /// It is also why `filters` and `advisor` are passed in rather than
+    /// constructed here. The advisor's whole job is to notice patterns
+    /// **across** recent calls; a fresh one per request would hold an
+    /// empty ring buffer and never fire a single hint. Building the
+    /// 30-filter chain per request would also be pure waste. This is
+    /// the "persistent state must live outside the handler" rule from
+    /// the rmcp 3.0 notes, applied.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_caller(
         inv: InventoryStore,
         ssh: Arc<SshClient>,
         tracker: Arc<Tracker>,
+        filters: Arc<FilterChain>,
+        advisor: Arc<Advisor>,
         stop_vm_step: Duration,
         caller_ip: Option<std::net::IpAddr>,
     ) -> Self {
@@ -365,8 +388,8 @@ impl Prompto {
             inv,
             ssh,
             tracker,
-            filters: Arc::new(FilterChain::default()),
-            advisor: Arc::new(Advisor::new()),
+            filters,
+            advisor,
             caller_ip,
             stop_vm_step,
             tool_router: Self::tool_router(),
@@ -445,9 +468,9 @@ impl Prompto {
                 let body = payload.to_string();
                 self.tracker
                     .record(tool, host, true, exec_ms, body.len() as u64);
-                let mut blocks = vec![Content::text(body)];
+                let mut blocks = vec![ContentBlock::text(body)];
                 if let Some(h) = hint {
-                    blocks.push(Content::text(format!("[advisor] {h}")));
+                    blocks.push(ContentBlock::text(format!("[advisor] {h}")));
                 }
                 Ok(CallToolResult::success(blocks))
             }
@@ -1480,7 +1503,16 @@ impl ServerHandler for Prompto {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_protocol_version(ProtocolVersion::LATEST)
+            // Pinned deliberately — never ride `ProtocolVersion::LATEST`.
+            // LATEST is not "the newest version rmcp knows": in 3.1.2 it
+            // resolves to 2025-11-25 even though V_2026_07_28 exists, and
+            // it moves silently between releases. This value is what
+            // LATEST resolved to at the time of the rmcp 3 migration, so
+            // pinning it is a no-op today and a guarantee tomorrow.
+            // Clients newer or older than this still negotiate normally:
+            // `supported_protocol_versions()` is left at its default of
+            // ProtocolVersion::KNOWN_VERSIONS.
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_instructions(
                 "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
                  Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, claude_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
