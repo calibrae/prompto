@@ -242,6 +242,13 @@ async fn main() -> Result<()> {
             }
         );
 
+        tracing::warn!(
+            "GET /log is UNAUTHENTICATED — anyone who can reach this listener can read \
+             journals on any inventory host granting sudo_exec. Same limits as the \
+             service_logs tool (sudo_exec gate, unit-name validation, 1..1000 lines), \
+             but no credential is required."
+        );
+
         let app = build_router(HttpParams {
             store,
             ssh,

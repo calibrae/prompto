@@ -129,6 +129,10 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("mcp_restart_claudecli", 200),
     // Probes every server on the client (~3-6 entries). Observed 344 tok.
     ("mcp_status", 700),
+    // Journal tail. `mcp_logs` is the deprecated alias for `service_logs`
+    // — same baseline, recorded separately so the gain log shows when the
+    // old name has fallen out of use and the alias can be retired.
+    ("service_logs", 400),
     ("mcp_logs", 400),
     ("mcp_reconnect_hint", 200),
     // ── self ─────────────────────────────────────────────────────────

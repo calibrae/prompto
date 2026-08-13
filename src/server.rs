@@ -98,7 +98,65 @@ async fn capture_caller_ip(
     caller::scoped(client, next.run(req)).await
 }
 
-/// Build the axum router serving MCP at `/mcp`.
+/// State for the plain-HTTP `/log` endpoint.
+#[derive(Clone)]
+struct LogState {
+    store: InventoryStore,
+    ssh: Arc<SshClient>,
+}
+
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    host: String,
+    unit: String,
+    #[serde(default)]
+    lines: Option<u32>,
+}
+
+/// `GET /log?host=<name>&unit=<unit>&lines=<n>` — tail a systemd unit's
+/// journal as plain text, outside the MCP protocol, for curl and browsers.
+///
+/// # No authentication
+///
+/// This endpoint is deliberately unauthenticated (operator's call). It is
+/// reachable wherever prompto's listener is: in the homelab deployment
+/// that is `prompto.portal.calii.net`, i.e. anyone on the LAN or WireGuard.
+/// Anyone who can reach it can read journals on any inventory host that
+/// grants `sudo_exec`.
+///
+/// It is held to *exactly* the same limits as the `service_logs` MCP tool
+/// and given no capability the tool lacks: same `sudo_exec` gate, same
+/// `validate_unit_name` on the unit (so it cannot be turned into a shell),
+/// same 1..=1000 line clamp, same 15 s timeout. So it widens *reach*, not
+/// *power* — the MCP surface was already unauthenticated on the same port.
+/// Adding auth here without also adding it to `/mcp` would be theatre.
+async fn log_handler(
+    axum::extract::State(state): axum::extract::State<LogState>,
+    axum::extract::Query(q): axum::extract::Query<LogQuery>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+
+    // Validate up front so a malformed unit is a 400 (caller's fault),
+    // not a 502 from the exec layer. `journalctl_tail` re-checks — this
+    // is for the status code, never the safety.
+    if let Err(e) = crate::claudemgr::validate_unit_name(&q.unit) {
+        return (StatusCode::BAD_REQUEST, format!("{e}\n"));
+    }
+    let inv = state.store.snapshot();
+    let host = match inv.require(&q.host, crate::inventory::Capability::SudoExec) {
+        Ok(h) => h.clone(),
+        // Unknown host or missing capability are both caller errors.
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")),
+    };
+    match crate::claudemgr::journalctl_tail(&state.ssh, &host, &q.unit, q.lines.unwrap_or(50)).await
+    {
+        Ok(out) => (StatusCode::OK, out),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}\n")),
+    }
+}
+
+/// Build the axum router serving MCP at `/mcp` and the plain-HTTP log
+/// tail at `/log`.
 pub fn build_router(p: HttpParams) -> axum::Router {
     // `stateless_protocol_metadata_required` is left at its default of
     // false: enabling it rejects ordinary requests from any client
@@ -133,6 +191,10 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         ..
     } = p;
 
+    // Clones for the /log endpoint; the originals move into the factory.
+    let store_for_log = store.clone();
+    let ssh_for_log = ssh.clone();
+
     let service = StreamableHttpService::new(
         move || {
             // rmcp 3.x calls this factory inline in the request future,
@@ -155,8 +217,17 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         http_config,
     );
 
+    let log_state = LogState {
+        store: store_for_log,
+        ssh: ssh_for_log,
+    };
+
     axum::Router::new()
         .nest_service("/mcp", service)
+        .route(
+            "/log",
+            axum::routing::get(log_handler).with_state(log_state),
+        )
         .layer(middleware::from_fn(
             move |conn: ConnectInfo<SocketAddr>, req, next| {
                 let trusted = trusted_proxies.clone();

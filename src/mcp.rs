@@ -222,6 +222,13 @@ pub struct RsyncSyncArgs {
     /// `--exclude=PATTERN` values.
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Optional identity file for the source→dest hop, as a path ON THE
+    /// SOURCE HOST. Omit to let the source host pick (its ~/.ssh/config,
+    /// default keys, agent) — correct for hosts that already trust each
+    /// other. This is NOT prompto's key path; prompto's keys do not exist
+    /// on the source box.
+    #[serde(default)]
+    pub dest_key: Option<String>,
     /// Default 300s.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -1002,7 +1009,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). source_host SSHs to dest_host (needs key already trusted). Trailing `/` on paths matters. Output is the --stats block."
+        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). PRECONDITION: the rsync runs ON source_host, so source_host must already be able to SSH to dest_host as its inventory ssh_user — prompto's own keys are not available there. Optional dest_key names an identity file on source_host. Trailing `/` on paths matters. Output is the --stats block."
     )]
     async fn rsync_sync(
         &self,
@@ -1027,6 +1034,7 @@ impl Prompto {
                 &args.source_path,
                 dest_host,
                 &args.dest_path,
+                args.dest_key.as_deref(),
                 &opts,
                 to,
             )
@@ -1441,11 +1449,43 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Tail systemd journal for a unit. lines default 50, clamped 1..1000."
+        description = "Read logs for ANY systemd unit on a host — this is how you find out why something failed to start or crashed. Tails the journal (`journalctl -u <unit>`). lines default 50, clamped 1..1000. Pairs with service_control, which drives the unit. Requires sudo_exec."
+    )]
+    async fn service_logs(
+        &self,
+        Parameters(args): Parameters<McpLogsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.journal_tail("service_logs", args).await
+    }
+
+    /// Deprecated alias for [`service_logs`], kept so existing callers
+    /// and pinned configs don't break.
+    ///
+    /// The `mcp_` prefix was always wrong: this tool tails ANY systemd
+    /// unit and gates on `sudo_exec`, not `claude_admin` — it never
+    /// belonged to the MCP fleet-management family. The prefix grouped it
+    /// by implementation lineage rather than by what a caller wants, so
+    /// "why did prometheus fail to start" never found it. Discovered when
+    /// an embedding-based tool router refused to route to it, which was
+    /// the router being right.
+    #[tool(
+        name = "mcp_logs",
+        description = "DEPRECATED alias for service_logs. Use service_logs."
     )]
     async fn mcp_logs(
         &self,
         Parameters(args): Parameters<McpLogsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Recorded under its own name so the gain log shows how much the
+        // old name is still used, i.e. when the alias can be retired.
+        self.journal_tail("mcp_logs", args).await
+    }
+
+    /// Shared body for `service_logs` and its `mcp_logs` alias.
+    async fn journal_tail(
+        &self,
+        tool: &'static str,
+        args: McpLogsArgs,
     ) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
         let host_name = args.host.clone();
@@ -1462,7 +1502,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("mcp_logs", Some(&host_name), started, res)
+        self.finish_tool(tool, Some(&host_name), started, res)
     }
 
     #[tool(
@@ -1524,7 +1564,7 @@ impl ServerHandler for Prompto {
 /// baseline — a tool with no entry silently records as pure cost.
 pub const fn instructions() -> &'static str {
     "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, claude_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, claude_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, service_logs, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
                  Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`, `claude_exec`). Inventory is operator-managed — edit /etc/prompto.toml and SIGHUP to reload. \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
