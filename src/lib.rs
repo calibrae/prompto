@@ -20,6 +20,7 @@ pub mod portscan;
 pub mod router;
 pub mod rsync;
 pub mod script;
+pub mod server;
 pub mod ssh;
 pub mod virt;
 pub mod wol;

@@ -2,9 +2,6 @@
 //! and the `gain` CLI subcommand.
 
 use anyhow::{Context, Result};
-use axum::extract::ConnectInfo;
-use axum::middleware::{self, Next};
-use axum::response::Response;
 use mcp_gain::Tracker;
 use prompto::baselines::BASELINES;
 use prompto::caller;
@@ -12,32 +9,13 @@ use prompto::inventory::InventoryStore;
 use prompto::mcp::Prompto;
 use prompto::ssh::SshClient;
 use std::net::SocketAddr;
-use rmcp::{
-    ServiceExt,
-    transport::{
-        stdio,
-        streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-        },
-    },
-};
+use prompto::server::{AllowedHosts, HttpParams, build_router};
+use rmcp::{ServiceExt, transport::stdio};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-
-/// axum middleware: capture the per-request peer IP from `ConnectInfo`
-/// and stash it in [`caller::CALLER_IP`] for the duration of the
-/// downstream handler. Tools that want to refuse self-targeting read
-/// it via [`caller::current`].
-async fn capture_caller_ip(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: axum::extract::Request,
-    next: Next,
-) -> Response {
-    caller::scoped(addr.ip(), next.run(req)).await
-}
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -213,15 +191,27 @@ async fn main() -> Result<()> {
             .with_context(|| format!("bind {}", cfg.bind))?;
         let cancel = CancellationToken::new();
 
-        let mut http_config = StreamableHttpServerConfig::default()
-            .with_cancellation_token(cancel.child_token())
-            .with_accept_unknown_sessions(true);
-        match std::env::var("PROMPTO_ALLOWED_HOSTS") {
+        // Peers allowed to speak for someone else via X-Real-IP /
+        // X-Forwarded-For. Defaults to loopback because prompto binds
+        // 127.0.0.1 behind nginx on the same host. Anything not on this
+        // list has its forwarding headers ignored outright.
+        let trusted_proxies = Arc::new(
+            std::env::var("PROMPTO_TRUSTED_PROXIES")
+                .ok()
+                .and_then(|raw| caller::parse_trusted_proxies(&raw))
+                .unwrap_or_else(|| caller::DEFAULT_TRUSTED_PROXIES.to_vec()),
+        );
+        tracing::info!(
+            trusted_proxies = ?trusted_proxies,
+            "forwarding headers honoured only from these peers"
+        );
+
+        let allowed_hosts = match std::env::var("PROMPTO_ALLOWED_HOSTS") {
             Ok(raw) if raw.trim() == "*" => {
                 tracing::warn!(
                     "PROMPTO_ALLOWED_HOSTS=* — DNS rebinding protection DISABLED. Ensure the listener is behind a trusted reverse proxy or firewall."
                 );
-                http_config = http_config.disable_allowed_hosts();
+                AllowedHosts::Disabled
             }
             Ok(raw) => {
                 let hosts: Vec<String> = raw
@@ -230,39 +220,38 @@ async fn main() -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect();
                 tracing::info!(?hosts, "Host header allowlist");
-                http_config = http_config.with_allowed_hosts(hosts);
+                AllowedHosts::List(hosts)
             }
             Err(_) => {
                 tracing::info!(
                     "Host header allowlist defaults to localhost — set PROMPTO_ALLOWED_HOSTS to accept remote clients."
                 );
+                AllowedHosts::Default
             }
-        }
+        };
 
-        let stop_vm_step = cfg.stop_vm_step;
-        let service = StreamableHttpService::new(
-            move || {
-                // The factory runs inside the request handler's task chain
-                // (rmcp calls `get_service()` before its per-session
-                // `tokio::spawn`), so the axum middleware's caller IP
-                // task-local is still set here. Snapshot it onto the
-                // Prompto instance — tool handlers can't read the
-                // task-local from inside the spawned task.
-                Ok(Prompto::new_with_caller(
-                    store.clone(),
-                    ssh.clone(),
-                    tracker.clone(),
-                    stop_vm_step,
-                    caller::current(),
-                ))
-            },
-            LocalSessionManager::default().into(),
-            http_config,
+        // Sessionless by default — see HttpParams::legacy_session_mode.
+        let legacy_session_mode = env_bool("PROMPTO_LEGACY_SESSION_MODE", false);
+        tracing::info!(
+            legacy_session_mode,
+            "pre-2026-07-28 clients served {}",
+            if legacy_session_mode {
+                "via legacy sessions"
+            } else {
+                "statelessly (no Mcp-Session-Id; survives redeploys)"
+            }
         );
 
-        let app = axum::Router::new()
-            .nest_service("/mcp", service)
-            .layer(middleware::from_fn(capture_caller_ip));
+        let app = build_router(HttpParams {
+            store,
+            ssh,
+            tracker,
+            stop_vm_step: cfg.stop_vm_step,
+            trusted_proxies,
+            allowed_hosts,
+            legacy_session_mode,
+            cancel: cancel.clone(),
+        });
 
         let cancel_for_signal = cancel.clone();
         tokio::spawn(async move {
