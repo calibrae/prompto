@@ -1010,11 +1010,15 @@ impl Prompto {
                         "ssh_port": h.ssh_port,
                 "platform": h.platform.as_str(),
                 "chassis": h.chassis.as_str(),
+                "aliases": h.aliases,
                 "hypervisor": h.hypervisor,
                         "platform": h.platform.as_str(),
                 "chassis": h.chassis.as_str(),
+                "aliases": h.aliases,
                 "hypervisor": h.hypervisor,
                         "chassis": h.chassis.as_str(),
+                "aliases": h.aliases,
+                        "aliases": h.aliases,
                         "hypervisor": h.hypervisor,
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     })
@@ -1049,6 +1053,7 @@ impl Prompto {
                 "ssh_port": h.ssh_port,
                 "platform": h.platform.as_str(),
                 "chassis": h.chassis.as_str(),
+                "aliases": h.aliases,
                 "hypervisor": h.hypervisor,
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             }))

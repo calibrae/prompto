@@ -66,6 +66,11 @@ pub enum Platform {
     /// BSD userland, no systemd. On OPNsense the login shell is csh, so
     /// even `a || b` and `2>&1` behave differently from POSIX sh.
     Freebsd,
+    /// Windows guest. Declared for honesty rather than support: none of
+    /// the POSIX tools apply, so everything that branches on platform
+    /// refuses. `mira` is the only one, and it exists in the inventory to
+    /// be *addressed*, not shelled into.
+    Windows,
 }
 
 impl Platform {
@@ -74,6 +79,7 @@ impl Platform {
             Platform::Linux => "linux",
             Platform::Macos => "macos",
             Platform::Freebsd => "freebsd",
+            Platform::Windows => "windows",
         }
     }
 
@@ -165,6 +171,15 @@ pub struct HostConfig {
     /// Required when the `claude_exec` capability is granted.
     #[serde(default)]
     pub apytti_url: Option<String>,
+    /// Extra names this host answers to. A box can carry a service
+    /// identity and a hardware name — 10.10.0.1 is `calisense` (the
+    /// router role) on hardware everyone calls `polnareff`. One machine,
+    /// so one entry, reachable by either name.
+    ///
+    /// Aliases must not collide with a host name or another alias;
+    /// both are rejected at load.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 }
@@ -214,14 +229,35 @@ impl HostConfig {
 pub struct Inventory {
     #[serde(rename = "host", default)]
     pub hosts: HashMap<String, HostConfig>,
+    /// alias -> canonical host name. Built at load, never deserialized.
+    #[serde(skip)]
+    alias_index: HashMap<String, String>,
 }
 
 impl Inventory {
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        let inv: Inventory = toml::from_str(s).context("parse inventory TOML")?;
+        let mut inv: Inventory = toml::from_str(s).context("parse inventory TOML")?;
         for (name, host) in &inv.hosts {
             host.validate(name)?;
         }
+        // Alias index. A collision here would make `get()` silently
+        // resolve to whichever entry won a HashMap race, so both kinds
+        // are load errors.
+        let mut alias_index: HashMap<String, String> = HashMap::new();
+        for (name, host) in &inv.hosts {
+            for a in &host.aliases {
+                if a.trim().is_empty() {
+                    bail!("host {name}: empty alias");
+                }
+                if inv.hosts.contains_key(a) {
+                    bail!("host {name}: alias {a:?} collides with a host of that name");
+                }
+                if let Some(prev) = alias_index.insert(a.clone(), name.clone()) {
+                    bail!("alias {a:?} claimed by both {prev:?} and {name:?}");
+                }
+            }
+        }
+        inv.alias_index = alias_index;
         // Cross-host checks, once every entry has parsed. A `hypervisor`
         // pointing at a typo or at a box that can't run virsh is a
         // promise the refusal message can't keep.
@@ -249,10 +285,26 @@ impl Inventory {
         Self::from_toml_str(&raw)
     }
 
+    /// Look up by canonical name, falling back to the alias index.
     pub fn get(&self, name: &str) -> Result<&HostConfig> {
-        self.hosts
-            .get(name)
-            .ok_or_else(|| anyhow!("unknown host {name:?}"))
+        if let Some(h) = self.hosts.get(name) {
+            return Ok(h);
+        }
+        if let Some(canon) = self.alias_index.get(name) {
+            return self
+                .hosts
+                .get(canon)
+                .ok_or_else(|| anyhow!("alias {name:?} points at missing host {canon:?}"));
+        }
+        Err(anyhow!("unknown host {name:?}"))
+    }
+
+    /// Canonical name for `name`, resolving an alias if needed.
+    pub fn canonical<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        if self.hosts.contains_key(name) {
+            return Some(name);
+        }
+        self.alias_index.get(name).map(String::as_str)
     }
 
     /// Look up a host and verify it carries the requested capability.
@@ -491,6 +543,74 @@ capabilities = ["exec"]
     /// `host_wake mira` broadcast a magic packet at a NIC that does not
     /// exist until libvirt creates the domain — and returned Ok(()).
     /// Unconditional success, nothing started.
+    /// 10.10.0.1 is one physical box with two names: `calisense` (the
+    /// router role) and `polnareff` (the hardware everyone calls that).
+    /// One machine, one entry, reachable by either name.
+    #[test]
+    fn alias_resolves_to_the_same_host() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.calisense]
+ip = "10.10.0.1"
+ssh_user = "cali"
+ssh_key = "/k"
+aliases = ["polnareff"]
+capabilities = ["exec"]
+"#,
+        )
+        .unwrap();
+        let by_name = inv.get("calisense").unwrap();
+        let by_alias = inv.get("polnareff").unwrap();
+        assert_eq!(by_name.ip, by_alias.ip);
+        assert_eq!(inv.canonical("polnareff"), Some("calisense"));
+        assert_eq!(inv.canonical("calisense"), Some("calisense"));
+        assert_eq!(inv.canonical("nope"), None);
+        // Capability gating works through the alias too.
+        inv.require("polnareff", Capability::Exec).unwrap();
+        assert!(inv.require("polnareff", Capability::Virt).is_err());
+    }
+
+    /// A collision would make `get()` resolve to whichever entry won a
+    /// HashMap race — silent and unreproducible. Both kinds are load
+    /// errors instead.
+    #[test]
+    fn rejects_alias_collisions() {
+        let with_host = r#"
+[host.a]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+aliases = ["b"]
+capabilities = ["exec"]
+
+[host.b]
+ip = "1.2.3.5"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(with_host).unwrap_err());
+        assert!(err.contains("collides with a host"), "{err}");
+
+        let two_claims = r#"
+[host.a]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+aliases = ["shared"]
+capabilities = ["exec"]
+
+[host.b]
+ip = "1.2.3.5"
+ssh_user = "x"
+ssh_key = "/k"
+aliases = ["shared"]
+capabilities = ["exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(two_claims).unwrap_err());
+        assert!(err.contains("claimed by both"), "{err}");
+    }
+
     #[test]
     fn rejects_wake_on_a_vm() {
         let bad = r#"
