@@ -1045,8 +1045,14 @@ impl Prompto {
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
             let h = inv.get(&args.name)?;
+            // Report the canonical name, not whatever the caller typed —
+            // asking for an alias and being told it IS that host hides
+            // the indirection. `queried_as` shows up only when they differ.
+            let canon = inv.canonical(&args.name).unwrap_or(&args.name).to_string();
+            let queried_as = (canon != args.name).then(|| args.name.clone());
             Ok(serde_json::json!({
-                "name": args.name,
+                "name": canon,
+                "queried_as": queried_as,
                 "ip": h.ip,
                 "mac": h.mac,
                 "ssh_user": h.ssh_user,
