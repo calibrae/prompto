@@ -96,6 +96,40 @@ impl Platform {
     }
 }
 
+/// Machine class: real hardware, or a guest on a hypervisor.
+///
+/// Distinct from [`Platform`], which describes the OS. A host can be
+/// FreeBSD on bare metal or FreeBSD in a VM, and the difference decides
+/// how you *power it on* — which is the one thing WOL gets wrong.
+///
+/// Before this existed, `mira` (a Windows guest on doppio) carried a
+/// `wake` capability and a `52:54:00:…` MAC — the QEMU/KVM OUI. Calling
+/// `host_wake mira` parsed the MAC, broadcast a magic packet at a NIC
+/// that does not exist until libvirt creates it, and returned `Ok(())`.
+/// Unconditional success, nothing started. The real path was always
+/// `virsh start mira`, which is what the MQTT chain on doppio does.
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Chassis {
+    /// Real hardware. Wakeable by WOL if it has a MAC and the firmware
+    /// is configured for it.
+    #[default]
+    ColdIron,
+    /// A guest. Started with `vm_start <hypervisor> <name>`, never WOL.
+    Vm,
+}
+
+impl Chassis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Chassis::ColdIron => "cold_iron",
+            Chassis::Vm => "vm",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
     /// Literal IPv4/IPv6 address — NOT a hostname. Typed as [`IpAddr`] on
@@ -116,6 +150,17 @@ pub struct HostConfig {
     /// doesn't.
     #[serde(default)]
     pub platform: Platform,
+    /// Real hardware or a guest. Defaults to `cold_iron`, so existing
+    /// entries need no edit; declaring `vm` disables WOL for the host.
+    #[serde(default)]
+    pub chassis: Chassis,
+    /// Inventory name of the hypervisor hosting this guest. Optional even
+    /// for `vm` — some guests (e.g. a VM on someone else's cluster) are
+    /// reachable but not ours to start. When present it must name a known
+    /// host carrying the `virt` capability, and it makes the wake refusal
+    /// actionable: "use vm_start doppio mira" rather than "mira is a VM".
+    #[serde(default)]
+    pub hypervisor: Option<String>,
     /// URL of the apytti gateway running on this host (e.g. `http://192.0.2.20:7781`).
     /// Required when the `claude_exec` capability is granted.
     #[serde(default)]
@@ -140,6 +185,21 @@ impl HostConfig {
         if self.has(Capability::Wake) && self.mac.is_none() {
             bail!("host {name}: wake capability requires `mac`");
         }
+        // WOL cannot start a libvirt guest: a shut-off domain has no NIC
+        // listening, so the magic packet lands nowhere while `host_wake`
+        // still reports success. Reject the combination at load rather
+        // than letting a caller discover it as a silent no-op.
+        if self.has(Capability::Wake) && self.chassis == Chassis::Vm {
+            let how = match &self.hypervisor {
+                Some(h) => format!("`vm_start {h} {name}`"),
+                None => "`vm_start <hypervisor> ".to_string() + name + "`",
+            };
+            bail!(
+                "host {name}: `wake` is not valid for chassis=\"vm\" — WOL cannot start a \
+                 guest (a shut-off domain has no NIC to receive the packet, and host_wake \
+                 would report success having done nothing). Drop `wake` and use {how}."
+            );
+        }
         if self.has(Capability::ClaudeExec) && self.apytti_url.is_none() {
             bail!("host {name}: claude_exec capability requires `apytti_url`");
         }
@@ -161,6 +221,24 @@ impl Inventory {
         let inv: Inventory = toml::from_str(s).context("parse inventory TOML")?;
         for (name, host) in &inv.hosts {
             host.validate(name)?;
+        }
+        // Cross-host checks, once every entry has parsed. A `hypervisor`
+        // pointing at a typo or at a box that can't run virsh is a
+        // promise the refusal message can't keep.
+        for (name, host) in &inv.hosts {
+            let Some(hv) = host.hypervisor.as_deref() else {
+                continue;
+            };
+            if host.chassis != Chassis::Vm {
+                bail!("host {name}: `hypervisor` is only meaningful with chassis = \"vm\"");
+            }
+            match inv.hosts.get(hv) {
+                None => bail!("host {name}: hypervisor {hv:?} is not a host in this inventory"),
+                Some(h) if !h.has(Capability::Virt) => {
+                    bail!("host {name}: hypervisor {hv:?} lacks the `virt` capability")
+                }
+                Some(_) => {}
+            }
         }
         Ok(inv)
     }
@@ -406,6 +484,126 @@ capabilities = ["exec"]
                 "host {name} was not self-guarded"
             );
         }
+    }
+
+    /// THE regression. `mira` is a Windows guest on doppio; its entry
+    /// carried `wake` and a `52:54:00:…` MAC (the QEMU/KVM OUI), so
+    /// `host_wake mira` broadcast a magic packet at a NIC that does not
+    /// exist until libvirt creates the domain — and returned Ok(()).
+    /// Unconditional success, nothing started.
+    #[test]
+    fn rejects_wake_on_a_vm() {
+        let bad = r#"
+[host.doppio]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["virt"]
+
+[host.mira]
+ip = "1.2.3.5"
+mac = "52:54:00:2b:bd:3c"
+ssh_user = "x"
+ssh_key = "/k"
+chassis = "vm"
+hypervisor = "doppio"
+capabilities = ["wake", "exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(bad).unwrap_err());
+        assert!(err.contains("not valid for chassis"), "{err}");
+        // The refusal must name the command that actually works.
+        assert!(err.contains("vm_start doppio mira"), "{err}");
+    }
+
+    #[test]
+    fn vm_without_hypervisor_is_allowed_but_wake_still_refused() {
+        // Some guests are reachable but not ours to start (a VM on
+        // someone else's cluster). chassis=vm alone is legal.
+        let ok = r#"
+[host.foreign]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+chassis = "vm"
+capabilities = ["exec"]
+"#;
+        Inventory::from_toml_str(ok).unwrap();
+
+        let bad = ok.replace(r#"capabilities = ["exec"]"#, r#"mac = "52:54:00:1:2:3"
+capabilities = ["wake"]"#);
+        let err = format!("{:#}", Inventory::from_toml_str(&bad).unwrap_err());
+        assert!(err.contains("vm_start <hypervisor> foreign"), "{err}");
+    }
+
+    #[test]
+    fn hypervisor_must_name_a_known_virt_host() {
+        let typo = r#"
+[host.mira]
+ip = "1.2.3.5"
+ssh_user = "x"
+ssh_key = "/k"
+chassis = "vm"
+hypervisor = "dopio"
+capabilities = ["exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(typo).unwrap_err());
+        assert!(err.contains("not a host in this inventory"), "{err}");
+
+        let no_virt = r#"
+[host.plain]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["exec"]
+
+[host.mira]
+ip = "1.2.3.5"
+ssh_user = "x"
+ssh_key = "/k"
+chassis = "vm"
+hypervisor = "plain"
+capabilities = ["exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(no_virt).unwrap_err());
+        assert!(err.contains("lacks the `virt` capability"), "{err}");
+    }
+
+    #[test]
+    fn hypervisor_on_cold_iron_is_rejected() {
+        let bad = r#"
+[host.dop]
+ip = "1.2.3.4"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["virt"]
+
+[host.metal]
+ip = "1.2.3.5"
+ssh_user = "x"
+ssh_key = "/k"
+hypervisor = "dop"
+capabilities = ["exec"]
+"#;
+        let err = format!("{:#}", Inventory::from_toml_str(bad).unwrap_err());
+        assert!(err.contains("only meaningful with chassis"), "{err}");
+    }
+
+    /// Counterweight: cold iron with a real MAC still wakes. The fix must
+    /// not disable WOL wholesale.
+    #[test]
+    fn cold_iron_wake_still_allowed() {
+        let ok = r#"
+[host.doppio]
+ip = "1.2.3.4"
+mac = "b4:2e:99:3e:c5:81"
+ssh_user = "x"
+ssh_key = "/k"
+capabilities = ["wake", "exec"]
+"#;
+        let inv = Inventory::from_toml_str(ok).unwrap();
+        let d = inv.get("doppio").unwrap();
+        assert_eq!(d.chassis, Chassis::ColdIron, "default must be cold_iron");
+        assert!(d.has(Capability::Wake));
     }
 
     #[test]
