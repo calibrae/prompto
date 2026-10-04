@@ -22,6 +22,7 @@ pub mod rsync;
 pub mod script;
 pub mod server;
 pub mod ssh;
+pub mod vault;
 pub mod virt;
 pub mod wol;
 

@@ -8,6 +8,7 @@ use prompto::caller;
 use prompto::inventory::InventoryStore;
 use prompto::mcp::Prompto;
 use prompto::ssh::SshClient;
+use prompto::vault::VaultClient;
 use std::net::SocketAddr;
 use prompto::server::{AllowedHosts, HttpParams, build_router};
 use rmcp::{ServiceExt, transport::stdio};
@@ -93,6 +94,27 @@ fn spawn_sighup_reloader(store: InventoryStore) {
     });
 }
 
+/// Keep prompto's vault token alive. A periodic token renewed inside its
+/// period never expires; this renews at half the lease, and backs off to
+/// five minutes on failure so a vault restart doesn't strand us.
+fn spawn_vault_renewal(vault: Arc<VaultClient>) {
+    tokio::spawn(async move {
+        loop {
+            let next = match vault.renew_self().await {
+                Ok(lease) => {
+                    tracing::info!(lease_secs = lease.as_secs(), "vault token renewed");
+                    (lease / 2).max(Duration::from_secs(60))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "vault token renewal failed; retrying in 5m");
+                    Duration::from_secs(300)
+                }
+            };
+            tokio::time::sleep(next).await;
+        }
+    });
+}
+
 #[cfg(not(unix))]
 fn spawn_sighup_reloader(_store: InventoryStore) {}
 
@@ -161,7 +183,29 @@ async fn main() -> Result<()> {
     );
     spawn_sighup_reloader(store.clone());
 
-    let ssh = Arc::new(SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout));
+    let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
+    let needs_vault: Vec<String> = store
+        .snapshot()
+        .hosts
+        .iter()
+        .filter(|(_, h)| h.sudo_password_vault_path.is_some())
+        .map(|(n, _)| n.clone())
+        .collect();
+    match VaultClient::from_env() {
+        Some(vault) => {
+            let vault = Arc::new(vault);
+            tracing::info!(addr = %vault.addr(), hosts = ?needs_vault, "vault-backed sudo enabled");
+            spawn_vault_renewal(vault.clone());
+            ssh_client = ssh_client.with_vault(vault);
+        }
+        None if !needs_vault.is_empty() => tracing::warn!(
+            hosts = ?needs_vault,
+            "these hosts declare sudo_password_vault_path but PROMPTO_VAULT_TOKEN is unset — \
+             their sudo calls will fail until it is configured"
+        ),
+        None => {}
+    }
+    let ssh = Arc::new(ssh_client);
     let tracker = Arc::new(Tracker::new(
         cfg.usage_log.clone(),
         cfg.gain_enabled,

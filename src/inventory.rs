@@ -180,6 +180,19 @@ pub struct HostConfig {
     /// both are rejected at load.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Vault KV v2 path (under the configured mount, default `secret`)
+    /// holding this host's sudo password, e.g. `infra/default`. When set,
+    /// sudo runs as `sudo -k -S` with the password fed over SSH stdin
+    /// instead of `sudo -n`. For hosts that deliberately keep a sudo
+    /// password — the edge routers — rather than passwordless sudo.
+    ///
+    /// The password is fetched per call, used inside prompto, and never
+    /// returned to the caller, logged, or placed on a command line.
+    #[serde(default)]
+    pub sudo_password_vault_path: Option<String>,
+    /// Field within that secret. Defaults to `password`.
+    #[serde(default)]
+    pub sudo_password_vault_field: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 }
@@ -214,6 +227,18 @@ impl HostConfig {
                  guest (a shut-off domain has no NIC to receive the packet, and host_wake \
                  would report success having done nothing). Drop `wake` and use {how}."
             );
+        }
+        if let Some(path) = &self.sudo_password_vault_path {
+            crate::vault::validate_kv_path(path)
+                .with_context(|| format!("host {name}: sudo_password_vault_path"))?;
+            // A vault path on a host that can't sudo is a typo or a
+            // forgotten capability — either way it would never be used.
+            if !self.has(Capability::SudoExec) {
+                bail!("host {name}: sudo_password_vault_path is set but the host lacks `sudo_exec`");
+            }
+        }
+        if self.sudo_password_vault_field.is_some() && self.sudo_password_vault_path.is_none() {
+            bail!("host {name}: sudo_password_vault_field needs sudo_password_vault_path");
         }
         if self.has(Capability::ClaudeExec) && self.apytti_url.is_none() {
             bail!("host {name}: claude_exec capability requires `apytti_url`");
@@ -609,6 +634,51 @@ capabilities = ["exec"]
 "#;
         let err = format!("{:#}", Inventory::from_toml_str(two_claims).unwrap_err());
         assert!(err.contains("claimed by both"), "{err}");
+    }
+
+    #[test]
+    fn sudo_vault_path_validation() {
+        let base = |extra: &str, caps: &str| {
+            format!(
+                "[host.edge]\nip = \"1.2.3.4\"\nssh_user = \"cali\"\nssh_key = \"/k\"\n{extra}\ncapabilities = {caps}\n"
+            )
+        };
+        // Good: path + sudo_exec, default field.
+        let inv = Inventory::from_toml_str(&base(
+            "sudo_password_vault_path = \"infra/default\"",
+            "[\"exec\", \"sudo_exec\"]",
+        ))
+        .unwrap();
+        assert_eq!(
+            inv.get("edge").unwrap().sudo_password_vault_path.as_deref(),
+            Some("infra/default")
+        );
+        // Path without sudo_exec: would never be used — reject.
+        let err = format!(
+            "{:#}",
+            Inventory::from_toml_str(&base(
+                "sudo_password_vault_path = \"infra/default\"",
+                "[\"exec\"]"
+            ))
+            .unwrap_err()
+        );
+        assert!(err.contains("lacks `sudo_exec`"), "{err}");
+        // Field without path.
+        let err = format!(
+            "{:#}",
+            Inventory::from_toml_str(&base(
+                "sudo_password_vault_field = \"password\"",
+                "[\"exec\", \"sudo_exec\"]"
+            ))
+            .unwrap_err()
+        );
+        assert!(err.contains("needs sudo_password_vault_path"), "{err}");
+        // Path traversal.
+        assert!(Inventory::from_toml_str(&base(
+            "sudo_password_vault_path = \"infra/../sys\"",
+            "[\"exec\", \"sudo_exec\"]"
+        ))
+        .is_err());
     }
 
     #[test]
