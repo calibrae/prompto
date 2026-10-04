@@ -156,7 +156,7 @@ pub async fn remove(
 }
 
 /// Tail a systemd unit's journal on a host. Wraps
-/// `sudo -n journalctl -u <unit> -n <lines> --no-pager`. Requires
+/// `journalctl -u <unit> -n <lines> --no-pager` as root. Requires
 /// `sudo_exec` capability on the target.
 pub async fn journalctl_tail(
     ssh: &SshClient,

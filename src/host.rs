@@ -47,7 +47,7 @@ pub async fn status(host: &HostConfig, probe_timeout: Duration) -> Result<HostSt
     })
 }
 
-/// `sudo -n shutdown -h now`. Caller must have checked `sudo_exec`.
+/// `shutdown -h now` as root. Caller must have checked `sudo_exec`.
 pub async fn sleep(ssh: &SshClient, host: &HostConfig) -> Result<()> {
     // Fire-and-forget — the connection drops as soon as init begins shutting
     // down, so any non-zero exit / broken pipe is fine.

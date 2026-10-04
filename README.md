@@ -19,7 +19,7 @@ prompto rolls them into one MCP. Single source of authority for power, virt, and
 | Tool | Purpose |
 |---|---|
 | `host_wake` | UDP magic packet to the host's MAC (broadcast :9). Capability: `wake`. |
-| `host_sleep` | SSH + `sudo -n shutdown -h now`. Capability: `sudo_exec`. |
+| `host_sleep` | SSH + `shutdown -h now` as root. Capability: `sudo_exec`. |
 | `host_status` | TCP probe to the host's SSH port: `up` / `off` / `unreachable`. |
 | `vm_list` | `virsh list --all` over SSH, parsed to JSON. Capability: `virt`. |
 | `vm_state` | `virsh domstate`. Capability: `virt`. |
@@ -27,7 +27,7 @@ prompto rolls them into one MCP. Single source of authority for power, virt, and
 | `vm_stop` | Fallback chain: `dompmsuspend disk` → `shutdown` → `destroy`. Capability: `virt`. |
 | `vm_ensure_up` | Wake host, start VM, wait until SSH-reachable. Capabilities: `wake` + `virt`. |
 | `ssh_exec` | Run a command over SSH and return stdout/stderr/exit. Capability: `exec`. |
-| `ssh_sudo_exec` | Same with `sudo -n`. Capability: `sudo_exec`. |
+| `ssh_sudo_exec` | Same, as root (`sudo -n`, or a vault-held sudo password — see below). Capability: `sudo_exec`. |
 | `mcp_list` / `mcp_get` / `mcp_add` / `mcp_remove` | Wrap `claude mcp …` on a remote client. Capability: `claude_admin`. |
 | `mcp_restart_claudecli` | Best-effort restart of a claudecli (Telegram-bridge) instance. Capability: `claude_admin`. |
 | `prompto_gain` | Token-savings analytics — see below. |
@@ -75,6 +75,35 @@ capabilities = ["exec", "virt"]        # no wake, no sudo (needs password)
 ```
 
 `SIGHUP` reloads the file without dropping the listener.
+
+### Sudo with a password (vault)
+
+Hosts without a passwordless sudo rule can keep their sudo password in
+Vault (KV v2) instead:
+
+```toml
+[host.router]
+# ...
+capabilities = ["exec", "sudo_exec"]
+sudo_password_vault_path  = "prompto/sudo-default"   # under PROMPTO_VAULT_MOUNT
+sudo_password_vault_field = "password"               # default
+```
+
+Env (restart, not SIGHUP): `PROMPTO_VAULT_TOKEN` (required — use a
+**periodic** token, `-period=768h`; prompto renews it at half its lease,
+and a non-periodic token dies at the mount's max TTL whatever you do),
+`PROMPTO_VAULT_ADDR` (default `http://127.0.0.1:8200`),
+`PROMPTO_VAULT_MOUNT` (default `secret`).
+
+The password and the command both travel over SSH stdin to
+`sudo -k -S -p '' -- sh -c '<guard>' prompto-sudo sh -s` — nothing secret
+in any argv, the caller never sees it. The guard demands a marker line
+after the password; if the host *also* has a passwordless rule, sudo
+never reads stdin, the guard sees the password instead, and refuses
+(exit 97) without printing it. Remove the passwordless rule (or the vault
+path) on such a host. On vault hosts the whole command runs as root
+under `sh`; on `sudo -n` hosts only its first simple command is
+elevated.
 
 ## Token-savings analytics
 

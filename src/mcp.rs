@@ -300,7 +300,7 @@ pub struct FileWriteArgs {
     /// Octal mode applied via chmod after write.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Use `sudo -n tee`. Default false.
+    /// Write as root (needs `sudo_exec`). Default false.
     #[serde(default)]
     pub sudo: Option<bool>,
 }
@@ -556,7 +556,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Shutdown a host (`sudo -n shutdown -h now`)."
+        description = "Shutdown a host (`shutdown -h now` as root)."
     )]
     async fn host_sleep(
         &self,
@@ -1278,7 +1278,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Write a remote file (content via SSH stdin, no shell quoting). Optional mode runs chmod after. sudo=true uses sudo -n tee."
+        description = "Write a remote file (content via SSH stdin, no shell quoting). Optional mode runs chmod after. sudo=true writes as root."
     )]
     async fn file_write(
         &self,
@@ -1342,7 +1342,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command via `sudo -n` over SSH. Passwordless sudo only. Same filter chain as ssh_exec."
+        description = "Run a command as root over SSH. Uses passwordless sudo, or a vault-held sudo password when the host declares one (the password never reaches the caller; the whole command then runs as root under sh). Same filter chain as ssh_exec."
     )]
     async fn ssh_sudo_exec(
         &self,

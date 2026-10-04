@@ -73,8 +73,8 @@ pub async fn read(
 }
 
 /// Write bytes to a remote path. Pipes the content through SSH stdin to
-/// `tee -- <path> >/dev/null`. With `sudo=true` the tee runs as root via
-/// `sudo -n tee` (caller must have `sudo_exec` capability checked).
+/// `tee -- <path> >/dev/null`. With `sudo=true` the tee runs as root
+/// (caller must have `sudo_exec` capability checked).
 pub async fn write(
     ssh: &SshClient,
     host: &HostConfig,
