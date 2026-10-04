@@ -47,6 +47,12 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 
 ### E0 — Spikes & housekeeping (before code)
 - **S0.1 Spike: mods see MCP calls.** A 10-line logging mod via `--plugin-dir`. Confirm `tool.call` fires for `mcp__prompto__*`, and note the exact `e.tool` and input field names. Confirm that `next({...e, input})` rewriting reaches the MCP server and that `$.session.id` is available. **Gates E7's design.**
+  - **Done 2026-10-04** (Claude Code 2.1.289). Confirmed live with `--plugin-dir` + `claude -p`:
+    - `tool.call` fires for `mcp__prompto__*`. `e` carries `tool`, `tool_use_id`, and the arguments as **flat top-level fields** (`e.host`), not `e.input`.
+    - `$.session.id()` and `$.session.cwd()` are async and work headless.
+    - `next({...e, host: 'calisense'})` reached prompto: the model asked for doppio, prompto probed calisense.
+    - `next({...e, ticket: '…'})` passed Claude Code's validation, and prompto accepted the call (unknown field ignored).
+  - **Consequence:** a mod can silently redirect or alter calls. That's further proof enforcement must stay server-side, with the ticket bound to the exact arguments.
 - **S0.2 `rsync_sync` failure reason.** Classify its errors (precondition vs ssh vs rsync) and surface them in the tool result. It's the most-failed tool (26–72%/month).
 - **S0.3 Decide the 7 never-called tools:** `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `mcp_add`, `mcp_remove`, `mcp_restart_claudecli`. Keep or remove; every tool is surface that policy must cover.
 - **S0.4 nginx attribution:** add `$host` to the mista access log format. Decide what happens to direct `:6337` access once auth exists. Once auth is in prompto, both paths are equivalent.
