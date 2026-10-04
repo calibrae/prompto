@@ -37,7 +37,7 @@ impl ExecOutput {
 /// matter:
 ///
 /// - **Nothing secret on a command line.** This string is all `ps` can
-///   see, on mista or on the target.
+///   see, on prompto's host or on the target.
 /// - **sudo reads stdin before anything else runs.** Splicing the
 ///   caller's command in as shell text (`sudo -S -- {cmd}`) would let
 ///   `x & cat` background sudo with its stdin detached while `cat` reads
@@ -58,7 +58,7 @@ impl ExecOutput {
 /// `!` even inside single quotes).
 ///
 /// Also avoids remote quoting entirely, which matters because the login
-/// shell on the OPNsense boxes is csh.
+/// shell on some BSD hosts is csh.
 pub const SUDO_STDIN_SHELL: &str = "sudo -k -S -p '' -- sh -c '\
 IFS= read -r l; [ \"$l\" = prompto-sudo-ok ] || { echo \"prompto: sudo did not read the password - \
 this host has a passwordless sudo rule, drop its sudo_password_vault_path\" >&2; exit 97; }; \

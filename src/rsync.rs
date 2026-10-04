@@ -13,15 +13,15 @@
 //!
 //! Until v0.8.0 this module violated its own premise. It passed
 //! `dest_host.ssh_key` — an *inventory* path like
-//! `/etc/prompto/keys/cali_net_rsa`, meaningful only on the host running
+//! `/etc/prompto/keys/id_rsa`, meaningful only on the host running
 //! prompto — to `ssh -i` **on the source host**, where that file is
 //! either absent or (on prompto's own host) present but `root:prompto
 //! 0640` and unreadable by the SSH user. Every call was therefore either
 //! silently rescued by the source host's default key or killed outright:
 //!
 //! ```text
-//! Warning: Identity file /etc/prompto/keys/cali_net_rsa not accessible: Permission denied.
-//! cali@10.10.0.12: Permission denied (publickey,...).
+//! Warning: Identity file /etc/prompto/keys/id_rsa not accessible: Permission denied.
+//! user@192.0.2.12: Permission denied (publickey,...).
 //! rsync error: unexplained error (code 255)
 //! ```
 //!

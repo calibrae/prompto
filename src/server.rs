@@ -120,7 +120,7 @@ struct LogQuery {
 ///
 /// This endpoint is deliberately unauthenticated (operator's call). It is
 /// reachable wherever prompto's listener is: in the homelab deployment
-/// that is `prompto.portal.calii.net`, i.e. anyone on the LAN or WireGuard.
+/// that is the public vhost, i.e. anyone on the LAN or WireGuard.
 /// Anyone who can reach it can read journals on any inventory host that
 /// grants `sudo_exec`.
 ///

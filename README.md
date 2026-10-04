@@ -85,7 +85,7 @@ Vault (KV v2) instead:
 [host.router]
 # ...
 capabilities = ["exec", "sudo_exec"]
-sudo_password_vault_path  = "prompto/sudo-default"   # under PROMPTO_VAULT_MOUNT
+sudo_password_vault_path  = "hosts/sudo"   # under PROMPTO_VAULT_MOUNT
 sudo_password_vault_field = "password"               # default
 ```
 

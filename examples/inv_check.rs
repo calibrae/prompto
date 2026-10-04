@@ -12,7 +12,6 @@ fn main() {
                     h.platform.as_str(), h.chassis.as_str(), hv,
                     h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","), al);
             }
-            println!("  alias check: polnareff -> {:?}", inv.canonical("polnareff"));
         }
         Err(e) => { println!("REJECTED: {e:#}"); std::process::exit(1); }
     }

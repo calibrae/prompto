@@ -395,11 +395,11 @@ mod tests {
     #[test]
     fn bsd_and_gnu_ls_normalise_to_one_shape() {
         let gnu = "total 8\n\
-                   drwxr-xr-x 3 cali staff 96 2026-08-13 14:23 somedir\n\
-                   -rw-r--r-- 1 cali staff 42 2026-08-13 09:05 a file.txt\n";
+                   drwxr-xr-x 3 user staff 96 2026-08-13 14:23 somedir\n\
+                   -rw-r--r-- 1 user staff 42 2026-08-13 09:05 a file.txt\n";
         let bsd = "total 8\n\
-                   drwxr-xr-x 3 cali staff 96 Aug 13 14:23:07 2026 somedir\n\
-                   -rw-r--r-- 1 cali staff 42 Aug 13 09:05:59 2026 a file.txt\n";
+                   drwxr-xr-x 3 user staff 96 Aug 13 14:23:07 2026 somedir\n\
+                   -rw-r--r-- 1 user staff 42 Aug 13 09:05:59 2026 a file.txt\n";
 
         let g = parse_ls(Platform::Linux, gnu);
         let b = parse_ls(Platform::Macos, bsd);
@@ -427,8 +427,8 @@ mod tests {
     /// Callers get one vocabulary.
     #[test]
     fn stat_kind_is_lowercased_for_both() {
-        let bsd = "755|4096|cali|staff|2026-08-13 14:23:07|Directory|/tmp";
-        let gnu = "755|4096|cali|staff|2026-08-13 14:23:07|directory|/tmp";
+        let bsd = "755|4096|user|staff|2026-08-13 14:23:07|Directory|/tmp";
+        let gnu = "755|4096|user|staff|2026-08-13 14:23:07|directory|/tmp";
         assert_eq!(parse_stat(bsd).unwrap().kind, "directory");
         assert_eq!(parse_stat(gnu).unwrap().kind, "directory");
     }
@@ -504,10 +504,10 @@ mod tests {
     #[test]
     fn parse_ls_long_extracts_entries() {
         let s = "total 12\n\
-                 drwxr-xr-x 2 cali staff   64 2026-04-27 12:00 .\n\
-                 drwxr-xr-x 5 cali staff  160 2026-04-27 11:00 ..\n\
-                 -rw-r--r-- 1 cali staff   42 2026-04-27 11:30 file.txt\n\
-                 lrwxrwxrwx 1 cali staff    7 2026-04-27 11:31 link -> target\n";
+                 drwxr-xr-x 2 user staff   64 2026-04-27 12:00 .\n\
+                 drwxr-xr-x 5 user staff  160 2026-04-27 11:00 ..\n\
+                 -rw-r--r-- 1 user staff   42 2026-04-27 11:30 file.txt\n\
+                 lrwxrwxrwx 1 user staff    7 2026-04-27 11:31 link -> target\n";
         let entries = parse_ls_long(s);
         assert_eq!(entries.len(), 4);
         assert!(entries[0].is_dir);
@@ -520,13 +520,13 @@ mod tests {
     #[test]
     fn parse_stat_one_line() {
         let s =
-            "0644|42|cali|staff|2026-04-27 11:30:00.000000 +0000|regular file|/home/cali/x.txt\n";
+            "0644|42|user|staff|2026-04-27 11:30:00.000000 +0000|regular file|/home/user/x.txt\n";
         let st = parse_stat(s).unwrap();
         assert_eq!(st.mode, "0644");
         assert_eq!(st.size, 42);
-        assert_eq!(st.owner, "cali");
+        assert_eq!(st.owner, "user");
         assert_eq!(st.kind, "regular file");
-        assert_eq!(st.path, "/home/cali/x.txt");
+        assert_eq!(st.path, "/home/user/x.txt");
     }
 
     #[test]

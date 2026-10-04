@@ -121,12 +121,12 @@ mod tests {
     /// what headers it sends.
     #[test]
     fn untrusted_peer_cannot_spoof_via_headers() {
-        let peer = ip("10.10.0.99");
+        let peer = ip("192.0.2.99");
         let got = resolve_client_ip(
             peer,
             DEFAULT_TRUSTED_PROXIES,
-            Some("10.10.0.2"),
-            Some("10.10.0.2"),
+            Some("192.0.2.2"),
+            Some("192.0.2.2"),
         );
         assert_eq!(got, peer, "headers from an untrusted peer must be ignored");
     }
@@ -136,10 +136,10 @@ mod tests {
         let got = resolve_client_ip(
             ip("127.0.0.1"),
             DEFAULT_TRUSTED_PROXIES,
-            Some("10.10.0.2"),
+            Some("192.0.2.2"),
             None,
         );
-        assert_eq!(got, ip("10.10.0.2"));
+        assert_eq!(got, ip("192.0.2.2"));
     }
 
     #[test]
@@ -147,10 +147,10 @@ mod tests {
         let got = resolve_client_ip(
             ip("127.0.0.1"),
             DEFAULT_TRUSTED_PROXIES,
-            Some("10.10.0.2"),
+            Some("192.0.2.2"),
             Some("203.0.113.9"),
         );
-        assert_eq!(got, ip("10.10.0.2"));
+        assert_eq!(got, ip("192.0.2.2"));
     }
 
     /// `$proxy_add_x_forwarded_for` appends what nginx saw, so the last
@@ -162,11 +162,11 @@ mod tests {
             ip("127.0.0.1"),
             DEFAULT_TRUSTED_PROXIES,
             None,
-            Some("203.0.113.9, 198.51.100.7, 10.10.0.2"),
+            Some("203.0.113.9, 198.51.100.7, 192.0.2.2"),
         );
         assert_eq!(
             got,
-            ip("10.10.0.2"),
+            ip("192.0.2.2"),
             "client-supplied leading entries must not win"
         );
     }
@@ -191,15 +191,15 @@ mod tests {
 
     #[test]
     fn ipv6_loopback_is_trusted_by_default() {
-        let got = resolve_client_ip(ip("::1"), DEFAULT_TRUSTED_PROXIES, Some("10.10.0.2"), None);
-        assert_eq!(got, ip("10.10.0.2"));
+        let got = resolve_client_ip(ip("::1"), DEFAULT_TRUSTED_PROXIES, Some("192.0.2.2"), None);
+        assert_eq!(got, ip("192.0.2.2"));
     }
 
     #[test]
     fn parse_trusted_proxies_filters_garbage() {
         assert_eq!(
-            parse_trusted_proxies("127.0.0.1, nonsense, 10.10.0.3"),
-            Some(vec![ip("127.0.0.1"), ip("10.10.0.3")])
+            parse_trusted_proxies("127.0.0.1, nonsense, 192.0.2.3"),
+            Some(vec![ip("127.0.0.1"), ip("192.0.2.3")])
         );
         assert_eq!(parse_trusted_proxies(""), None);
         assert_eq!(parse_trusted_proxies("garbage"), None);

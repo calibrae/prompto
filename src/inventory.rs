@@ -108,12 +108,12 @@ impl Platform {
 /// FreeBSD on bare metal or FreeBSD in a VM, and the difference decides
 /// how you *power it on* — which is the one thing WOL gets wrong.
 ///
-/// Before this existed, `mira` (a Windows guest on doppio) carried a
-/// `wake` capability and a `52:54:00:…` MAC — the QEMU/KVM OUI. Calling
-/// `host_wake mira` parsed the MAC, broadcast a magic packet at a NIC
-/// that does not exist until libvirt creates it, and returned `Ok(())`.
-/// Unconditional success, nothing started. The real path was always
-/// `virsh start mira`, which is what the MQTT chain on doppio does.
+/// Before this existed, a Windows guest carried a `wake` capability and
+/// a `52:54:00:…` MAC — the QEMU/KVM OUI. Calling `host_wake` on it
+/// parsed the MAC, broadcast a magic packet at a NIC that does not exist
+/// until libvirt creates it, and returned `Ok(())`. Unconditional
+/// success, nothing started. The real path was always `virsh start` on
+/// its hypervisor.
 #[derive(
     Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -164,7 +164,7 @@ pub struct HostConfig {
     /// for `vm` — some guests (e.g. a VM on someone else's cluster) are
     /// reachable but not ours to start. When present it must name a known
     /// host carrying the `virt` capability, and it makes the wake refusal
-    /// actionable: "use vm_start doppio mira" rather than "mira is a VM".
+    /// actionable: "use vm_start hypervisor winguest" rather than "winguest is a VM".
     #[serde(default)]
     pub hypervisor: Option<String>,
     /// URL of the apytti gateway running on this host (e.g. `http://192.0.2.20:7781`).
@@ -172,9 +172,9 @@ pub struct HostConfig {
     #[serde(default)]
     pub apytti_url: Option<String>,
     /// Extra names this host answers to. A box can carry a service
-    /// identity and a hardware name — 10.10.0.1 is `calisense` (the
-    /// router role) on hardware everyone calls `polnareff`. One machine,
-    /// so one entry, reachable by either name.
+    /// identity and a hardware name — e.g. `router` (the role) on a box
+    /// everyone calls `minipc`. One machine, so one entry, reachable by
+    /// either name.
     ///
     /// Aliases must not collide with a host name or another alias;
     /// both are rejected at load.
@@ -563,36 +563,30 @@ capabilities = ["exec"]
         }
     }
 
-    /// THE regression. `mira` is a Windows guest on doppio; its entry
-    /// carried `wake` and a `52:54:00:…` MAC (the QEMU/KVM OUI), so
-    /// `host_wake mira` broadcast a magic packet at a NIC that does not
-    /// exist until libvirt creates the domain — and returned Ok(()).
-    /// Unconditional success, nothing started.
-    /// 10.10.0.1 is one physical box with two names: `calisense` (the
-    /// router role) and `polnareff` (the hardware everyone calls that).
-    /// One machine, one entry, reachable by either name.
+    /// One physical box with two names: `router` (the role) and `minipc`
+    /// (the hardware). One machine, one entry, reachable by either name.
     #[test]
     fn alias_resolves_to_the_same_host() {
         let inv = Inventory::from_toml_str(
             r#"
-[host.calisense]
-ip = "10.10.0.1"
-ssh_user = "cali"
+[host.router]
+ip = "192.0.2.1"
+ssh_user = "admin"
 ssh_key = "/k"
-aliases = ["polnareff"]
+aliases = ["minipc"]
 capabilities = ["exec"]
 "#,
         )
         .unwrap();
-        let by_name = inv.get("calisense").unwrap();
-        let by_alias = inv.get("polnareff").unwrap();
+        let by_name = inv.get("router").unwrap();
+        let by_alias = inv.get("minipc").unwrap();
         assert_eq!(by_name.ip, by_alias.ip);
-        assert_eq!(inv.canonical("polnareff"), Some("calisense"));
-        assert_eq!(inv.canonical("calisense"), Some("calisense"));
+        assert_eq!(inv.canonical("minipc"), Some("router"));
+        assert_eq!(inv.canonical("router"), Some("router"));
         assert_eq!(inv.canonical("nope"), None);
         // Capability gating works through the alias too.
-        inv.require("polnareff", Capability::Exec).unwrap();
-        assert!(inv.require("polnareff", Capability::Virt).is_err());
+        inv.require("minipc", Capability::Exec).unwrap();
+        assert!(inv.require("minipc", Capability::Virt).is_err());
     }
 
     /// A collision would make `get()` resolve to whichever entry won a
@@ -681,28 +675,31 @@ capabilities = ["exec"]
         .is_err());
     }
 
+    /// THE regression: a Windows guest carrying `wake` and a QEMU/KVM
+    /// `52:54:00:…` MAC made `host_wake` broadcast at a NIC that does not
+    /// exist until libvirt creates the domain — and return Ok(()).
     #[test]
     fn rejects_wake_on_a_vm() {
         let bad = r#"
-[host.doppio]
+[host.hypervisor]
 ip = "1.2.3.4"
 ssh_user = "x"
 ssh_key = "/k"
 capabilities = ["virt"]
 
-[host.mira]
+[host.winguest]
 ip = "1.2.3.5"
-mac = "52:54:00:2b:bd:3c"
+mac = "52:54:00:00:00:01"
 ssh_user = "x"
 ssh_key = "/k"
 chassis = "vm"
-hypervisor = "doppio"
+hypervisor = "hypervisor"
 capabilities = ["wake", "exec"]
 "#;
         let err = format!("{:#}", Inventory::from_toml_str(bad).unwrap_err());
         assert!(err.contains("not valid for chassis"), "{err}");
         // The refusal must name the command that actually works.
-        assert!(err.contains("vm_start doppio mira"), "{err}");
+        assert!(err.contains("vm_start hypervisor winguest"), "{err}");
     }
 
     #[test]
@@ -783,15 +780,15 @@ capabilities = ["exec"]
     #[test]
     fn cold_iron_wake_still_allowed() {
         let ok = r#"
-[host.doppio]
+[host.workstation]
 ip = "1.2.3.4"
-mac = "b4:2e:99:3e:c5:81"
+mac = "00:11:22:33:44:55"
 ssh_user = "x"
 ssh_key = "/k"
 capabilities = ["wake", "exec"]
 "#;
         let inv = Inventory::from_toml_str(ok).unwrap();
-        let d = inv.get("doppio").unwrap();
+        let d = inv.get("workstation").unwrap();
         assert_eq!(d.chassis, Chassis::ColdIron, "default must be cold_iron");
         assert!(d.has(Capability::Wake));
     }

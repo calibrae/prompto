@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn kv_path_validation() {
         validate_kv_path("infra/default").unwrap();
-        validate_kv_path("infra/opnsense/calisense").unwrap();
+        validate_kv_path("infra/router/sudo").unwrap();
         for bad in ["", "/infra/default", "infra/", "infra/../root", "infra//x", "a?b=c", "a b"] {
             assert!(validate_kv_path(bad).is_err(), "accepted {bad:?}");
         }
