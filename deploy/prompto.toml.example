@@ -23,3 +23,10 @@ ip = "192.0.2.7"
 ssh_user = "admin"
 ssh_key  = "/etc/prompto/keys/id_rsa"
 capabilities = ["exec", "virt"]
+
+# Optional per-host fields:
+#   platform = "linux"            # linux | macos | freebsd | windows
+#   chassis = "vm"                # cold_iron (default) | vm — a vm is never WOL'd
+#   hypervisor = "hypervisor"     # host with `virt` that runs this guest
+#   aliases = ["other-name"]
+#   sudo_password_vault_path = "hosts/sudo"   # needs PROMPTO_VAULT_TOKEN
