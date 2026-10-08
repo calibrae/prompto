@@ -4,6 +4,8 @@
 #   sbx-core  control plane: prompto-dev, OpenBao, Kanidm   (passwordless sudo)
 #   sbx-t1    managed target: passwordless sudo, static key
 #   sbx-t2    managed target: password sudo                 (vault-sudo path)
+#   sbx-dev   the dev agent's workstation: Claude Code + toolchain, root
+#             only inside itself, governed by sandbox prompto
 #
 # Everything sandbox-only: its own SSH key, its own sudo password, its own
 # network (libvirt "default" NAT). Nothing here can reach a credential that
@@ -24,7 +26,8 @@ NET=default
 #        name      ram   cpu  disk  ip               mac                 sudo
 GUESTS=("sbx-core  4096  4    30G   192.168.122.10   52:54:00:5b:00:10   nopasswd"
         "sbx-t1    1024  1    10G   192.168.122.11   52:54:00:5b:00:11   nopasswd"
-        "sbx-t2    1024  1    10G   192.168.122.12   52:54:00:5b:00:12   password")
+        "sbx-t2    1024  1    10G   192.168.122.12   52:54:00:5b:00:12   password"
+        "sbx-dev   3072  3    30G   192.168.122.20   52:54:00:5b:00:20   nopasswd")
 
 install -d -m 0700 -o "$OWNER" "$STATE" "$STATE/secrets"
 
@@ -93,6 +96,8 @@ Host sbx-t1
   HostName 192.168.122.11
 Host sbx-t2
   HostName 192.168.122.12
+Host sbx-dev
+  HostName 192.168.122.20
 EOF
 chown "$OWNER" "$STATE/ssh_config"
 echo "ssh -F $STATE/ssh_config sbx-core"

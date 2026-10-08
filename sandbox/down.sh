@@ -2,7 +2,7 @@
 # Destroy the prompto sandbox guests and their disks. Keeps the base image
 # and $SBX_STATE (sandbox key and password) unless --purge is given.
 set -euo pipefail
-for name in sbx-core sbx-t1 sbx-t2; do
+for name in sbx-core sbx-t1 sbx-t2 sbx-dev; do
   virsh -q destroy "$name" 2>/dev/null || true
   virsh -q undefine "$name" --remove-all-storage 2>/dev/null && echo "removed $name" || true
 done
