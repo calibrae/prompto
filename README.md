@@ -30,7 +30,7 @@ Every call is **capability-gated** by the per-host allowlist in the inventory. A
 
 `ssh_exec` stdout passes through a filter chain (cargo, git, journalctl, systemctl, pkg, k8s, zfs, …) that compacts known-noisy output and names the filter it applied. Compound commands (`;`, `&&`, `||`, `&`, newlines) are never filtered.
 
-**Self-targeting guard.** Every tool that contacts a host refuses one whose `ip` is the calling agent's source IP, with no exceptions: logins, exec, files, `rsync_sync` (both ends), `vm_*`, `mcp_*` (including `mcp_restart_claudecli`), `claude_exec`, `host_wake`, `host_status`, `port_scan` and `GET /log`. The refusal is `error_class = refused_self_target` and reads `refused_self_target: you are calling from <host> (<ip>) — prompto never acts on the caller's own machine; run this in your local shell instead.` An agent that wants something done on its own machine uses its local shell, not a loop through prompto as the inventory's `ssh_user` and around its own sandbox. Only tools that never contact a host are unaffected: `inventory_list`, `inventory_get_host`, `mcp_reconnect_hint`, `prompto_gain`. The guard is not a policy setting, and no future policy or ticket can lift it. Addresses are compared in canonical form, so an IPv4 caller seen as `::ffff:a.b.c.d` is still matched. Behind a reverse proxy, the caller IP comes from `X-Real-IP` / `X-Forwarded-For`, honoured only when the TCP peer is in `PROMPTO_TRUSTED_PROXIES`.
+**Self-targeting guard.** Every tool that contacts a host refuses one whose `ip` is the calling agent's source IP, with no exceptions: logins, exec, files, `rsync_sync` (both ends), `vm_*`, `mcp_*` (including `mcp_restart_claudecli`), `claude_exec`, `host_wake`, `host_status`, `port_scan` and `GET /log`. The refusal is `error_class = refused_self_target` and reads `refused_self_target: you are calling from <host> (<ip>) — prompto never acts on the caller's own machine; run this in your local shell instead.` An agent that wants something done on its own machine uses its local shell, not a loop through prompto as the inventory's `ssh_user` and around its own sandbox. Only tools that never contact a host are unaffected: `inventory_list`, `inventory_get_host`, `mcp_reconnect_hint`, `prompto_gain`. The guard is not a policy setting, and no future policy or ticket can lift it. Addresses are compared in canonical form, so an IPv4 caller seen as `::ffff:a.b.c.d` is still matched. A machine that can reach prompto from more than one address (a second NIC, Wi-Fi, a VPN, IPv6) lists the others in `extra_ips`. A call from any of them is the same machine and is refused the same way. Behind a reverse proxy, the caller IP comes from `X-Real-IP` / `X-Forwarded-For`, honoured only when the TCP peer is in `PROMPTO_TRUSTED_PROXIES`.
 
 **Request IDs.** Every call gets a ULID `request_id`:
 
@@ -105,6 +105,7 @@ capabilities = []
 | `aliases` | One machine, one entry, reachable by either name. Collisions with host names or other aliases are load errors. |
 | `apytti_url` | Gateway URL; required with `claude_exec`. |
 | `sudo_password_vault_path` / `sudo_password_vault_field` | Vault-held sudo password (field defaults to `password`). Requires `sudo_exec`. |
+| `extra_ips` | Other addresses the machine may call prompto from (second NIC, Wi-Fi, VPN, IPv6). Used only by the self-targeting guard, never to reach the host. Literal IPs, canonicalized at load (`::ffff:a.b.c.d` → `a.b.c.d`). Load errors: unspecified or multicast addresses, repeats, and an address claimed by two hosts. |
 | `request_id_env` | How `PROMPTO_REQUEST_ID` reaches remote commands. `export` adds an `export …;` prefix plus `ssh -o SetEnv`; it is the default on `linux` and `macos`. `setenv` uses `SetEnv` only, leaving the command line untouched; it is the default on `freebsd` and `windows`. `off` sends nothing: no prefix, no `SetEnv`, no `env` on the vault sudo path. Use `off` for keys restricted by `command=`, rrsync or git-shell. Use `setenv` for a non-POSIX login shell on Linux or macOS. Any other value is a load error. |
 
 The whole file is validated at load (unknown hypervisors, alias collisions, `wake` on a VM, malformed vault paths, …). `SIGHUP` reloads it without dropping the listener; a file that fails validation is rejected and the previous inventory stays live.
@@ -142,13 +143,72 @@ Put it in `PROMPTO_VAULT_TOKEN` in the service's env file and **restart** (env i
 
 Without `PROMPTO_VAULT_TOKEN`, prompto starts normally and warns about every host that declares a vault path — their sudo calls fail until it's set.
 
+## Agent identity (`PROMPTO_AUTH`)
+
+Each agent *role* gets a bearer token. prompto stores only the token's SHA-256, in `/etc/prompto/agents.toml` (`PROMPTO_AGENTS`):
+
+```toml
+[agent.builder]
+groups = ["build"]
+token_sha256 = "<64 hex chars>"
+created = "2026-10-09T12:00:00Z"
+disabled = false
+```
+
+| `PROMPTO_AUTH` | No / invalid / revoked token | Valid token |
+|---|---|---|
+| `off` (default) | Accepted, no agent attached: exactly the behaviour before agent identity existed | Token ignored |
+| `optional` | Accepted as agent `anonymous`. An invalid or revoked token is also logged as a warning with the caller IP (never the token) | Agent = the role |
+| `required` | **401**: a JSON-RPC error object on `/mcp`, plain text on `GET /log` | Agent = the role |
+
+- The stdio transport is always agent `local`.
+- Any other `PROMPTO_AUTH` value stops the server at startup, so a typo can't silently mean `off`.
+- Tokens are hashed, then compared in constant time against every entry.
+- Agent names use `[a-z0-9_-]`; `anonymous` and `local` are reserved. Names and groups are what policy (E3) and the audit log (E4) will key on.
+- Until those land, the agent and session appear in the journald line of every failed call: `tool call failed request_id=… agent="builder" session_id="…"`.
+- Tool results don't echo the agent. The caller knows who it is, and an unchanged result shape keeps `off` byte-identical.
+
+**Session context.** A client may send `X-Prompto-Session: <id>` (the Claude session ID). It is context for the logs, never proof of identity: any holder of a role token can claim any session. Values over 128 characters or outside `A-Za-z0-9._:-` are dropped with a warning; the call itself proceeds.
+
+### Managing tokens
+
+```bash
+sudo prompto agent add builder --groups build,ops   # prints the token ONCE on stdout
+sudo prompto agent list                             # name, status, groups, created, sha256 prefix
+sudo prompto agent revoke builder                   # sets disabled = true
+sudo systemctl reload prompto                       # SIGHUP: a running server re-reads agents.toml
+```
+
+- **`add`** writes only the hash, atomically, keeping the file's mode and owner.
+  - A new file is created `0640` with the directory's group. With the standard install (`/etc/prompto` is `root:prompto`), that lets the service read it.
+  - Run it as the user that owns the file.
+- **`revoke`** keeps the entry with `disabled = true` rather than deleting it.
+  - The name stays taken.
+  - A stale token is logged as *revoked*, naming the role, instead of just *invalid*.
+  - To issue a new token for a role, revoke it and add a new name, or delete the entry by hand and `add` again.
+- **Nothing takes effect until SIGHUP.** The CLI says so after every change.
+  - A reload that fails (bad TOML, malformed hash, duplicate token) keeps the previous agents live and logs why.
+  - A missing file means no agents.
+- **After the reload, a revoked token** is refused on the very next request with `PROMPTO_AUTH=required`. With `optional` it falls back to `anonymous`.
+
+**Rollout:**
+
+1. Set `PROMPTO_AUTH=optional`.
+2. Mint a token per role.
+3. Register clients with their token.
+4. Watch the logs for `agent="anonymous"`.
+5. Switch to `required`. This needs a restart, since env is read at startup.
+
 ## `GET /log`
 
 ```
 GET /log?host=<name>&unit=<systemd unit>&lines=<1..1000, default 50>
 ```
 
-Plain-text journal tail for scripts and dashboards — same gate as `service_logs` (`sudo_exec`, self-targeting guard, unit-name validation). **Unauthenticated**: anyone who can reach the listener can read journals on any `sudo_exec` host. Keep the listener behind a trusted proxy or firewall.
+Plain-text journal tail for scripts and dashboards. It has the same gate as `service_logs` (`sudo_exec`, self-targeting guard, unit-name validation) and the same authentication as `/mcp`.
+
+- With `PROMPTO_AUTH` `off` or `optional` it is **unauthenticated**: anyone who can reach the listener can read journals on any `sudo_exec` host. Keep the listener behind a trusted proxy or firewall.
+- With `required`, send `Authorization: Bearer <token>`.
 
 ## Token-savings analytics
 
@@ -178,19 +238,50 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_VAULT_ADDR` | `http://127.0.0.1:8200` | Vault address. |
 | `PROMPTO_VAULT_MOUNT` | `secret` | KV v2 mount holding the sudo secrets. |
 | `PROMPTO_VAULT_CACERT` | unset | PEM file (one or more certs) trusted as extra roots for the vault client, on top of the bundled webpki roots — for a vault behind a private CA. The system trust store is not consulted. Unreadable or certificate-less file = startup error. |
+| `PROMPTO_AUTH` | `off` | `off`, `optional` or `required`; see [Agent identity](#agent-identity-prompto_auth). Anything else is a startup error. |
+| `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents. Also used by `prompto agent`. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
-Env is read once at startup: changes need a restart. Only the inventory reloads on `SIGHUP`.
+Env is read once at startup: changes need a restart. Only the inventory and `agents.toml` reload on `SIGHUP`, each independently.
 
-CLI flags: `--stdio` selects stdio transport instead of HTTP. `gain` runs the analytics report and exits.
+CLI:
+
+- `--stdio` selects stdio transport instead of HTTP.
+- `gain` runs the analytics report and exits.
+- `agent add|list|revoke` manages agent tokens and exits.
 
 ## Registering with Claude Code
+
+Without auth (`PROMPTO_AUTH=off`):
 
 ```bash
 claude mcp add --transport http --scope user prompto http://YOUR-HOST:6337/mcp
 ```
+
+With a role token, inline (the token then lives in `~/.claude.json`):
+
+```bash
+claude mcp add --transport http --scope user prompto http://YOUR-HOST:6337/mcp \
+  --header "Authorization: Bearer pto_…"
+```
+
+Or keep the token in its own file and let Claude Code read it through a `headersHelper`: a command whose stdout is a JSON object of headers.
+
+```bash
+install -d -m 0700 ~/.config/prompto
+( umask 077; cat > ~/.config/prompto/token )        # paste the token, then Ctrl-D
+cat > ~/.config/prompto/headers.sh <<'SH'
+#!/bin/sh
+printf '{"Authorization": "Bearer %s"}\n' "$(cat "$HOME/.config/prompto/token")"
+SH
+chmod 0700 ~/.config/prompto/headers.sh
+claude mcp add-json --scope user prompto \
+  '{"type":"http","url":"http://YOUR-HOST:6337/mcp","headersHelper":"'"$HOME"'/.config/prompto/headers.sh"}'
+```
+
+Keep `token` at `0600`. Rotating then means replacing one file, and the token never appears in Claude Code's config or a shell history.
 
 ## Deployment
 

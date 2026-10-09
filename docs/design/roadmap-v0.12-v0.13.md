@@ -70,6 +70,14 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S2.4 `PROMPTO_AUTH=off|optional|required`.** `optional` → unauthenticated calls become `agent=anonymous` and get the anonymous policy. `required` → 401. `GET /log` is gated the same way. stdio is `agent=local`.
 - **S2.5 Client registration doc.** `claude mcp add … --header "Authorization: Bearer …"`, or `headersHelper` reading `~/.config/prompto/token` (0600).
 - **Tests:** 401 / anonymous / valid / revoked / reload, through `spawn_server_with`.
+- **Done (task 005).** Decisions:
+  - `agents.toml` is `[agent.<name>]` tables with `groups`, `token_sha256`, `created` and `disabled`. Names are `[a-z0-9_-]`; `anonymous` and `local` are reserved; a duplicate hash is a load error.
+  - `agent revoke` sets `disabled = true` and keeps the entry: the name stays taken, and a stale token is logged as revoked, naming the role.
+  - CLI edits need SIGHUP, and the CLI says so. The inventory and the agents reload independently; each keeps its previous version on error.
+  - A malformed `X-Prompto-Session` (over 128 chars, or outside `A-Za-z0-9._:-`) is dropped with a warning. It is context, so it never fails the call.
+  - Attribution lives in the journald `tool call failed` line (`agent`, `session_id`) until E4. Results don't echo the agent.
+  - An unknown `PROMPTO_AUTH` value is a startup error.
+  - E1 leftover: inventory `extra_ips`, compared by the self-target guard.
 
 ### E3 — Policy engine (v0.12.0)
 - **S3.1 `policy.toml` + `PolicyStore`.** SIGHUP-reloaded; default deny when auth is required. Rules are agent (or group) × hosts (names, globs, `group:<g>`) × tools (names/globs), with `approval = "none" | "ticket" | "human"`.

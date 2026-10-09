@@ -37,7 +37,7 @@ Agents authenticate with `Authorization: Bearer <token>` on `/mcp`. Two token so
 - **Static tokens (first).** `/etc/prompto/agents.toml`, one entry per agent: name, groups, **SHA-256 of the token** (never the token). Tokens are minted by `prompto agent add <name>` (prints once). Clients register with `claude mcp add --transport http prompto <url> --header "Authorization: Bearer …"`.
 - **OIDC (next).** JWTs from any OIDC provider, validated against its JWKS (issuer, audience, expiry). Agent = a service account in the IdP; name from `preferred_username`/`sub`, groups from the `groups` claim. Disabling the account in the IdP ends access as soon as its token expires.
 
-`PROMPTO_AUTH = off | optional | required` for rollout. `optional` logs unauthenticated calls as `agent=anonymous` and applies the anonymous policy; `required` refuses them with 401. stdio transport is `agent=local`.
+`PROMPTO_AUTH = off | optional | required` for rollout. `optional` logs unauthenticated calls as `agent=anonymous` and applies the anonymous policy; `required` refuses them with 401. stdio transport is `agent=local`. The default is `off`, which keeps the pre-identity behaviour. A revoked (`disabled`) token is refused with 401 under `required`, and treated as `anonymous` with a warning under `optional`. The Claude session ID travels in `X-Prompto-Session` as context only.
 
 ## 2. Policy (v0.12, argument rules in v0.14)
 
