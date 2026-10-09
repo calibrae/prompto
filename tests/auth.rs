@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod common;
+
 /// `bare` has no capabilities, so `ssh_exec` on it is a classified
 /// refusal (and a warn line) without any network. `multi` answers from a
 /// second address, for the `extra_ips` guard.
@@ -187,8 +189,21 @@ async fn server(mode: AuthMode) -> Server {
 
 /// `tools/call` over the stateless path. Returns (status, parsed body).
 async fn call(server: &Server, tool: &str, args: Value, headers: &[(&str, &str)]) -> (u16, Value) {
+    let (status, text) = post_call(server.addr, tool, args, headers)
+        .await
+        .unwrap_or_else(|e| panic!("POST /mcp on {}: {e:?}", server.addr));
+    (status, parse_body(status, &text))
+}
+
+/// The request [`call`] sends. Returns (status, raw body).
+async fn post_call(
+    addr: SocketAddr,
+    tool: &str,
+    args: Value,
+    headers: &[(&str, &str)],
+) -> reqwest::Result<(u16, String)> {
     let mut req = reqwest::Client::new()
-        .post(format!("http://{}/mcp", server.addr))
+        .post(format!("http://{addr}/mcp"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", "2026-07-28")
@@ -211,18 +226,20 @@ async fn call(server: &Server, tool: &str, args: Value, headers: &[(&str, &str)]
             }
         }))
         .send()
-        .await
-        .unwrap();
+        .await?;
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap();
+    Ok((status, resp.text().await?))
+}
+
+/// A JSON body, or the JSON-RPC message of an SSE one. Panics with the
+/// status and the raw body when it is neither.
+fn parse_body(status: u16, text: &str) -> Value {
     let raw = text
         .lines()
         .find_map(|l| l.strip_prefix("data: ").filter(|d| d.starts_with('{')))
-        .unwrap_or(&text);
-    (
-        status,
-        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{e}: {text}")),
-    )
+        .unwrap_or(text);
+    serde_json::from_str(raw)
+        .unwrap_or_else(|e| panic!("HTTP {status}, body is not JSON-RPC ({e}): {text:?}"))
 }
 
 /// `ssh_exec` on `bare`: refused for capability, so the server logs a
@@ -698,6 +715,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_prompto");
 struct Proc {
     child: std::process::Child,
     port: u16,
+    dir: PathBuf,
+}
+
+impl Proc {
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(self.dir.join("stderr.log")).unwrap_or_default()
+    }
 }
 
 impl Drop for Proc {
@@ -728,18 +752,13 @@ fn spawn_binary(dir: &Path, agents: &Path) -> Proc {
 
 /// The server on a free port; its stderr goes to `dir/stderr.log`.
 fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let child = std::process::Command::new(BIN)
         .env("PROMPTO_INVENTORY", write_inventory(dir))
         .env("PROMPTO_AGENTS", agents)
         .env("PROMPTO_AUTH", mode)
         // Absent: deny-all, and never whatever /etc holds on the test box.
         .env("PROMPTO_POLICY", dir.join("policy.toml"))
-        .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
+        .env("PROMPTO_BIND", "127.0.0.1:0")
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
@@ -750,26 +769,30 @@ fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
         .spawn()
         .unwrap();
     // Owned by `Proc` from here, whose Drop kills and reaps it.
-    let p = Proc { child, port };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return p;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("prompto did not start listening");
+    let mut p = Proc {
+        child,
+        port: 0,
+        dir: dir.to_path_buf(),
+    };
+    p.port = common::bound_port(&mut p.child, &dir.join("stderr.log"));
+    p
 }
 
+/// The status of `inventory_list` on the binary. The body must be
+/// JSON-RPC whatever the status; a failed request shows the server's
+/// stderr.
 async fn status_with(p: &Proc, token: Option<&str>) -> u16 {
-    let s = Server {
-        addr: SocketAddr::from(([127, 0, 0, 1], p.port)),
-        cancel: CancellationToken::new(),
-    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], p.port));
     let headers: Vec<(&str, String)> = token
         .map(|t| vec![("authorization", format!("Bearer {t}"))])
         .unwrap_or_default();
     let h: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    call(&s, "inventory_list", json!({}), &h).await.0
+    let (status, text) = post_call(addr, "inventory_list", json!({}), &h)
+        .await
+        .unwrap_or_else(|e| panic!("POST /mcp on {addr}: {e:?}\nserver stderr:\n{}", p.stderr()));
+    let body = parse_body(status, &text);
+    assert_eq!(body["jsonrpc"], "2.0", "HTTP {status}: {text}");
+    status
 }
 
 async fn sighup(p: &Proc) {
@@ -971,4 +994,102 @@ fn stdio_is_agent_local() {
         out
     };
     assert!(line.contains("agent=\"local\""), "{line}");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-reload under non-atomic writes
+// ---------------------------------------------------------------------------
+
+/// agents.toml and policy.toml are reloaded on the request after they
+/// change, and editors (or `echo >`) rewrite them in place: truncate,
+/// then write. A request that lands mid-write must still get a
+/// well-formed answer — a JSON-RPC 401 or tool error if the half file
+/// it read fails closed, never an empty body, a 500 or a reset — and
+/// once the writes stop the next request sees the finished file.
+#[tokio::test]
+async fn torn_config_writes_never_break_a_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents_path = dir.path().join("agents.toml");
+    let policy_path = dir.path().join("policy.toml");
+    let agents_toml = store().snapshot().to_toml_string().unwrap();
+    // Two versions of each file, so every rewrite changes the stamp.
+    let versions = |base: &str| [base.to_string(), format!("# edited\n{base}")];
+    let agents_v = versions(&agents_toml);
+    let policy_v =
+        versions("[[rule]]\nagents = [\"alpha\"]\nhosts = [\"*\"]\ntools = [\"inventory_list\"]\n");
+    std::fs::write(&agents_path, &agents_v[0]).unwrap();
+    std::fs::write(&policy_path, &policy_v[0]).unwrap();
+    let s = spawn_server_with(AuthConfig {
+        mode: AuthMode::Required,
+        store: AgentStore::load_from(agents_path.clone()).unwrap(),
+        policy: PolicyStore::load_from(policy_path.clone()).unwrap(),
+    })
+    .await;
+
+    // In place, in two writes with a pause between: the window an
+    // editor leaves open.
+    fn rewrite(path: &Path, text: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        let (a, b) = text.split_at(text.len() / 2);
+        f.write_all(a.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+        f.write_all(b.as_bytes()).unwrap();
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        let (agents_v, policy_v) = (agents_v.clone(), policy_v.clone());
+        let (ap, pp) = (agents_path.clone(), policy_path.clone());
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                rewrite(&ap, &agents_v[i % 2]);
+                rewrite(&pp, &policy_v[i % 2]);
+                std::thread::sleep(Duration::from_millis(1));
+                i += 1;
+            }
+        })
+    };
+
+    let mut refused = 0;
+    for _ in 0..300 {
+        let (status, body) = call(
+            &s,
+            "inventory_list",
+            json!({}),
+            &[("authorization", "Bearer pto_alpha")],
+        )
+        .await;
+        match status {
+            401 => {
+                assert_401_jsonrpc(status, &body, "");
+                refused += 1;
+            }
+            200 if body.get("result").is_some() => {}
+            200 => {
+                let msg = body["error"]["message"].as_str().unwrap_or_default();
+                assert!(msg.contains("refused_policy"), "{body}");
+                refused += 1;
+            }
+            _ => panic!("HTTP {status}: {body}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    eprintln!("refused mid-write: {refused}/300");
+
+    // The writes have stopped on a valid pair: the next call reads it.
+    let (status, body) = call(
+        &s,
+        "inventory_list",
+        json!({}),
+        &[("authorization", "Bearer pto_alpha")],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("result").is_some(), "{body}");
 }

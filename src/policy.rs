@@ -85,7 +85,7 @@ use crate::authz;
 use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::inventory::{HostConfig, Inventory};
-use crate::stamp::{Seen, Stamp};
+use crate::stamp::{Seen, Stamp, read_settled};
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
@@ -623,8 +623,8 @@ impl PolicyStore {
 
     pub fn load_from(path: PathBuf) -> Result<Self> {
         // Stamped before reading: a change during the read is seen next.
-        let stamp = Stamp::of(&path);
-        let p = Policy::from_path(&path)?;
+        let (stamp, p) = read_settled(&path, Policy::from_path);
+        let p = p?;
         let store = Self::new(p, Some(path));
         store
             .seen
@@ -691,8 +691,9 @@ impl PolicyStore {
     }
 
     fn read_locked(&self, path: &Path, seen: &mut Seen) -> Result<usize> {
-        seen.record(Stamp::of(path));
-        match Policy::from_path(path) {
+        let (stamp, read) = read_settled(path, Policy::from_path);
+        seen.record(stamp);
+        match read {
             Ok(new) => {
                 let n = new.rules.len();
                 self.inner.store(Arc::new(new));
