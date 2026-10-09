@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod common;
+
 const FAKE_SSH: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.log"
 echo ran
@@ -738,16 +740,11 @@ fn kill_cli(dir: &Path, args: &[&str]) -> std::process::Output {
 fn spawn_binary(dir: &Path) -> Proc {
     std::fs::write(dir.join("prompto.toml"), INVENTORY).unwrap();
     write_exe(&dir.join("ssh"), FAKE_SSH);
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let child = std::process::Command::new(BIN)
         .env("PROMPTO_INVENTORY", dir.join("prompto.toml"))
         .env("PROMPTO_AUTH", "off")
         .env("PROMPTO_SSH_BIN", dir.join("ssh"))
-        .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
+        .env("PROMPTO_BIND", "127.0.0.1:0")
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
@@ -757,14 +754,9 @@ fn spawn_binary(dir: &Path) -> Proc {
         .stderr(std::fs::File::create(dir.join("stderr.log")).unwrap())
         .spawn()
         .unwrap();
-    let p = Proc { child, port };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return p;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("prompto did not start listening");
+    let mut p = Proc { child, port: 0 };
+    p.port = common::bound_port(&mut p.child, &dir.join("stderr.log"));
+    p
 }
 
 fn out_text(o: &std::process::Output) -> String {

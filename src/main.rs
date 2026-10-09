@@ -1028,10 +1028,15 @@ async fn main() -> Result<()> {
             .context("stdio serve")?;
         service.waiting().await?;
     } else {
-        tracing::info!("transport: streamable-http on {}", cfg.bind);
         let listener = tokio::net::TcpListener::bind(&cfg.bind)
             .await
             .with_context(|| format!("bind {}", cfg.bind))?;
+        // The bound address, not `cfg.bind`: with port 0 it is the only
+        // place the port shows up (the tests read it from here).
+        let local = listener
+            .local_addr()
+            .map_or_else(|_| cfg.bind.clone(), |a| a.to_string());
+        tracing::info!("transport: streamable-http on {local}");
         let cancel = CancellationToken::new();
 
         // Peers allowed to speak for someone else via X-Real-IP /
