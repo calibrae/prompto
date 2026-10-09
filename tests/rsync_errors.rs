@@ -247,7 +247,10 @@ async fn dest_refusing_the_source_is_dest_ssh_auth() {
     )
     .await;
     let err = expect_class(&resp, "dest_ssh_auth");
-    assert_eq!(err["data"]["exit_code"], 255);
+    // rsync reports the same refused login as 255 or, when the sender
+    // trips over the closed pipe first, as 12: timing decides which.
+    let code = &err["data"]["exit_code"];
+    assert!(code == 255 || code == 12, "exit_code {code}");
     let tail = err["data"]["stderr_tail"].as_str().unwrap();
     assert!(tail.contains("Permission denied (publickey)"), "{tail}");
     assert!(tail.contains("rsync error"), "{tail}");
