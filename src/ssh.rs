@@ -5,13 +5,15 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::inventory::HostConfig;
+use crate::ctx::CallCtx;
+use crate::inventory::{HostConfig, RequestIdEnv};
 use crate::vault::VaultClient;
 use std::sync::Arc;
 
@@ -36,7 +38,8 @@ impl ExecOutput {
 /// root `sh -s` reads the command from the remainder. Two properties
 /// matter:
 ///
-/// - **Nothing secret on a command line.** This string is all `ps` can
+/// - **Nothing secret on a command line.** This string (with the
+///   request ID spliced in, see [`with_request_id`]) is all `ps` can
 ///   see, on prompto's host or on the target.
 /// - **sudo reads stdin before anything else runs.** Splicing the
 ///   caller's command in as shell text (`sudo -S -- {cmd}`) would let
@@ -78,6 +81,50 @@ pub fn sudo_guarded(cmd: &str) -> String {
     format!("{prefix}{cmd}")
 }
 
+/// Environment variable carrying the call's request ID to the remote
+/// command, so host-side logs can be joined with prompto's.
+pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
+
+/// Shell text exporting [`REQUEST_ID_ENV`], put in front of every remote
+/// command on hosts whose [`RequestIdEnv`] is `export`. That is the
+/// default where the login shell is known to be POSIX-ish (sh, bash, zsh:
+/// Linux and macOS). Elsewhere the default is `setenv`: on
+/// FreeBSD/OPNsense the login shell may be csh, which has no `export`,
+/// and Windows has no POSIX shell at all. Those hosts get the ID only
+/// through `-o SetEnv` (needs `AcceptEnv PROMPTO_*`) or the vault sudo
+/// path. `off` hosts get nothing: a key restricted by `command=`, rrsync
+/// or git-shell sees the whole command line and rejects the prefix.
+///
+/// `sudo -n` resets the environment, so a passwordless-sudo command sees
+/// the variable only if the host's sudoers has
+/// `Defaults env_keep += "PROMPTO_REQUEST_ID"`. prompto deliberately does
+/// not wrap the caller's command in `env …` there: a sudoers rule that
+/// allows only specific commands would then stop matching. The vault
+/// sudo path runs prompto's own root `sh`, so it sets the variable
+/// itself (see [`with_request_id`]).
+///
+/// `rid` must be a ULID (Crockford base32): it is spliced in unquoted.
+pub fn request_id_export(mode: RequestIdEnv, rid: &str) -> Option<String> {
+    match mode {
+        RequestIdEnv::Export => Some(format!("export {REQUEST_ID_ENV}={rid}; ")),
+        RequestIdEnv::Setenv | RequestIdEnv::Off => None,
+    }
+}
+
+/// `cmd` run under `env PROMPTO_REQUEST_ID=<id>`, for the slot after the
+/// sudo guard's `exec "$@"` — the root side of the vault sudo path, where
+/// sudo has already reset the environment. Plain words, so the login
+/// shell (even csh) passes them through untouched. `cmd` unchanged on
+/// `off` hosts.
+pub fn with_request_id(ctx: &CallCtx, host: &HostConfig, cmd: &str) -> String {
+    match host.request_id_env() {
+        RequestIdEnv::Off => cmd.to_string(),
+        RequestIdEnv::Export | RequestIdEnv::Setenv => {
+            format!("env {REQUEST_ID_ENV}={} {cmd}", ctx.request_id())
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SshClient {
     pub ssh_bin: PathBuf,
@@ -109,8 +156,12 @@ impl SshClient {
     /// stdin-fed password path (see [`SUDO_STDIN_SHELL`]); every other
     /// host gets `sudo -n`, which fails fast instead of hanging on a TTY
     /// prompt when there's no passwordless rule.
+    ///
+    /// The remote side gets [`REQUEST_ID_ENV`]; see [`request_id_export`]
+    /// for how, and where it does not reach.
     pub async fn exec(
         &self,
+        ctx: &CallCtx,
         host: &HostConfig,
         cmd: &str,
         cmd_timeout: Option<Duration>,
@@ -122,15 +173,16 @@ impl SshClient {
         if sudo {
             if let Some(pw) = self.sudo_password(host).await? {
                 let input = sudo_stdin_payload(&pw, cmd.as_bytes());
+                let remote = sudo_guarded(&with_request_id(ctx, host, "sh -s"));
                 return self
-                    .run(host, SUDO_STDIN_SHELL, Some(&input), cmd_timeout)
+                    .run(ctx, host, &remote, Some(&input), cmd_timeout)
                     .await;
             }
             return self
-                .run(host, &format!("sudo -n -- {cmd}"), None, cmd_timeout)
+                .run(ctx, host, &format!("sudo -n -- {cmd}"), None, cmd_timeout)
                 .await;
         }
-        self.run(host, cmd, None, cmd_timeout).await
+        self.run(ctx, host, cmd, None, cmd_timeout).await
     }
 
     /// Run a remote command and feed `stdin_bytes` into its stdin. Used by
@@ -145,6 +197,7 @@ impl SshClient {
     /// caller-supplied shell text.
     pub async fn exec_stdin(
         &self,
+        ctx: &CallCtx,
         host: &HostConfig,
         cmd: &str,
         stdin_bytes: &[u8],
@@ -158,16 +211,18 @@ impl SshClient {
             if let Some(pw) = self.sudo_password(host).await? {
                 let mut input = sudo_preamble(&pw);
                 input.extend_from_slice(stdin_bytes);
+                let remote = sudo_guarded(&with_request_id(ctx, host, cmd));
                 return self
-                    .run(host, &sudo_guarded(cmd), Some(&input), cmd_timeout)
+                    .run(ctx, host, &remote, Some(&input), cmd_timeout)
                     .await;
             }
             let remote = format!("sudo -n -- {cmd}");
             return self
-                .run(host, &remote, Some(stdin_bytes), cmd_timeout)
+                .run(ctx, host, &remote, Some(stdin_bytes), cmd_timeout)
                 .await;
         }
-        self.run(host, cmd, Some(stdin_bytes), cmd_timeout).await
+        self.run(ctx, host, cmd, Some(stdin_bytes), cmd_timeout)
+            .await
     }
 
     /// The host's sudo password from vault, if it declares one.
@@ -201,6 +256,7 @@ impl SshClient {
     /// The one place that spawns ssh.
     async fn run(
         &self,
+        ctx: &CallCtx,
         host: &HostConfig,
         remote: &str,
         stdin_bytes: Option<&[u8]>,
@@ -210,22 +266,7 @@ impl SshClient {
 
         let mut command = Command::new(&self.ssh_bin);
         command
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg(format!(
-                "ConnectTimeout={}",
-                self.connect_timeout.as_secs().max(1)
-            ))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg("-i")
-            .arg(&host.ssh_key)
-            .arg("-p")
-            .arg(host.ssh_port.to_string())
-            .arg(format!("{}@{}", host.ssh_user, host.ip))
-            .arg("--")
-            .arg(remote)
+            .args(self.ssh_args(ctx, host, remote))
             .stdin(if stdin_bytes.is_some() {
                 Stdio::piped()
             } else {
@@ -267,6 +308,42 @@ impl SshClient {
                 timed_out: true,
             }),
         }
+    }
+
+    /// ssh's argv for one call: options, target, then the remote command
+    /// with the request ID exported in front of it.
+    fn ssh_args(&self, ctx: &CallCtx, host: &HostConfig, remote: &str) -> Vec<OsString> {
+        let rid = ctx.request_id();
+        let mode = host.request_id_env();
+        let remote = match request_id_export(mode, &rid) {
+            Some(export) => format!("{export}{remote}"),
+            None => remote.to_string(),
+        };
+        let mut args = vec![
+            OsString::from("-o"),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            format!("ConnectTimeout={}", self.connect_timeout.as_secs().max(1)).into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+        ];
+        if mode != RequestIdEnv::Off {
+            // Delivered only where the host's sshd has `AcceptEnv
+            // PROMPTO_*`, silently dropped elsewhere. It is the only
+            // route on `setenv` hosts, where the export prefix is skipped.
+            args.push("-o".into());
+            args.push(format!("SetEnv={REQUEST_ID_ENV}={rid}").into());
+        }
+        args.extend([
+            "-i".into(),
+            host.ssh_key.clone().into_os_string(),
+            "-p".into(),
+            host.ssh_port.to_string().into(),
+            format!("{}@{}", host.ssh_user, host.ip).into(),
+            "--".into(),
+            remote.into(),
+        ]);
+        args
     }
 }
 
@@ -386,6 +463,134 @@ mod tests {
             "leaked: {out:?}"
         );
         assert!(stderr.contains("passwordless sudo rule"), "{stderr}");
+    }
+
+    /// csh has no `export`: prefixing it there would turn every command
+    /// on an OPNsense box into a "Command not found" plus whatever the
+    /// rest does. Only `export` mode gets it, and that is the default only
+    /// on platforms with a known POSIX login shell (see below).
+    #[test]
+    fn request_id_export_only_in_export_mode() {
+        assert_eq!(
+            request_id_export(RequestIdEnv::Export, "01ABC").as_deref(),
+            Some("export PROMPTO_REQUEST_ID=01ABC; ")
+        );
+        for m in [RequestIdEnv::Setenv, RequestIdEnv::Off] {
+            assert_eq!(request_id_export(m, "01ABC"), None);
+        }
+    }
+
+    fn host(extra: &str) -> HostConfig {
+        let toml = format!(
+            "[host.h]\nip = \"192.0.2.5\"\nssh_user = \"u\"\nssh_key = \"/dev/null\"\n{extra}\n"
+        );
+        crate::inventory::Inventory::from_toml_str(&toml)
+            .unwrap()
+            .get("h")
+            .unwrap()
+            .clone()
+    }
+
+    /// ssh's argv for `remote` on a host configured with `extra`.
+    fn argv(extra: &str) -> (Vec<String>, String) {
+        let ctx = CallCtx::new(None);
+        let client = SshClient::new("ssh".into(), Duration::from_secs(5));
+        let args = client
+            .ssh_args(&ctx, &host(extra), "uptime")
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        (args, ctx.request_id())
+    }
+
+    /// Unset `request_id_env` keeps today's behaviour: export + SetEnv on
+    /// POSIX platforms, SetEnv alone on the others.
+    #[test]
+    fn request_id_env_defaults_follow_the_platform() {
+        for (extra, export) in [
+            ("", true),
+            ("platform = \"macos\"", true),
+            ("platform = \"freebsd\"", false),
+            ("platform = \"windows\"", false),
+        ] {
+            let (args, rid) = argv(extra);
+            assert!(
+                args.contains(&format!("SetEnv=PROMPTO_REQUEST_ID={rid}")),
+                "{extra}: {args:?}"
+            );
+            let want = if export {
+                format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+            } else {
+                "uptime".to_string()
+            };
+            assert_eq!(args.last().unwrap(), &want, "{extra}");
+        }
+    }
+
+    /// `setenv` on a Linux host drops the prefix; `export` on FreeBSD
+    /// (bash as login shell) adds it.
+    #[test]
+    fn request_id_env_overrides_the_platform_default() {
+        let (args, rid) = argv("request_id_env = \"setenv\"");
+        assert_eq!(args.last().unwrap(), "uptime");
+        assert!(args.contains(&format!("SetEnv=PROMPTO_REQUEST_ID={rid}")));
+
+        let (args, rid) = argv("platform = \"freebsd\"\nrequest_id_env = \"export\"");
+        assert_eq!(
+            args.last().unwrap(),
+            &format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+        );
+    }
+
+    /// `off`: the command line is exactly the caller's, and no SetEnv —
+    /// a `command=`/rrsync key must see nothing prompto added.
+    #[test]
+    fn request_id_env_off_adds_nothing() {
+        let (args, _) = argv("request_id_env = \"off\"");
+        assert_eq!(args.last().unwrap(), "uptime");
+        assert!(
+            !args.iter().any(|a| a.contains("PROMPTO_REQUEST_ID")),
+            "{args:?}"
+        );
+        let ctx = CallCtx::new(None);
+        assert_eq!(
+            with_request_id(&ctx, &host("request_id_env = \"off\""), "sh -s"),
+            "sh -s"
+        );
+    }
+
+    /// The root shell on the vault path sees the ID even though sudo
+    /// reset the environment: run the guard as root's shell would, with
+    /// `with_request_id` in the guarded slot and an emptied environment.
+    #[test]
+    fn guard_passes_the_request_id_to_the_root_shell() {
+        use std::io::Write;
+        let ctx = CallCtx::new(None);
+        let guarded = with_request_id(&ctx, &host(""), "sh -s");
+        let mut child = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("-c")
+            .arg(guard_body())
+            .arg("prompto-sudo")
+            .args(guarded.split(' '))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"prompto-sudo-ok\necho $PROMPTO_REQUEST_ID\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", ctx.request_id()),
+            "{out:?}"
+        );
     }
 
     #[test]

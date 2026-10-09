@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::ctx::CallCtx;
 use crate::inventory::HostConfig;
 use crate::ssh::SshClient;
 
@@ -48,11 +49,17 @@ pub async fn status(host: &HostConfig, probe_timeout: Duration) -> Result<HostSt
 }
 
 /// `shutdown -h now` as root. Caller must have checked `sudo_exec`.
-pub async fn sleep(ssh: &SshClient, host: &HostConfig) -> Result<()> {
+pub async fn sleep(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig) -> Result<()> {
     // Fire-and-forget — the connection drops as soon as init begins shutting
     // down, so any non-zero exit / broken pipe is fine.
     let _ = ssh
-        .exec(host, "shutdown -h now", Some(Duration::from_secs(10)), true)
+        .exec(
+            ctx,
+            host,
+            "shutdown -h now",
+            Some(Duration::from_secs(10)),
+            true,
+        )
         .await?;
     Ok(())
 }

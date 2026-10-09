@@ -36,6 +36,7 @@
 use anyhow::{Result, bail};
 use std::time::Duration;
 
+use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass, stderr_tail};
 use crate::files::validate_path;
 use crate::inventory::HostConfig;
@@ -130,6 +131,7 @@ pub fn build_command(
 /// box. See the module docs.
 pub async fn run(
     ssh: &SshClient,
+    ctx: &CallCtx,
     source_host: &HostConfig,
     source_path: &str,
     dest_host: &HostConfig,
@@ -158,6 +160,7 @@ pub async fn run(
     );
     let res = ssh
         .exec(
+            ctx,
             source_host,
             &cmd,
             timeout.or(Some(Duration::from_secs(300))),

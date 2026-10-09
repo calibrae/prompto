@@ -1,6 +1,9 @@
-//! rmcp tool router for prompto. Every tool body returns
-//! `anyhow::Result<impl Serialize>` and routes through `finish_tool`,
-//! which records one event per call into the gain tracker.
+//! rmcp tool router for prompto. Every tool builds a [`CallCtx`], passes
+//! [`Prompto::authorize`] (or `authz::authorize_tool` when it targets no
+//! host, `authz::lookup` when it only reads the inventory) before
+//! touching anything, returns `anyhow::Result<impl
+//! Serialize>`, and routes through `finish_tool`, which records one event
+//! per call and stamps the request ID on the result.
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -10,14 +13,16 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mcp_gain::Tracker;
 
 use crate::advisor::Advisor;
 use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
+use crate::authz::{self, Authorized, Need};
 use crate::batch;
 use crate::claudemgr::{self, Scope};
+use crate::ctx::CallCtx;
 use crate::diagnose;
 use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::files;
@@ -438,14 +443,15 @@ impl Prompto {
         interpreter: &'static str,
         args: ScriptExecArgs,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let target = self.authorize(&ctx, tool, &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
             let raw = script::run(
                 &self.ssh,
+                &ctx,
                 host,
                 interpreter,
                 &args.script,
@@ -466,7 +472,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool(tool, Some(&host_name), started, res)
+        self.finish_tool(&ctx, tool, Some(&host_name), res)
     }
 
     /// Run the filter chain on an `ExecOutput.stdout` and bundle the
@@ -484,46 +490,70 @@ impl Prompto {
         }
     }
 
-    /// Finalise a tool call: record the event and convert
-    /// `anyhow::Result<T>` to the `CallToolResult`/`McpError` rmcp expects.
+    /// A fresh [`CallCtx`] for one tool call: new request ID, this
+    /// instance's caller IP, clock started.
+    fn new_ctx(&self) -> CallCtx {
+        CallCtx::new(self.caller_ip)
+    }
+
+    /// The single authorization gate for a tool call that targets a host:
+    /// existence, capability, self-target guard, and (later) policy and
+    /// ticket. See [`authz::authorize`].
+    pub fn authorize(
+        &self,
+        ctx: &CallCtx,
+        tool: &str,
+        host: &str,
+        need: Need,
+    ) -> Result<Authorized, ClassifiedError> {
+        authz::authorize(&self.inv.snapshot(), ctx, tool, host, need)
+    }
+
+    /// Finalise a tool call. The single emission point for every call's
+    /// outcome: records the gain-tracker event (and, with E4, the audit
+    /// record), stamps the request ID on the result — success and error
+    /// alike — and converts `anyhow::Result<T>` to what rmcp expects.
     fn finish_tool<T: serde::Serialize>(
         &self,
+        ctx: &CallCtx,
         tool: &'static str,
         host: Option<&str>,
-        started: Instant,
         res: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
-        let exec_ms = started.elapsed().as_millis() as u64;
+        let exec_ms = ctx.started.elapsed().as_millis() as u64;
         let hint = self.advisor.record(tool, host);
+        let request_id = ctx.request_id();
         match res {
             Ok(v) => {
                 let payload = serde_json::to_value(&v).unwrap_or_default();
-                let body = payload.to_string();
-                self.tracker
-                    .record(tool, host, true, exec_ms, body.len() as u64);
-                let mut blocks = vec![ContentBlock::text(body)];
+                let mut blocks = success_blocks(payload, &request_id);
+                let bytes = blocks.iter().map(|b| b.len()).sum::<usize>();
+                self.tracker.record(tool, host, true, exec_ms, bytes as u64);
                 if let Some(h) = hint {
-                    blocks.push(ContentBlock::text(format!("[advisor] {h}")));
+                    blocks.push(format!("[advisor] {h}"));
                 }
-                Ok(CallToolResult::success(blocks))
+                Ok(CallToolResult::success(
+                    blocks.into_iter().map(ContentBlock::text).collect(),
+                ))
             }
             Err(e) => {
-                let msg = e.to_string();
+                let classified = e.downcast_ref::<ClassifiedError>();
+                let (msg, data) = error_parts(&e, classified, &request_id);
                 self.tracker
                     .record(tool, host, false, exec_ms, msg.len() as u64);
                 // mcp-gain's Event has no room for a class, so a
                 // classified failure is also logged here, for journald.
-                let data = e.downcast_ref::<ClassifiedError>().map(|c| {
+                if let Some(c) = classified {
                     tracing::warn!(
+                        request_id,
                         tool,
                         host,
                         error_class = c.class.as_str(),
                         exit_code = c.exit_code,
                         "tool call failed"
                     );
-                    c.data()
-                });
-                Err(McpError::internal_error(msg, data))
+                }
+                Err(McpError::internal_error(msg, Some(data)))
             }
         }
     }
@@ -533,11 +563,12 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<HostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Wake)?;
+            let target =
+                self.authorize(&ctx, "host_wake", &args.host, Need::Cap(Capability::Wake))?;
+            let host = &target.host;
             host::wake(host).await?;
             Ok(WakeResult {
                 host: args.host.clone(),
@@ -545,7 +576,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool("host_wake", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "host_wake", Some(&host_name), res)
     }
 
     #[tool(description = "TCP-probe a host's SSH port. Returns up | unreachable | off.")]
@@ -553,15 +584,15 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<HostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.get(&args.host)?;
+            let target = self.authorize(&ctx, "host_status", &args.host, Need::Exists)?;
+            let host = &target.host;
             host::status(host, Duration::from_secs(2)).await
         }
         .await;
-        self.finish_tool("host_status", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "host_status", Some(&host_name), res)
     }
 
     #[tool(description = "Shutdown a host (`shutdown -h now` as root).")]
@@ -569,16 +600,21 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<HostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::SudoExec)?;
-            host::sleep(&self.ssh, host).await?;
+            let target = self.authorize(
+                &ctx,
+                "host_sleep",
+                &args.host,
+                Need::Cap(Capability::SudoExec),
+            )?;
+            let host = &target.host;
+            host::sleep(&self.ssh, &ctx, host).await?;
             Ok(serde_json::json!({ "host": host_name, "sent": "shutdown -h now" }))
         }
         .await;
-        self.finish_tool("host_sleep", Some(&args.host), started, res)
+        self.finish_tool(&ctx, "host_sleep", Some(&args.host), res)
     }
 
     #[tool(description = "List libvirt domains on a host (`virsh list --all`).")]
@@ -586,15 +622,16 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<HostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Virt)?;
-            virt::list(&self.ssh, host).await
+            let target =
+                self.authorize(&ctx, "vm_list", &args.host, Need::Cap(Capability::Virt))?;
+            let host = &target.host;
+            virt::list(&self.ssh, &ctx, host).await
         }
         .await;
-        self.finish_tool("vm_list", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "vm_list", Some(&host_name), res)
     }
 
     #[tool(
@@ -604,16 +641,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<VmArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Virt)?;
-            let s = virt::domstate(&self.ssh, host, &args.vm).await?;
+            let target =
+                self.authorize(&ctx, "vm_state", &args.host, Need::Cap(Capability::Virt))?;
+            let host = &target.host;
+            let s = virt::domstate(&self.ssh, &ctx, host, &args.vm).await?;
             Ok(serde_json::json!({ "host": args.host, "vm": args.vm, "state": s }))
         }
         .await;
-        self.finish_tool("vm_state", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "vm_state", Some(&host_name), res)
     }
 
     #[tool(description = "Start a libvirt domain (`virsh start`).")]
@@ -621,16 +659,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<VmArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Virt)?;
-            let out = virt::start(&self.ssh, host, &args.vm).await?;
+            let target =
+                self.authorize(&ctx, "vm_start", &args.host, Need::Cap(Capability::Virt))?;
+            let host = &target.host;
+            let out = virt::start(&self.ssh, &ctx, host, &args.vm).await?;
             Ok(serde_json::json!({ "host": args.host, "vm": args.vm, "stdout": out }))
         }
         .await;
-        self.finish_tool("vm_start", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "vm_start", Some(&host_name), res)
     }
 
     #[tool(
@@ -640,19 +679,20 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<VmStopArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let step = args
             .step_timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(self.stop_vm_step);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Virt)?;
-            virt::stop(&self.ssh, host, &args.vm, step).await
+            let target =
+                self.authorize(&ctx, "vm_stop", &args.host, Need::Cap(Capability::Virt))?;
+            let host = &target.host;
+            virt::stop(&self.ssh, &ctx, host, &args.vm, step).await
         }
         .await;
-        self.finish_tool("vm_stop", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "vm_stop", Some(&host_name), res)
     }
 
     #[tool(
@@ -662,29 +702,45 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<VmEnsureUpArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let total = Duration::from_secs(args.total_timeout_secs.unwrap_or(180));
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Virt)?;
+            let target = self.authorize(
+                &ctx,
+                "vm_ensure_up",
+                &args.host,
+                Need::Cap(Capability::Virt),
+            )?;
+            let host = &target.host;
+            // Every authorization runs before the first probe. Wake is only
+            // needed if the host turns out to be down, so its verdict is
+            // held and enforced then: a host without `wake` that is already
+            // up keeps working, but nothing touches the network until all
+            // the checks have run.
+            let wake_auth = self.authorize(
+                &ctx,
+                "vm_ensure_up",
+                &args.host,
+                Need::Cap(Capability::Wake),
+            );
 
             let initial = host::status(host, Duration::from_secs(2)).await?;
             let mut woke = false;
             if initial.state != "up" {
-                inv.require(&args.host, Capability::Wake)?;
+                wake_auth?;
                 host::wake(host).await?;
                 woke = true;
                 host::wait_until_up(host, total).await?;
             }
 
-            let state_before = virt::domstate(&self.ssh, host, &args.vm).await?;
+            let state_before = virt::domstate(&self.ssh, &ctx, host, &args.vm).await?;
             let mut started_vm = false;
             if state_before != "running" {
-                let _ = virt::start(&self.ssh, host, &args.vm).await?;
+                let _ = virt::start(&self.ssh, &ctx, host, &args.vm).await?;
                 started_vm = true;
             }
-            let state_after = virt::domstate(&self.ssh, host, &args.vm).await?;
+            let state_after = virt::domstate(&self.ssh, &ctx, host, &args.vm).await?;
 
             Ok(VmEnsureUpResult {
                 host_wake: woke,
@@ -693,7 +749,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool("vm_ensure_up", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "vm_ensure_up", Some(&host_name), res)
     }
 
     #[tool(
@@ -703,17 +759,18 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<ExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require_remote(&args.host, self.caller_ip, Capability::Exec)?;
-            let raw = self.ssh.exec(host, &args.cmd, to, false).await?;
+            let target =
+                self.authorize(&ctx, "ssh_exec", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
+            let raw = self.ssh.exec(&ctx, host, &args.cmd, to, false).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }
         .await;
-        self.finish_tool("ssh_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "ssh_exec", Some(&host_name), res)
     }
 
     #[tool(
@@ -723,14 +780,15 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<BatchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
             if args.commands.is_empty() {
                 anyhow::bail!("commands list is empty");
             }
-            let inv = self.inv.snapshot();
-            let host = inv.require_remote(&args.host, self.caller_ip, Capability::Exec)?;
+            let target =
+                self.authorize(&ctx, "ssh_batch", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
             // The batch wire protocol runs each entry under `bash -c`.
             // Without bash the remote shell mangles the script and the
             // failure surfaces as "missing record for command 0 — remote
@@ -753,7 +811,7 @@ impl Prompto {
             let script = batch::build_script(&args.commands, fail_fast);
             let raw = self
                 .ssh
-                .exec_stdin(host, "bash", script.as_bytes(), to, false)
+                .exec_stdin(&ctx, host, "bash", script.as_bytes(), to, false)
                 .await?;
             if raw.timed_out {
                 anyhow::bail!("batch timed out (>{:?})", to.unwrap_or_default());
@@ -762,7 +820,7 @@ impl Prompto {
             Ok(parsed)
         }
         .await;
-        self.finish_tool("ssh_batch", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "ssh_batch", Some(&host_name), res)
     }
 
     #[tool(
@@ -772,15 +830,20 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<ClaudeExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let total_timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
         let res: anyhow::Result<_> = async {
             if args.task.trim().is_empty() {
                 anyhow::bail!("task is empty");
             }
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::ClaudeExec)?;
+            let target = self.authorize(
+                &ctx,
+                "claude_exec",
+                &args.host,
+                Need::Cap(Capability::ClaudeExec),
+            )?;
+            let host = &target.host;
             let url = host
                 .apytti_url
                 .as_deref()
@@ -814,7 +877,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("claude_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "claude_exec", Some(&host_name), res)
     }
 
     #[tool(
@@ -824,14 +887,16 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<PythonExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let target =
+                self.authorize(&ctx, "python_exec", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
             let raw = script::run(
                 &self.ssh,
+                &ctx,
                 host,
                 "python3",
                 &args.script,
@@ -856,7 +921,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool("python_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "python_exec", Some(&host_name), res)
     }
 
     #[tool(
@@ -866,14 +931,24 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
-            let raw =
-                script::run(&self.ssh, host, "node", &args.script, &args.args, to, false).await?;
+            let target =
+                self.authorize(&ctx, "node_exec", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
+            let raw = script::run(
+                &self.ssh,
+                &ctx,
+                host,
+                "node",
+                &args.script,
+                &args.args,
+                to,
+                false,
+            )
+            .await?;
             let original = raw.stderr.len();
             let compacted = script::compact_node_stack(&raw.stderr);
             let was_compacted = compacted.len() != original;
@@ -890,7 +965,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool("node_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "node_exec", Some(&host_name), res)
     }
 
     #[tool(description = "Run Ruby on a remote host. Script body via SSH stdin.")]
@@ -926,16 +1001,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let target =
+                self.authorize(&ctx, "file_list", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
             files::validate_path(&args.path)?;
             let cmd = files::ls_command(host.platform, &args.path);
             let raw = self
                 .ssh
-                .exec(host, &cmd, Some(Duration::from_secs(10)), false)
+                .exec(&ctx, host, &cmd, Some(Duration::from_secs(10)), false)
                 .await?;
             if !raw.ok() {
                 anyhow::bail!(
@@ -953,7 +1029,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("file_list", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "file_list", Some(&host_name), res)
     }
 
     #[tool(
@@ -963,16 +1039,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let target =
+                self.authorize(&ctx, "file_stat", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
             files::validate_path(&args.path)?;
             let cmd = files::stat_command(host.platform, &args.path);
             let raw = self
                 .ssh
-                .exec(host, &cmd, Some(Duration::from_secs(10)), false)
+                .exec(&ctx, host, &cmd, Some(Duration::from_secs(10)), false)
                 .await?;
             if !raw.ok() {
                 anyhow::bail!(
@@ -989,13 +1066,14 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("file_stat", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "file_stat", Some(&host_name), res)
     }
 
     #[tool(description = "List inventory hosts with their capabilities. Read-only.")]
     async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let res: anyhow::Result<_> = async {
+            authz::authorize_tool(&ctx, "inventory_list")?;
             let inv = self.inv.snapshot();
             let hosts: Vec<serde_json::Value> = inv
                 .hosts
@@ -1007,23 +1085,12 @@ impl Prompto {
                         "mac": h.mac,
                         "ssh_user": h.ssh_user,
                         "ssh_port": h.ssh_port,
-                "platform": h.platform.as_str(),
-                "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
-                "hypervisor": h.hypervisor,
                         "platform": h.platform.as_str(),
-                "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
-                "hypervisor": h.hypervisor,
                         "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
                         "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
                         "sudo_password_vault_path": h.sudo_password_vault_path,
                         "hypervisor": h.hypervisor,
+                        "request_id_env": h.request_id_env().as_str(),
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     })
                 })
@@ -1034,7 +1101,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("inventory_list", None, started, res)
+        self.finish_tool(&ctx, "inventory_list", None, res)
     }
 
     #[tool(description = "Get one host's inventory config (ssh_key path elided).")]
@@ -1042,15 +1109,16 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<InventoryHostNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.name.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let h = inv.get(&args.name)?;
+            let target =
+                authz::lookup(&self.inv.snapshot(), &ctx, "inventory_get_host", &args.name)?;
+            let h = &target.host;
             // Report the canonical name, not whatever the caller typed —
             // asking for an alias and being told it IS that host hides
             // the indirection. `queried_as` shows up only when they differ.
-            let canon = inv.canonical(&args.name).unwrap_or(&args.name).to_string();
+            let canon = target.canonical.clone();
             let queried_as = (canon != args.name).then(|| args.name.clone());
             Ok(serde_json::json!({
                 "name": canon,
@@ -1064,11 +1132,12 @@ impl Prompto {
                 "aliases": h.aliases,
                 "sudo_password_vault_path": h.sudo_password_vault_path,
                 "hypervisor": h.hypervisor,
+                "request_id_env": h.request_id_env().as_str(),
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             }))
         }
         .await;
-        self.finish_tool("inventory_get_host", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "inventory_get_host", Some(&host_name), res)
     }
 
     #[tool(
@@ -1078,23 +1147,18 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<RsyncSyncArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.source_host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let require = |name: &str| {
-                inv.require(name, Capability::Exec).map_err(|e| {
-                    let class = if inv.get(name).is_err() {
-                        ErrorClass::UnknownHost
-                    } else {
-                        ErrorClass::RefusedCapability
-                    };
-                    ClassifiedError::refused(class, e)
-                })
-            };
-            let source_host = require(&args.source_host)?;
-            let dest_host = require(&args.dest_host)?;
+            // Both ends are guarded against self-targeting: prompto logs
+            // into the source, and the dest receives files written as its
+            // ssh_user — on the caller's own box that is the same sandbox
+            // escape as file_write.
+            let need = Need::Cap(Capability::Exec);
+            let source = self.authorize(&ctx, "rsync_sync", &args.source_host, need)?;
+            let dest = self.authorize(&ctx, "rsync_sync", &args.dest_host, need)?;
+            let (source_host, dest_host) = (&source.host, &dest.host);
             let opts = rsync::RsyncOptions {
                 archive: args.archive.unwrap_or(true),
                 delete: args.delete.unwrap_or(false),
@@ -1103,6 +1167,7 @@ impl Prompto {
             };
             let raw = rsync::run(
                 &self.ssh,
+                &ctx,
                 source_host,
                 &args.source_path,
                 dest_host,
@@ -1129,7 +1194,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("rsync_sync", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "rsync_sync", Some(&host_name), res)
     }
 
     #[tool(
@@ -1139,11 +1204,11 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<PortScanArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.get(&args.host)?;
+            let target = self.authorize(&ctx, "port_scan", &args.host, Need::Exists)?;
+            let host = &target.host;
             let probe = Duration::from_millis(args.probe_ms.unwrap_or(500).clamp(50, 5000));
             let mut results = Vec::with_capacity(args.ports.len());
             let ip = host.ip.to_string();
@@ -1160,7 +1225,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("port_scan", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "port_scan", Some(&host_name), res)
     }
 
     #[tool(
@@ -1170,13 +1235,19 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<HostArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
+            let target = self.authorize(
+                &ctx,
+                "host_diagnose",
+                &args.host,
+                Need::Cap(Capability::Exec),
+            )?;
+            let host = &target.host;
             let raw = script::run(
                 &self.ssh,
+                &ctx,
                 host,
                 "bash",
                 diagnose::DIAGNOSE_SCRIPT,
@@ -1194,7 +1265,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("host_diagnose", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "host_diagnose", Some(&host_name), res)
     }
 
     #[tool(
@@ -1215,7 +1286,7 @@ impl Prompto {
             "is-active",
             "is-enabled",
         ];
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
             if !ACTIONS.contains(&args.action.as_str()) {
@@ -1226,13 +1297,18 @@ impl Prompto {
                 );
             }
             crate::claudemgr::validate_unit_name(&args.unit)?;
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::SudoExec)?;
+            let target = self.authorize(
+                &ctx,
+                "service_control",
+                &args.host,
+                Need::Cap(Capability::SudoExec),
+            )?;
+            let host = &target.host;
             require_systemd(host, &args.host, "service_control")?;
             let cmd = format!("systemctl {} -- {}", args.action, args.unit);
             let raw = self
                 .ssh
-                .exec(host, &cmd, Some(Duration::from_secs(15)), true)
+                .exec(&ctx, host, &cmd, Some(Duration::from_secs(15)), true)
                 .await?;
             let stdout = if args.action == "status" {
                 let (compacted, _report) = self.filters.apply("systemctl status", &raw.stdout);
@@ -1250,7 +1326,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("service_control", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "service_control", Some(&host_name), res)
     }
 
     #[tool(
@@ -1260,16 +1336,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<FileReadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let max_bytes = args
             .max_bytes
             .unwrap_or(files::DEFAULT_READ_BYTES)
             .clamp(1, files::MAX_READ_BYTES);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
-            let raw = files::read(&self.ssh, host, &args.path, max_bytes).await?;
+            let target =
+                self.authorize(&ctx, "file_read", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
+            let raw = files::read(&self.ssh, &ctx, host, &args.path, max_bytes).await?;
             let bytes = raw.stdout.len();
             let truncated = bytes as u64 >= max_bytes;
             Ok(serde_json::json!({
@@ -1282,7 +1359,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("file_read", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "file_read", Some(&host_name), res)
     }
 
     #[tool(
@@ -1292,20 +1369,28 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<FileWriteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let sudo = args.sudo.unwrap_or(false);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
             let cap = if sudo {
                 Capability::SudoExec
             } else {
                 Capability::Exec
             };
-            let host = inv.require(&args.host, cap)?;
-            files::write(&self.ssh, host, &args.path, args.content.as_bytes(), sudo).await?;
+            let target = self.authorize(&ctx, "file_write", &args.host, Need::Cap(cap))?;
+            let host = &target.host;
+            files::write(
+                &self.ssh,
+                &ctx,
+                host,
+                &args.path,
+                args.content.as_bytes(),
+                sudo,
+            )
+            .await?;
             if let Some(mode) = &args.mode {
-                files::chmod(&self.ssh, host, &args.path, mode, sudo).await?;
+                files::chmod(&self.ssh, &ctx, host, &args.path, mode, sudo).await?;
             }
             Ok(serde_json::json!({
                 "host": args.host,
@@ -1316,7 +1401,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("file_write", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "file_write", Some(&host_name), res)
     }
 
     #[tool(description = "Run Bash on a remote host. Script body via SSH stdin.")]
@@ -1324,14 +1409,24 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::Exec)?;
-            let raw =
-                script::run(&self.ssh, host, "bash", &args.script, &args.args, to, false).await?;
+            let target =
+                self.authorize(&ctx, "bash_exec", &args.host, Need::Cap(Capability::Exec))?;
+            let host = &target.host;
+            let raw = script::run(
+                &self.ssh,
+                &ctx,
+                host,
+                "bash",
+                &args.script,
+                &args.args,
+                to,
+                false,
+            )
+            .await?;
             let len = raw.stderr.len();
             Ok(ScriptExecResult {
                 stdout: raw.stdout,
@@ -1344,7 +1439,7 @@ impl Prompto {
             })
         }
         .await;
-        self.finish_tool("bash_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "bash_exec", Some(&host_name), res)
     }
 
     #[tool(
@@ -1354,17 +1449,22 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<ExecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require_remote(&args.host, self.caller_ip, Capability::SudoExec)?;
-            let raw = self.ssh.exec(host, &args.cmd, to, true).await?;
+            let target = self.authorize(
+                &ctx,
+                "ssh_sudo_exec",
+                &args.host,
+                Need::Cap(Capability::SudoExec),
+            )?;
+            let host = &target.host;
+            let raw = self.ssh.exec(&ctx, host, &args.cmd, to, true).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }
         .await;
-        self.finish_tool("ssh_sudo_exec", Some(&host_name), started, res)
+        self.finish_tool(&ctx, "ssh_sudo_exec", Some(&host_name), res)
     }
 
     #[tool(description = "List MCP servers registered on a client (`claude mcp list`).")]
@@ -1372,16 +1472,21 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpClientArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
-            let raw = claudemgr::list(&self.ssh, host).await?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_list",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
+            let raw = claudemgr::list(&self.ssh, &ctx, host).await?;
             Ok(serde_json::json!({ "client": args.client, "stdout": raw }))
         }
         .await;
-        self.finish_tool("mcp_list", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_list", Some(&client), res)
     }
 
     #[tool(description = "Show one MCP server's config on a client (`claude mcp get <name>`).")]
@@ -1389,16 +1494,21 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
-            let raw = claudemgr::get(&self.ssh, host, &args.name).await?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_get",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
+            let raw = claudemgr::get(&self.ssh, &ctx, host, &args.name).await?;
             Ok(serde_json::json!({ "client": args.client, "name": args.name, "stdout": raw }))
         }
         .await;
-        self.finish_tool("mcp_get", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_get", Some(&client), res)
     }
 
     #[tool(
@@ -1408,14 +1518,20 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpAddArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_add",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
             let scope = args.scope.unwrap_or(Scope::User);
             let out = claudemgr::add(
                 &self.ssh,
+                &ctx,
                 host,
                 &args.name,
                 &args.transport,
@@ -1430,7 +1546,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("mcp_add", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_add", Some(&client), res)
     }
 
     #[tool(description = "Unregister an MCP server on a client.")]
@@ -1438,13 +1554,18 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpRemoveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_remove",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
             let scope = args.scope.unwrap_or(Scope::User);
-            let out = claudemgr::remove(&self.ssh, host, &args.name, scope).await?;
+            let out = claudemgr::remove(&self.ssh, &ctx, host, &args.name, scope).await?;
             Ok(serde_json::json!({
                 "client": args.client,
                 "name": args.name,
@@ -1452,7 +1573,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("mcp_remove", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_remove", Some(&client), res)
     }
 
     #[tool(
@@ -1462,16 +1583,21 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpClientArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
-            let detail = claudemgr::restart_claudecli(&self.ssh, host).await?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_restart_claudecli",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
+            let detail = claudemgr::restart_claudecli(&self.ssh, &ctx, host).await?;
             Ok(serde_json::json!({ "client": args.client, "result": detail }))
         }
         .await;
-        self.finish_tool("mcp_restart_claudecli", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_restart_claudecli", Some(&client), res)
     }
 
     #[tool(
@@ -1481,12 +1607,17 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<McpClientArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let client = args.client.clone();
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.client, Capability::ClaudeAdmin)?;
-            let raw = claudemgr::list(&self.ssh, host).await?;
+            let target = self.authorize(
+                &ctx,
+                "mcp_status",
+                &args.client,
+                Need::Cap(Capability::ClaudeAdmin),
+            )?;
+            let host = &target.host;
+            let raw = claudemgr::list(&self.ssh, &ctx, host).await?;
             let entries = mcpprobe::parse_mcp_list(&raw);
 
             let mut probes = Vec::with_capacity(entries.len());
@@ -1511,7 +1642,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool("mcp_status", Some(&client), started, res)
+        self.finish_tool(&ctx, "mcp_status", Some(&client), res)
     }
 
     #[tool(
@@ -1553,14 +1684,15 @@ impl Prompto {
         tool: &'static str,
         args: McpLogsArgs,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let lines = args.lines.unwrap_or(50);
         let res: anyhow::Result<_> = async {
-            let inv = self.inv.snapshot();
-            let host = inv.require(&args.host, Capability::SudoExec)?;
+            let target = self.authorize(&ctx, tool, &args.host, Need::Cap(Capability::SudoExec))?;
+            let host = &target.host;
             require_systemd(host, &args.host, tool)?;
-            let stdout = claudemgr::journalctl_tail(&self.ssh, host, &args.unit, lines).await?;
+            let stdout =
+                claudemgr::journalctl_tail(&self.ssh, &ctx, host, &args.unit, lines).await?;
             Ok(serde_json::json!({
                 "host": args.host,
                 "unit": args.unit,
@@ -1569,24 +1701,28 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool(tool, Some(&host_name), started, res)
+        self.finish_tool(&ctx, tool, Some(&host_name), res)
     }
 
     #[tool(
         description = "Advice for recovering from MCP-server disconnects (interactive sessions need /mcp; claude -p refreshes per-message)."
     )]
     async fn mcp_reconnect_hint(&self) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let hint = "If an MCP server appears disconnected:\n\
             1. Run `mcp_status <client>` first — distinguishes 'daemon down' from 'session stale'.\n\
             2. Daemon down: check `mcp_logs <host> <unit>`; if needed, restart via `ssh_sudo_exec`.\n\
             3. Session stale (probe says reachable, but your tool calls still fail):\n\
                • Interactive Claude Code session: type `/mcp` and reconnect the server.\n\
-               • Telegram via claudecli: ask me to call `mcp_restart_claudecli <client>` — claudecli\n\
-                 runs `claude -p` per message, so the next message handshakes fresh.\n\
+               • Telegram via claudecli: `mcp_restart_claudecli <client>` — claudecli runs\n\
+                 `claude -p` per message, so the next message handshakes fresh.\n\
+            prompto refuses every one of these against the caller's own machine: on the client\n\
+            itself, run the equivalent (`claude mcp list`, `systemctl restart …`) in your local shell.\n\
                • There is no in-session re-handshake hook today; this hint is the honest answer.";
-        let res: anyhow::Result<serde_json::Value> = Ok(serde_json::json!({ "hint": hint }));
-        self.finish_tool("mcp_reconnect_hint", None, started, res)
+        let res = authz::authorize_tool(&ctx, "mcp_reconnect_hint")
+            .map(|()| serde_json::json!({ "hint": hint }))
+            .map_err(anyhow::Error::from);
+        self.finish_tool(&ctx, "mcp_reconnect_hint", None, res)
     }
 
     #[tool(
@@ -1596,13 +1732,62 @@ impl Prompto {
         &self,
         Parameters(args): Parameters<GainArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let started = Instant::now();
+        let ctx = self.new_ctx();
         let cutoff = args
             .since_secs
             .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s as i64));
-        let res = self.tracker.summary(cutoff);
-        self.finish_tool("prompto_gain", None, started, res)
+        let res = authz::authorize_tool(&ctx, "prompto_gain")
+            .map_err(anyhow::Error::from)
+            .and_then(|()| self.tracker.summary(cutoff));
+        self.finish_tool(&ctx, "prompto_gain", None, res)
     }
+}
+
+/// Text blocks for a successful result, carrying `request_id`.
+///
+/// An object payload (every tool but `vm_list`) gains a `request_id`
+/// field, appended so existing keys keep their order. Anything else — an
+/// array, whose shape clients may depend on — is left untouched and the
+/// ID follows in its own `[request_id=…]` block, like the advisor's.
+fn success_blocks(payload: serde_json::Value, request_id: &str) -> Vec<String> {
+    match payload {
+        serde_json::Value::Object(mut map) => {
+            map.insert("request_id".into(), request_id.into());
+            vec![serde_json::Value::Object(map).to_string()]
+        }
+        other => vec![other.to_string(), format!("[request_id={request_id}]")],
+    }
+}
+
+/// Message and `data` for a failed call.
+///
+/// The message leads with a bracketed prefix carrying the request ID —
+/// merged with the class prefix when the error is classified
+/// (`[request_id=… error_class=… exit=…] …`) — because not every client
+/// shows `data` to the model. `data` always has `request_id`, plus the
+/// classified fields when there are any.
+fn error_parts(
+    e: &anyhow::Error,
+    classified: Option<&ClassifiedError>,
+    request_id: &str,
+) -> (String, serde_json::Value) {
+    let msg = e.to_string();
+    let Some(c) = classified else {
+        return (
+            format!("[request_id={request_id}] {msg}"),
+            serde_json::json!({ "request_id": request_id }),
+        );
+    };
+    let mut data = c.data();
+    data["request_id"] = request_id.into();
+    // Only splice into the class prefix when the classified error is what
+    // the message shows; under added context it isn't, so prefix instead.
+    let msg = if msg == c.to_string() {
+        c.render(Some(request_id))
+    } else {
+        format!("[request_id={request_id}] {msg}")
+    };
+    (msg, data)
 }
 
 #[tool_handler]
@@ -1637,4 +1822,35 @@ pub const fn instructions() -> &'static str {
                  The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
                  prompto_gain returns the token-savings summary for this instance. \
                  Reload the inventory live by sending SIGHUP to the server process."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_payload_gains_a_trailing_request_id_field() {
+        let b = success_blocks(serde_json::json!({ "a": 1, "z": 2 }), "RID");
+        assert_eq!(b, vec![r#"{"a":1,"z":2,"request_id":"RID"}"#.to_string()]);
+    }
+
+    /// vm_list returns an array; wrapping it would change its shape for
+    /// every client, so the ID rides in its own block instead.
+    #[test]
+    fn array_payload_keeps_its_shape() {
+        let b = success_blocks(serde_json::json!([{ "name": "vm1" }]), "RID");
+        assert_eq!(b[0], r#"[{"name":"vm1"}]"#);
+        assert_eq!(b[1], "[request_id=RID]");
+    }
+
+    #[test]
+    fn classified_error_under_context_is_prefixed_not_spliced() {
+        let e = anyhow::Error::new(ClassifiedError::refused(ErrorClass::Timeout, "slow"))
+            .context("outer");
+        let c = e.downcast_ref::<ClassifiedError>();
+        let (msg, data) = error_parts(&e, c, "RID");
+        assert_eq!(msg, "[request_id=RID] outer");
+        assert_eq!(data["error_class"], "timeout");
+        assert_eq!(data["request_id"], "RID");
+    }
 }

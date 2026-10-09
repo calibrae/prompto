@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 use std::time::Duration;
 
+use crate::ctx::CallCtx;
 use crate::inventory::{HostConfig, Platform};
 use crate::ssh::{ExecOutput, SshClient};
 
@@ -53,6 +54,7 @@ pub fn validate_mode(m: &str) -> Result<()> {
 /// the file may be larger).
 pub async fn read(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     path: &str,
     max_bytes: u64,
@@ -60,7 +62,7 @@ pub async fn read(
     validate_path(path)?;
     let cmd = format!("head -c {max_bytes} -- {path}");
     let res = ssh
-        .exec(host, &cmd, Some(Duration::from_secs(15)), false)
+        .exec(ctx, host, &cmd, Some(Duration::from_secs(15)), false)
         .await?;
     if !res.ok() {
         bail!(
@@ -77,6 +79,7 @@ pub async fn read(
 /// (caller must have `sudo_exec` capability checked).
 pub async fn write(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     path: &str,
     content: &[u8],
@@ -85,7 +88,14 @@ pub async fn write(
     validate_path(path)?;
     let cmd = format!("tee -- {path} >/dev/null");
     let res = ssh
-        .exec_stdin(host, &cmd, content, Some(Duration::from_secs(30)), sudo)
+        .exec_stdin(
+            ctx,
+            host,
+            &cmd,
+            content,
+            Some(Duration::from_secs(30)),
+            sudo,
+        )
         .await?;
     if !res.ok() {
         bail!(
@@ -338,6 +348,7 @@ pub fn parse_stat(stdout: &str) -> Option<FileStat> {
 /// Optional chmod after a write. No-op if `mode` is `None`.
 pub async fn chmod(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     path: &str,
     mode: &str,
@@ -347,7 +358,7 @@ pub async fn chmod(
     validate_mode(mode)?;
     let cmd = format!("chmod {mode} -- {path}");
     let res = ssh
-        .exec(host, &cmd, Some(Duration::from_secs(10)), sudo)
+        .exec(ctx, host, &cmd, Some(Duration::from_secs(10)), sudo)
         .await?;
     if !res.ok() {
         bail!(

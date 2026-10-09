@@ -185,16 +185,17 @@ async fn rsync_sync(server: &Server, args: Value) -> Value {
 }
 
 /// The JSON-RPC error of a failed call, asserting its class in both
-/// `data` and the message.
+/// `data` and the message, behind the same request ID in both.
 fn expect_class(resp: &Value, class: &str) -> Value {
     let err = resp
         .get("error")
         .unwrap_or_else(|| panic!("expected an error, got {resp}"));
     assert_eq!(err["data"]["error_class"], class, "{resp}");
+    let rid = err["data"]["request_id"].as_str().expect("data.request_id");
     let msg = err["message"].as_str().unwrap();
     assert!(
-        msg.starts_with(&format!("[error_class={class}")),
-        "message must lead with the class: {msg}"
+        msg.starts_with(&format!("[request_id={rid} error_class={class}")),
+        "message must lead with the request ID and the class: {msg}"
     );
     err.clone()
 }

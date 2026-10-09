@@ -5,10 +5,12 @@
 
 pub mod advisor;
 pub mod apytti_client;
+pub mod authz;
 pub mod baselines;
 pub mod batch;
 pub mod caller;
 pub mod claudemgr;
+pub mod ctx;
 pub mod diagnose;
 pub mod error_class;
 pub mod files;

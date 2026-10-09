@@ -6,7 +6,9 @@
 //! spots it, puts `error_class`, the exit code and a stderr tail into the
 //! MCP error's `data`, and prefixes the message with the class.
 //!
-//! Only `rsync_sync` produces these today. The enum is meant to grow into
+//! `rsync_sync` classifies its own failures, and `authz::authorize`
+//! classifies every refusal (`unknown_host`, `refused_capability`,
+//! `refused_self_target`). The enum is meant to grow into
 //! the audit log's `error_class` (roadmap S4.4: `refused_policy`,
 //! `refused_self_target`, `sudo_guard`, …), so names are stable
 //! `snake_case` strings and nothing here is rsync-specific except the
@@ -22,6 +24,9 @@ pub enum ErrorClass {
     UnknownHost,
     /// The host exists but lacks the capability the tool needs.
     RefusedCapability,
+    /// The target is the calling agent's own machine. Unconditional: no
+    /// tool is exempt and no policy can grant it (see `authz`).
+    RefusedSelfTarget,
     /// An argument failed validation; nothing was run.
     InvalidArgs,
     /// prompto could not reach the target host over SSH.
@@ -61,6 +66,7 @@ impl ErrorClass {
         match self {
             Self::UnknownHost => "unknown_host",
             Self::RefusedCapability => "refused_capability",
+            Self::RefusedSelfTarget => "refused_self_target",
             Self::InvalidArgs => "invalid_args",
             Self::SshConnect => "ssh_connect",
             Self::SshAuth => "ssh_auth",
@@ -118,17 +124,29 @@ impl ClassifiedError {
     }
 }
 
+impl ClassifiedError {
+    /// The display form, with `request_id` leading the bracketed prefix
+    /// when given: `[request_id=… error_class=… exit=…] message | stderr: …`.
+    pub fn render(&self, request_id: Option<&str>) -> String {
+        let mut out = String::from("[");
+        if let Some(id) = request_id {
+            out.push_str(&format!("request_id={id} "));
+        }
+        out.push_str(&format!("error_class={}", self.class));
+        if let Some(c) = self.exit_code {
+            out.push_str(&format!(" exit={c}"));
+        }
+        out.push_str(&format!("] {}", self.message));
+        if let Some(t) = &self.stderr_tail {
+            out.push_str(&format!(" | stderr: {t}"));
+        }
+        out
+    }
+}
+
 impl fmt::Display for ClassifiedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[error_class={}", self.class)?;
-        if let Some(c) = self.exit_code {
-            write!(f, " exit={c}")?;
-        }
-        write!(f, "] {}", self.message)?;
-        if let Some(t) = &self.stderr_tail {
-            write!(f, " | stderr: {t}")?;
-        }
-        Ok(())
+        f.write_str(&self.render(None))
     }
 }
 
@@ -199,6 +217,10 @@ mod tests {
         );
         let r = ClassifiedError::refused(ErrorClass::InvalidArgs, "bad path");
         assert_eq!(r.to_string(), "[error_class=invalid_args] bad path");
+        assert_eq!(
+            e.render(Some("01ABC")),
+            "[request_id=01ABC error_class=rsync_partial exit=23] rsync failed | stderr: rsync error: some files"
+        );
     }
 
     #[test]

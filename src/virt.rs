@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::time::Duration;
 
+use crate::ctx::CallCtx;
 use crate::inventory::HostConfig;
 use crate::ssh::SshClient;
 
@@ -96,9 +97,9 @@ pub fn parse_virsh_list(stdout: &str) -> Vec<VmRow> {
     out
 }
 
-pub async fn list(ssh: &SshClient, host: &HostConfig) -> Result<Vec<VmRow>> {
+pub async fn list(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig) -> Result<Vec<VmRow>> {
     let cmd = format!("{VIRSH} list --all");
-    let res = ssh.exec(host, &cmd, None, false).await?;
+    let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
         bail!(
             "virsh list failed (exit={:?}): {}",
@@ -109,10 +110,15 @@ pub async fn list(ssh: &SshClient, host: &HostConfig) -> Result<Vec<VmRow>> {
     Ok(parse_virsh_list(&res.stdout))
 }
 
-pub async fn domstate(ssh: &SshClient, host: &HostConfig, vm: &str) -> Result<String> {
+pub async fn domstate(
+    ssh: &SshClient,
+    ctx: &CallCtx,
+    host: &HostConfig,
+    vm: &str,
+) -> Result<String> {
     validate_vm_name(vm)?;
     let cmd = format!("{VIRSH} domstate {vm}");
-    let res = ssh.exec(host, &cmd, None, false).await?;
+    let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
         bail!(
             "virsh domstate {vm} failed (exit={:?}): {}",
@@ -123,10 +129,10 @@ pub async fn domstate(ssh: &SshClient, host: &HostConfig, vm: &str) -> Result<St
     Ok(res.stdout.trim().to_string())
 }
 
-pub async fn start(ssh: &SshClient, host: &HostConfig, vm: &str) -> Result<String> {
+pub async fn start(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig, vm: &str) -> Result<String> {
     validate_vm_name(vm)?;
     let cmd = format!("{VIRSH} start {vm}");
-    let res = ssh.exec(host, &cmd, None, false).await?;
+    let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
         bail!(
             "virsh start {vm} failed (exit={:?}): {} / {}",
@@ -142,6 +148,7 @@ pub async fn start(ssh: &SshClient, host: &HostConfig, vm: &str) -> Result<Strin
 /// virsh sub-step (poll cycle included).
 pub async fn stop(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     vm: &str,
     step_timeout: Duration,
@@ -149,7 +156,7 @@ pub async fn stop(
     validate_vm_name(vm)?;
 
     let mut steps = Vec::new();
-    let initial = domstate(ssh, host, vm).await?;
+    let initial = domstate(ssh, ctx, host, vm).await?;
     if initial == "shut off" || initial == "pmsuspended" {
         return Ok(StopVmResult {
             outcome: "already-off".into(),
@@ -161,9 +168,16 @@ pub async fn stop(
     // Step 1: dompmsuspend disk — S4 hibernate.
     steps.push("dompmsuspend".into());
     let cmd = format!("{VIRSH} dompmsuspend {vm} disk");
-    let _ = ssh.exec(host, &cmd, Some(step_timeout), false).await?;
-    if let Some(state) =
-        wait_for_state(ssh, host, vm, &["pmsuspended", "shut off"], step_timeout).await?
+    let _ = ssh.exec(ctx, host, &cmd, Some(step_timeout), false).await?;
+    if let Some(state) = wait_for_state(
+        ssh,
+        ctx,
+        host,
+        vm,
+        &["pmsuspended", "shut off"],
+        step_timeout,
+    )
+    .await?
     {
         return Ok(StopVmResult {
             outcome: "hibernated".into(),
@@ -175,8 +189,8 @@ pub async fn stop(
     // Step 2: shutdown — ACPI.
     steps.push("shutdown".into());
     let cmd = format!("{VIRSH} shutdown {vm}");
-    let _ = ssh.exec(host, &cmd, Some(step_timeout), false).await?;
-    if let Some(state) = wait_for_state(ssh, host, vm, &["shut off"], step_timeout).await? {
+    let _ = ssh.exec(ctx, host, &cmd, Some(step_timeout), false).await?;
+    if let Some(state) = wait_for_state(ssh, ctx, host, vm, &["shut off"], step_timeout).await? {
         return Ok(StopVmResult {
             outcome: "shutdown".into(),
             steps,
@@ -187,8 +201,8 @@ pub async fn stop(
     // Step 3: destroy — force kill.
     steps.push("destroy".into());
     let cmd = format!("{VIRSH} destroy {vm}");
-    let res = ssh.exec(host, &cmd, Some(step_timeout), false).await?;
-    if let Some(state) = wait_for_state(ssh, host, vm, &["shut off"], step_timeout).await? {
+    let res = ssh.exec(ctx, host, &cmd, Some(step_timeout), false).await?;
+    if let Some(state) = wait_for_state(ssh, ctx, host, vm, &["shut off"], step_timeout).await? {
         return Ok(StopVmResult {
             outcome: "destroyed".into(),
             steps,
@@ -204,6 +218,7 @@ pub async fn stop(
 
 async fn wait_for_state(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     vm: &str,
     accept: &[&str],
@@ -211,7 +226,7 @@ async fn wait_for_state(
 ) -> Result<Option<String>> {
     let deadline = std::time::Instant::now() + total_timeout;
     loop {
-        let state = match domstate(ssh, host, vm).await {
+        let state = match domstate(ssh, ctx, host, vm).await {
             Ok(s) => s,
             Err(_) => {
                 if std::time::Instant::now() >= deadline {

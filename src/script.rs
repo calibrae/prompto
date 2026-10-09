@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use std::borrow::Cow;
 use std::time::Duration;
 
+use crate::ctx::CallCtx;
 use crate::inventory::HostConfig;
 use crate::ssh::{ExecOutput, SshClient};
 
@@ -68,8 +69,10 @@ fn stdin_marker(interpreter: &str) -> &'static str {
 /// Run a script through an interpreter on a remote host. Script body is
 /// piped via SSH stdin so embedded quotes/heredocs/etc. survive
 /// untouched. Args (if any) become positional argv after the script.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     interpreter: &str,
     script: &str,
@@ -88,7 +91,7 @@ pub async fn run(
         cmd.push_str(a);
     }
 
-    ssh.exec_stdin(host, &cmd, script.as_bytes(), cmd_timeout, sudo)
+    ssh.exec_stdin(ctx, host, &cmd, script.as_bytes(), cmd_timeout, sudo)
         .await
 }
 

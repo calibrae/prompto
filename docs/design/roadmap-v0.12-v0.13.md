@@ -59,7 +59,7 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 
 ### E1 — Call context & central authorization (refactor, no behaviour change)
 - **S1.1 `CallCtx`.** `{ request_id: Ulid, caller_ip, agent: Option<Agent>, session_id: Option<String> }`, built per tool call. The `request_id` is returned in every result (success and error).
-- **S1.2 `Prompto::authorize(ctx, tool, host, Need)`.** One function replacing the inline `require`/`require_remote` in all 38 handlers. It applies the capability check, the self-target guard (now **universal**: `file_write`, `bash_exec` etc. lack it today), and later the policy (E3) and tickets (E6). Mechanical change across `mcp.rs`; existing tests must stay green.
+- **S1.2 `Prompto::authorize(ctx, tool, host, Need)`.** One function replacing the inline `require`/`require_remote` in all 38 handlers. It applies the capability check, the self-target guard, and later the policy (E3) and tickets (E6). The guard is now **unconditional**: before this, `file_write`, `bash_exec` and others lacked it. Every tool that contacts a host refuses the caller's own machine. There is no exemption table: only tools that never contact a host (the hostless ones, and `inventory_get_host`, which uses `authz::lookup`) are outside it. The guard is **not a policy dimension**. E3 and E6 run after it and cannot re-open it. Caller and host IPs are compared canonically (`::ffff:a.b.c.d` = `a.b.c.d`). Mechanical change across `mcp.rs`; existing tests must stay green.
 - **S1.3 Thread ctx into SSH.** `SshClient::exec*`/`run()` take `&CallCtx`. The remote side gets `PROMPTO_REQUEST_ID` (via `-o SetEnv` where accepted, otherwise an env prefix in the remote command). This is the hook point for certificates in E8.
 - **S1.4 `finish_tool` takes ctx.** It becomes the single emission point for both the gain tracker and the audit record (E4).
 
@@ -75,6 +75,7 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S3.1 `policy.toml` + `PolicyStore`.** SIGHUP-reloaded; default deny when auth is required. Rules are agent (or group) × hosts (names, globs, `group:<g>`) × tools (names/globs), with `approval = "none" | "ticket" | "human"`.
 - **S3.2 Inventory `groups = [...]`** per host. Validated at load; `inv_check` also validates `policy.toml` against the inventory and `agents.toml`.
 - **S3.3 Separate grants:** `ssh_sudo_exec`, `file_write{sudo=true}`, `service_control` and `host_sleep` each need an explicit grant even on `sudo_exec` hosts. Effective permission = policy ∩ host capability.
+- **S3.3b No self-target grant.** Policy can only narrow. It has no rule, glob or approval mode that lets an agent target its own machine: the self-target guard (S1.2) runs before policy and is not configurable.
 - **S3.4 Decisions name their rule.** Allow and deny both carry `rule = "<file>:<line>"`. Deny messages are actionable ("agent X has no grant for ssh_sudo_exec on mista").
 - **S3.5 Dry-run:** `prompto policy check --agent X --host Y --tool Z`.
 

@@ -68,13 +68,32 @@ pub const DEFAULT_TRUSTED_PROXIES: &[IpAddr] = &[
 /// Unparseable header values fall back to `peer` rather than failing
 /// the request; the guard treats a wrong-but-real address the same as
 /// any other non-matching one.
+///
+/// Every address is canonicalized (`::ffff:a.b.c.d` → `a.b.c.d`): a
+/// dual-stack listener reports IPv4 peers mapped, and a proxy may write
+/// them that way, but it is the same machine either way.
 pub fn resolve_client_ip(
     peer: IpAddr,
     trusted_proxies: &[IpAddr],
     x_real_ip: Option<&str>,
     x_forwarded_for: Option<&str>,
 ) -> IpAddr {
-    if !trusted_proxies.contains(&peer) {
+    resolve_raw(
+        peer.to_canonical(),
+        trusted_proxies,
+        x_real_ip,
+        x_forwarded_for,
+    )
+    .to_canonical()
+}
+
+fn resolve_raw(
+    peer: IpAddr,
+    trusted_proxies: &[IpAddr],
+    x_real_ip: Option<&str>,
+    x_forwarded_for: Option<&str>,
+) -> IpAddr {
+    if !trusted_proxies.iter().any(|p| p.to_canonical() == peer) {
         // Untrusted peer: whatever it claims about its own origin is
         // unverifiable, so it does not get to claim anything.
         return peer;
@@ -196,6 +215,53 @@ mod tests {
     fn ipv6_loopback_is_trusted_by_default() {
         let got = resolve_client_ip(ip("::1"), DEFAULT_TRUSTED_PROXIES, Some("192.0.2.2"), None);
         assert_eq!(got, ip("192.0.2.2"));
+    }
+
+    /// A dual-stack listener sees an IPv4 client as `::ffff:a.b.c.d`. It
+    /// is still that client, and still a trusted proxy if `a.b.c.d` is.
+    #[test]
+    fn mapped_peer_is_canonicalized() {
+        let got = resolve_client_ip(ip("::ffff:192.0.2.9"), DEFAULT_TRUSTED_PROXIES, None, None);
+        assert_eq!(got, ip("192.0.2.9"));
+        let got = resolve_client_ip(
+            ip("::ffff:127.0.0.1"),
+            DEFAULT_TRUSTED_PROXIES,
+            Some("192.0.2.2"),
+            None,
+        );
+        assert_eq!(got, ip("192.0.2.2"), "mapped loopback proxy not trusted");
+    }
+
+    #[test]
+    fn mapped_forwarded_addresses_are_canonicalized() {
+        let peer = ip("127.0.0.1");
+        let got = resolve_client_ip(
+            peer,
+            DEFAULT_TRUSTED_PROXIES,
+            Some("::ffff:192.0.2.2"),
+            None,
+        );
+        assert_eq!(got, ip("192.0.2.2"));
+        let got = resolve_client_ip(
+            peer,
+            DEFAULT_TRUSTED_PROXIES,
+            None,
+            Some("::ffff:192.0.2.3"),
+        );
+        assert_eq!(got, ip("192.0.2.3"));
+    }
+
+    /// Canonicalizing must not widen trust: a mapped address that is not
+    /// a proxy still cannot claim a source.
+    #[test]
+    fn mapped_untrusted_peer_still_cannot_spoof() {
+        let got = resolve_client_ip(
+            ip("::ffff:192.0.2.99"),
+            DEFAULT_TRUSTED_PROXIES,
+            Some("192.0.2.2"),
+            None,
+        );
+        assert_eq!(got, ip("192.0.2.99"));
     }
 
     #[test]
