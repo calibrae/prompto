@@ -30,6 +30,7 @@ pub mod script;
 pub mod server;
 pub mod sessions;
 pub mod ssh;
+pub mod stamp;
 pub mod vault;
 pub mod virt;
 pub mod wol;

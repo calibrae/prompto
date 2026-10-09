@@ -57,7 +57,9 @@
 //!
 //! # Reload
 //!
-//! SIGHUP re-reads the file. A missing file is deny-all. A malformed one
+//! The file is re-read when it changes ([`PolicyStore::refresh`], one
+//! `stat` per call: an edit applies to the next call), and on SIGHUP.
+//! A missing file is deny-all. A malformed one
 //! is fatal at startup; on reload it **fails closed** — the live policy
 //! becomes deny-all and every refusal says `policy file invalid since
 //! <time>` until a valid file is loaded (the parser's error and the path
@@ -83,6 +85,7 @@ use crate::authz;
 use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::inventory::{HostConfig, Inventory};
+use crate::stamp::{Seen, Stamp};
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
@@ -291,7 +294,7 @@ pub struct Policy {
     /// Set when the file did not exist: no rules, and deny messages say
     /// why.
     pub missing: Option<PathBuf>,
-    /// Set when a SIGHUP reload found the file malformed: no rules (the
+    /// Set when a reload found the file malformed: no rules (the
     /// previous policy is dropped, not kept), and deny messages say why.
     pub invalid: Option<Invalid>,
 }
@@ -590,11 +593,16 @@ impl Policy {
     }
 }
 
-/// `policy.toml`, hot-swappable on SIGHUP like the inventory and agents.
+/// `policy.toml`, hot-swappable. Re-read on SIGHUP like the inventory
+/// and agents, and by itself when the file changes: [`Self::refresh`]
+/// runs on every policy decision (one `stat`), so an edit applies to the
+/// next call. Either way a bad file fails closed (see [`Self::reload`]).
 #[derive(Clone)]
 pub struct PolicyStore {
     inner: Arc<ArcSwap<Policy>>,
     path: Option<PathBuf>,
+    /// The file's metadata when it was last read.
+    seen: Arc<std::sync::Mutex<Seen>>,
 }
 
 impl Default for PolicyStore {
@@ -609,12 +617,21 @@ impl PolicyStore {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(policy)),
             path,
+            seen: Default::default(),
         }
     }
 
     pub fn load_from(path: PathBuf) -> Result<Self> {
+        // Stamped before reading: a change during the read is seen next.
+        let stamp = Stamp::of(&path);
         let p = Policy::from_path(&path)?;
-        Ok(Self::new(p, Some(path)))
+        let store = Self::new(p, Some(path));
+        store
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(stamp);
+        Ok(store)
     }
 
     pub fn snapshot(&self) -> Arc<Policy> {
@@ -632,6 +649,49 @@ impl PolicyStore {
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("no policy path configured — cannot reload"))?;
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        self.read_locked(path, &mut seen)
+    }
+
+    /// Re-read the file if it changed since it was last read, with the
+    /// same fail-closed semantics as [`Self::reload`]. Cheap (one
+    /// `stat`); called on every policy decision.
+    pub fn refresh(&self) {
+        let Some(path) = &self.path else { return };
+        let now = Stamp::of(path);
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(changed) = seen.check(now) else {
+            return;
+        };
+        match self.read_locked(path, &mut seen) {
+            Ok(_) if !changed => {}
+            Ok(n) => {
+                let live = self.snapshot();
+                if live.missing.is_some() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "POLICY FILE MISSING — every tool call is DENIED (refused_policy) until \
+                         it exists"
+                    );
+                } else {
+                    tracing::info!(
+                        rule_count = n,
+                        path = %path.display(),
+                        "policy file changed — reloaded (`prompto policy lint` checks it)"
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                path = %path.display(),
+                "POLICY FILE INVALID — every tool call is DENIED (refused_policy) until a valid \
+                 file is written"
+            ),
+        }
+    }
+
+    fn read_locked(&self, path: &Path, seen: &mut Seen) -> Result<usize> {
+        seen.record(Stamp::of(path));
         match Policy::from_path(path) {
             Ok(new) => {
                 let n = new.rules.len();
@@ -674,6 +734,8 @@ impl Enforcer {
         host: Option<(&str, &HostConfig)>,
         root: bool,
     ) -> Result<String, ClassifiedError> {
+        // An edit to policy.toml applies to this call, no SIGHUP needed.
+        self.policy.refresh();
         let (name, groups) = self.subject(ctx, tool).map_err(|msg| {
             ClassifiedError::refused(ErrorClass::RefusedPolicy, msg).with_rule(DEFAULT_DENY)
         })?;
@@ -1735,6 +1797,63 @@ capabilities = ["virt"]
             store.snapshot().missing.is_some(),
             "a vanished file is deny-all"
         );
+    }
+
+    /// An edit to policy.toml applies to the next decision without
+    /// SIGHUP — atomic replace, in-place edit, a broken edit (fail
+    /// closed), deletion — and an unchanged file keeps its snapshot.
+    #[test]
+    fn enforcer_follows_the_policy_file_without_sighup() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = "0".repeat(64);
+        let agents = store_with(
+            &format!("[agent.eve]\ntoken_sha256 = \"{h}\"\n"),
+            dir.path(),
+        );
+        let path = dir.path().join("policy.toml");
+        let grant = |tool: &str| {
+            format!("[[rule]]\nagents = [\"eve\"]\nhosts = [\"*\"]\ntools = [\"{tool}\"]\n")
+        };
+        std::fs::write(&path, grant("ssh_exec")).unwrap();
+        let e = Enforcer {
+            policy: PolicyStore::load_from(path.clone()).unwrap(),
+            agents,
+        };
+        let ok = |tool: &str| e.check(&ctx_for(Some("eve")), tool, None, false).is_ok();
+        assert!(ok("ssh_exec") && !ok("file_read"));
+        // Old enough for its stamp to be trusted (`stamp::Seen`).
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(ok("ssh_exec"));
+        let before = e.policy.snapshot();
+        assert!(ok("ssh_exec"));
+        assert!(
+            Arc::ptr_eq(&before, &e.policy.snapshot()),
+            "re-read unchanged"
+        );
+
+        // Atomic replace (new inode).
+        let tmp = dir.path().join("policy.toml.new");
+        std::fs::write(&tmp, grant("file_read")).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert!(ok("file_read") && !ok("ssh_exec"));
+        // In place, same inode, same size.
+        std::fs::write(&path, grant("file_list")).unwrap();
+        assert!(ok("file_list") && !ok("file_read"));
+        // Broken: deny-all, marked invalid — never the previous rules.
+        std::fs::write(&path, "[[rule]]\nagents = \"eve\"\n").unwrap();
+        assert!(!ok("file_list"));
+        assert!(e.policy.snapshot().invalid.is_some());
+        std::fs::write(&path, grant("ssh_exec")).unwrap();
+        assert!(ok("ssh_exec"));
+        assert!(e.policy.snapshot().invalid.is_none());
+        // Gone: deny-all.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!ok("ssh_exec"));
+        assert!(e.policy.snapshot().missing.is_some());
+        // SIGHUP still works, and records what it read: no second read.
+        std::fs::write(&path, grant("ssh_exec")).unwrap();
+        assert_eq!(e.policy.reload().unwrap(), 1);
+        assert!(ok("ssh_exec"));
     }
 
     /// The deny message carries the error's line and column but not the

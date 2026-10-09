@@ -21,6 +21,7 @@
 //! holding a role token can claim any session.
 
 use crate::ctx::Agent;
+use crate::stamp::{Seen, Stamp};
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -267,40 +268,7 @@ pub struct AgentStore {
     inner: Arc<ArcSwap<Agents>>,
     path: Option<PathBuf>,
     /// The file's metadata when it was last read.
-    seen: Arc<std::sync::Mutex<Option<Stamp>>>,
-}
-
-/// What a `stat` of `agents.toml` says: enough to notice any change
-/// (`write_atomic` replaces the inode; an in-place edit moves mtime,
-/// ctime or size).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stamp {
-    Missing,
-    Unreadable(std::io::ErrorKind),
-    File {
-        dev: u64,
-        ino: u64,
-        size: u64,
-        mtime: (i64, i64),
-        ctime: (i64, i64),
-    },
-}
-
-impl Stamp {
-    fn of(path: &Path) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(m) => Stamp::File {
-                dev: m.dev(),
-                ino: m.ino(),
-                size: m.size(),
-                mtime: (m.mtime(), m.mtime_nsec()),
-                ctime: (m.ctime(), m.ctime_nsec()),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stamp::Missing,
-            Err(e) => Stamp::Unreadable(e.kind()),
-        }
-    }
+    seen: Arc<std::sync::Mutex<Seen>>,
 }
 
 impl Default for AgentStore {
@@ -323,7 +291,11 @@ impl AgentStore {
         let stamp = Stamp::of(&path);
         let agents = Agents::from_path(&path)?;
         let store = Self::new(agents, Some(path));
-        *store.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+        store
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(stamp);
         Ok(store)
     }
 
@@ -349,15 +321,16 @@ impl AgentStore {
         let Some(path) = &self.path else { return };
         let now = Stamp::of(path);
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        if *seen == Some(now) {
+        let Some(changed) = seen.check(now) else {
             return;
-        }
+        };
         match self.read_locked(path, &mut seen) {
-            Ok(n) => tracing::info!(
+            Ok(n) if changed => tracing::info!(
                 agent_count = n,
                 path = %path.display(),
                 "agents file changed — reloaded"
             ),
+            Ok(_) => {}
             Err(e) => tracing::error!(
                 error = %format!("{e:#}"),
                 "AGENTS FILE INVALID — every agent token is REFUSED until a valid file is read"
@@ -365,8 +338,8 @@ impl AgentStore {
         }
     }
 
-    fn read_locked(&self, path: &Path, seen: &mut Option<Stamp>) -> Result<usize> {
-        *seen = Some(Stamp::of(path));
+    fn read_locked(&self, path: &Path, seen: &mut Seen) -> Result<usize> {
+        seen.record(Stamp::of(path));
         match Agents::from_path(path) {
             Ok(new) => {
                 let n = new.agents.len();
@@ -845,7 +818,10 @@ mod tests {
         };
         assert!(matches!(auth(&store), AuthResult::Valid(_)));
 
-        // Unchanged file: the very same snapshot is kept.
+        // Unchanged file: the very same snapshot is kept — once it is
+        // old enough for its stamp to be trusted (`stamp::Seen`).
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        store.refresh();
         let before = store.snapshot();
         store.refresh();
         assert!(Arc::ptr_eq(&before, &store.snapshot()));
