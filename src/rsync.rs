@@ -187,11 +187,25 @@ fn rsync_spoke(stderr: &str) -> bool {
     })
 }
 
+/// OpenSSH refused the login. Its message lists auth methods —
+/// `Permission denied (publickey,password).` — which is what tells it
+/// apart from rsync's file errors, `Permission denied (13)`.
 fn ssh_auth_refused(stderr: &str) -> bool {
-    stderr.contains("Permission denied (")
+    stderr
+        .match_indices("Permission denied (")
+        .any(|(i, m)| stderr[i + m.len()..].starts_with(|c: char| c.is_ascii_alphabetic()))
         || stderr.contains("Permission denied, please try again")
         || stderr.contains("Too many authentication failures")
         || stderr.contains("Host key verification failed")
+}
+
+/// OpenSSH could not open the connection at all.
+fn ssh_connect_failed(stderr: &str) -> bool {
+    stderr.contains("ssh: connect to host")
+        || stderr.contains("ssh: Could not resolve hostname")
+        || stderr.contains("kex_exchange_identification")
+        || stderr.contains("Connection closed by")
+        || stderr.contains("Connection reset by")
 }
 
 fn command_not_found(stderr: &str) -> bool {
@@ -239,8 +253,11 @@ pub fn classify(out: &ExecOutput) -> ErrorClass {
     if command_not_found(stderr) {
         return ErrorClass::RsyncMissing;
     }
-    if code == 255 {
-        let auth = ssh_auth_refused(stderr);
+    // The transport failing is decided on ssh's own messages, not on
+    // 255 alone: when the source path is also bad, rsync can trip over
+    // the closed pipe first and exit 12 instead (seen live).
+    let auth = ssh_auth_refused(stderr);
+    if code == 255 || auth || ssh_connect_failed(stderr) {
         return match (rsync_spoke(stderr), auth) {
             (true, true) => ErrorClass::DestSshAuth,
             (true, false) => ErrorClass::DestSshConnect,
@@ -480,6 +497,22 @@ mod tests {
         let s = "rsync: [sender] send_files failed to open \"/src/secret\": Permission denied (13)\n\
                  rsync error: some files/attrs were not transferred (see previous errors) (code 23)\n";
         assert_eq!(classify(&failed(Some(23), s)), ErrorClass::RsyncPartial);
+    }
+
+    /// Verbatim from sbx-t1 (rsync 3.5.0): missing source path AND a dest
+    /// that refuses the source's key. rsync exits 12, not 255, yet the
+    /// cause to fix is the SSH trust.
+    #[test]
+    fn dest_auth_failure_masked_as_protocol_error() {
+        let s = "ops@192.0.2.12: Permission denied (publickey).\n\
+                 rsync: connection unexpectedly closed (0 bytes received so far) [sender]\n\
+                 rsync error: error in rsync protocol data stream (code 12) at io.c(285) [sender=3.5.0]\n";
+        assert_eq!(classify(&failed(Some(12), s)), ErrorClass::DestSshAuth);
+        let c = s.replace(
+            "ops@192.0.2.12: Permission denied (publickey).",
+            "ssh: connect to host 192.0.2.12 port 22: No route to host",
+        );
+        assert_eq!(classify(&failed(Some(12), &c)), ErrorClass::DestSshConnect);
     }
 
     #[test]
