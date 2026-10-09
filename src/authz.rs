@@ -92,8 +92,9 @@ pub fn authorize(
     // Both sides are canonicalized: an IPv4 client seen through a
     // dual-stack socket (or a proxy) as `::ffff:a.b.c.d` is the same
     // machine as `a.b.c.d`, and a plain `==` says it is not.
+    // `extra_ips` (the machine's other NICs, VPN, IPv6) count too.
     if let Some(caller) = ctx.caller_ip
-        && caller.to_canonical() == target.host.ip.to_canonical()
+        && target.host.is_own_address(caller)
     {
         return Err(ClassifiedError::refused(
             ErrorClass::RefusedSelfTarget,
@@ -278,6 +279,47 @@ capabilities = ["exec"]
             Need::Cap(Capability::Exec),
         );
         assert_eq!(class(r), ErrorClass::RefusedSelfTarget);
+    }
+
+    /// A machine calling from its Wi-Fi, VPN or IPv6 address is still
+    /// itself: every `extra_ips` entry is compared, mapped or not.
+    #[test]
+    fn extra_ips_are_the_same_machine() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.laptop]
+ip = "192.0.2.12"
+extra_ips = ["198.51.100.4", "2001:db8::4", "::ffff:203.0.113.4"]
+ssh_user = "u"
+ssh_key = "/dev/null"
+capabilities = ["exec"]
+"#,
+        )
+        .unwrap();
+        for caller in [
+            "198.51.100.4",
+            "::ffff:198.51.100.4",
+            "2001:db8::4",
+            "203.0.113.4",
+        ] {
+            let e = authorize(
+                &inv,
+                &ctx(Some(caller)),
+                "ssh_exec",
+                "laptop",
+                Need::Cap(Capability::Exec),
+            )
+            .expect_err(caller);
+            assert_eq!(e.class, ErrorClass::RefusedSelfTarget, "{caller}");
+        }
+        authorize(
+            &inv,
+            &ctx(Some("198.51.100.5")),
+            "ssh_exec",
+            "laptop",
+            Need::Cap(Capability::Exec),
+        )
+        .unwrap();
     }
 
     #[test]

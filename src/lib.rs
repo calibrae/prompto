@@ -4,6 +4,7 @@
 //! binary uses.
 
 pub mod advisor;
+pub mod agent;
 pub mod apytti_client;
 pub mod authz;
 pub mod baselines;
@@ -24,6 +25,7 @@ pub mod router;
 pub mod rsync;
 pub mod script;
 pub mod server;
+pub mod sessions;
 pub mod ssh;
 pub mod vault;
 pub mod virt;

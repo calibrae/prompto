@@ -238,11 +238,26 @@ pub struct HostConfig {
     /// [`HostConfig::request_id_env`].
     #[serde(default, rename = "request_id_env")]
     pub request_id_env_override: Option<RequestIdEnv>,
+    /// Other addresses this machine may call prompto from: a second NIC,
+    /// Wi-Fi, a VPN address, its IPv6 address. Never used to *reach* the
+    /// host — only by the self-targeting guard, which refuses a caller
+    /// matching `ip` or any of these. Canonicalized at load
+    /// (`::ffff:a.b.c.d` → `a.b.c.d`).
+    #[serde(default)]
+    pub extra_ips: Vec<IpAddr>,
 }
 
 impl HostConfig {
     pub fn has(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
+    }
+
+    /// Whether `addr` is one of this machine's addresses (`ip` or
+    /// `extra_ips`), compared in canonical form. The self-targeting
+    /// guard's whole question.
+    pub fn is_own_address(&self, addr: IpAddr) -> bool {
+        let addr = addr.to_canonical();
+        self.ip.to_canonical() == addr || self.extra_ips.iter().any(|e| e.to_canonical() == addr)
     }
 
     /// The effective [`RequestIdEnv`]: the inventory's setting, else the
@@ -298,6 +313,19 @@ impl HostConfig {
         if let Some(mac) = &self.mac {
             crate::wol::parse_mac(mac).with_context(|| format!("host {name}: invalid mac"))?;
         }
+        let mut seen = vec![self.ip.to_canonical()];
+        for e in &self.extra_ips {
+            let e = e.to_canonical();
+            // An unspecified or multicast address is never a caller's
+            // source: listing one is a typo that would guard nothing.
+            if e.is_unspecified() || e.is_multicast() {
+                bail!("host {name}: extra_ips entry {e} is not a unicast address");
+            }
+            if seen.contains(&e) {
+                bail!("host {name}: extra_ips repeats {e} (ip or another entry)");
+            }
+            seen.push(e);
+        }
         Ok(())
     }
 }
@@ -314,8 +342,32 @@ pub struct Inventory {
 impl Inventory {
     pub fn from_toml_str(s: &str) -> Result<Self> {
         let mut inv: Inventory = toml::from_str(s).context("parse inventory TOML")?;
-        for (name, host) in &inv.hosts {
+        for (name, host) in inv.hosts.iter_mut() {
             host.validate(name)?;
+            for e in host.extra_ips.iter_mut() {
+                *e = e.to_canonical();
+            }
+        }
+        // An extra address belongs to exactly one machine. Claimed by two
+        // hosts (or equal to another host's `ip`), the guard would refuse
+        // calls between two different machines — a typo, not a policy.
+        let mut owner: HashMap<IpAddr, &str> = HashMap::new();
+        for (name, host) in &inv.hosts {
+            for e in &host.extra_ips {
+                if let Some(prev) = owner.insert(*e, name) {
+                    bail!("extra_ips address {e} is claimed by both {prev:?} and {name:?}");
+                }
+            }
+        }
+        for (name, host) in &inv.hosts {
+            if let Some(other) = owner.get(&host.ip.to_canonical())
+                && *other != name.as_str()
+            {
+                bail!(
+                    "host {other}: extra_ips address {} is host {name:?}'s ip",
+                    host.ip.to_canonical()
+                );
+            }
         }
         // Alias index. A collision here would make `get()` silently
         // resolve to whichever entry won a HashMap race, so both kinds
@@ -499,6 +551,52 @@ capabilities = ["exec", "sudo_exec"]
         let inv = Inventory::from_toml_str(sample()).unwrap();
         let err = inv.require("nonexistent", Capability::Exec).unwrap_err();
         assert!(err.to_string().contains("unknown host"));
+    }
+
+    fn extra_ips_inv(alpha_extra: &str, bravo_extra: &str) -> Result<Inventory> {
+        Inventory::from_toml_str(&format!(
+            r#"
+[host.alpha]
+ip = "192.0.2.12"
+extra_ips = [{alpha_extra}]
+ssh_user = "u"
+ssh_key = "/k"
+
+[host.bravo]
+ip = "192.0.2.13"
+extra_ips = [{bravo_extra}]
+ssh_user = "u"
+ssh_key = "/k"
+"#
+        ))
+    }
+
+    #[test]
+    fn extra_ips_are_canonicalized_at_load() {
+        let inv = extra_ips_inv(r#""::ffff:198.51.100.4", "2001:db8::4""#, "").unwrap();
+        assert_eq!(
+            inv.get("alpha").unwrap().extra_ips,
+            vec![
+                "198.51.100.4".parse::<IpAddr>().unwrap(),
+                "2001:db8::4".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_ips_are_validated() {
+        for (a, b, want) in [
+            (r#""not-an-ip""#, "", "IP address"),
+            (r#""0.0.0.0""#, "", "not a unicast"),
+            (r#""ff02::1""#, "", "not a unicast"),
+            (r#""192.0.2.12""#, "", "repeats"),
+            (r#""198.51.100.4", "::ffff:198.51.100.4""#, "", "repeats"),
+            (r#""198.51.100.4""#, r#""198.51.100.4""#, "claimed by both"),
+            (r#""192.0.2.13""#, "", "ip"),
+        ] {
+            let err = format!("{:#}", extra_ips_inv(a, b).unwrap_err());
+            assert!(err.contains(want), "{a} / {b}: {err}");
+        }
     }
 
     /// Regression: a hostname in `ip` used to load fine and then silently

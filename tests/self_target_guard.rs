@@ -86,6 +86,7 @@ async fn serve(
         // aren't testing a laxer config than production.
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode,
+        auth: Default::default(),
         cancel: cancel.clone(),
     });
 

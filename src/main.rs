@@ -1,8 +1,9 @@
-//! prompto — bootstrap, transport selection, SIGHUP-driven inventory reload,
-//! and the `gain` CLI subcommand.
+//! prompto — bootstrap, transport selection, SIGHUP-driven inventory and
+//! agents reload, and the `gain` / `agent` CLI subcommands.
 
 use anyhow::{Context, Result};
 use mcp_gain::Tracker;
+use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode, Identity};
 use prompto::baselines::BASELINES;
 use prompto::caller;
 use prompto::inventory::InventoryStore;
@@ -48,6 +49,7 @@ pub struct Config {
     pub stop_vm_step: Duration,
     pub usage_log: PathBuf,
     pub gain_enabled: bool,
+    pub agents_path: PathBuf,
 }
 
 impl Config {
@@ -60,6 +62,7 @@ impl Config {
             stop_vm_step: Duration::from_secs(env_u64("PROMPTO_STOP_VM_STEP_SECS", 30)),
             usage_log: env_or("PROMPTO_USAGE_LOG", "/var/lib/prompto/usage.jsonl").into(),
             gain_enabled: env_bool("PROMPTO_GAIN_ENABLED", true),
+            agents_path: env_or("PROMPTO_AGENTS", "/etc/prompto/agents.toml").into(),
         }
     }
 }
@@ -74,8 +77,12 @@ fn init_tracing() {
         .init();
 }
 
+/// SIGHUP re-reads the inventory and `agents.toml` (the latter only when
+/// auth is on — `agents` is `None` with `PROMPTO_AUTH=off`),
+/// independently: a bad file keeps its previous version live and logs
+/// why, without blocking the other.
 #[cfg(unix)]
-fn spawn_sighup_reloader(store: InventoryStore) {
+fn spawn_sighup_reloader(store: InventoryStore, agents: Option<AgentStore>) {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
         let mut sig = match signal(SignalKind::hangup()) {
@@ -89,6 +96,13 @@ fn spawn_sighup_reloader(store: InventoryStore) {
             match store.reload() {
                 Ok(n) => tracing::info!(host_count = n, "inventory reloaded on SIGHUP"),
                 Err(e) => tracing::error!(?e, "inventory reload failed — keeping previous"),
+            }
+            let Some(agents) = &agents else { continue };
+            match agents.reload() {
+                Ok(n) => tracing::info!(agent_count = n, "agents reloaded on SIGHUP"),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "agents reload failed — keeping previous")
+                }
             }
         }
     });
@@ -116,7 +130,103 @@ fn spawn_vault_renewal(vault: Arc<VaultClient>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reloader(_store: InventoryStore) {}
+fn spawn_sighup_reloader(_store: InventoryStore, _agents: Option<AgentStore>) {}
+
+const AGENT_USAGE: &str = "\
+Usage: prompto agent add <name> [--groups a,b]   mint a token (printed once)
+       prompto agent list                        list agents (hashes abbreviated)
+       prompto agent revoke <name>               disable an agent's token
+
+Edits $PROMPTO_AGENTS (default /etc/prompto/agents.toml). A running server
+picks changes up on SIGHUP: systemctl reload prompto";
+
+/// `prompto agent …`: edit `agents.toml`. Only the token's hash is ever
+/// written; the token itself goes to stdout once, everything else to
+/// stderr, so `prompto agent add x > token-file` captures just the token.
+fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
+    let path = &cfg.agents_path;
+    let reload_hint = || {
+        eprintln!(
+            "{} updated. Running servers keep the old list until reloaded: \
+             `systemctl reload prompto` (or kill -HUP <pid>).",
+            path.display()
+        )
+    };
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let mut name = None;
+            let mut groups = Vec::new();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                let list = if a == "--groups" {
+                    Some(it.next().context("--groups requires a value")?.as_str())
+                } else {
+                    a.strip_prefix("--groups=")
+                };
+                match list {
+                    Some(l) => groups.extend(
+                        l.split(',')
+                            .map(str::trim)
+                            .filter(|g| !g.is_empty())
+                            .map(String::from),
+                    ),
+                    None if a.starts_with('-') || name.is_some() => {
+                        anyhow::bail!("unexpected argument {a:?}\n{AGENT_USAGE}")
+                    }
+                    None => name = Some(a.clone()),
+                }
+            }
+            let name = name.with_context(|| format!("agent add needs a name\n{AGENT_USAGE}"))?;
+            let mut agents = Agents::from_path(path)?;
+            let token = prompto::agent::add_agent(&mut agents, &name, groups)?;
+            prompto::agent::write_atomic(path, &agents.to_toml_string()?)?;
+            println!("{token}");
+            eprintln!(
+                "agent {name:?} added. Its token went to stdout, ONCE, and is not stored \
+                 anywhere — save it now (e.g. ~/.config/prompto/token, mode 0600)."
+            );
+            reload_hint();
+        }
+        Some("list") if args.len() == 1 => {
+            let agents = Agents::from_path(path)?;
+            if agents.agents.is_empty() {
+                eprintln!("no agents in {}", path.display());
+            }
+            println!(
+                "{:<24} {:<8} {:<24} {:<21} TOKEN",
+                "NAME", "STATUS", "GROUPS", "CREATED"
+            );
+            for (name, e) in &agents.agents {
+                println!(
+                    "{:<24} {:<8} {:<24} {:<21} sha256:{}…",
+                    name,
+                    if e.disabled { "revoked" } else { "active" },
+                    if e.groups.is_empty() {
+                        "-".to_string()
+                    } else {
+                        e.groups.join(",")
+                    },
+                    e.created.as_deref().unwrap_or("-"),
+                    &e.token_sha256[..8],
+                );
+            }
+        }
+        Some("revoke") if args.len() == 2 => {
+            let name = &args[1];
+            let mut agents = Agents::from_path(path)?;
+            if prompto::agent::revoke_agent(&mut agents, name)? {
+                prompto::agent::write_atomic(path, &agents.to_toml_string()?)?;
+                eprintln!("agent {name:?} revoked (disabled = true).");
+                reload_hint();
+            } else {
+                eprintln!("agent {name:?} was already revoked; nothing changed.");
+            }
+        }
+        Some("--help" | "-h" | "help") => println!("{AGENT_USAGE}"),
+        _ => anyhow::bail!("{AGENT_USAGE}"),
+    }
+    Ok(())
+}
 
 fn run_gain_cli(cfg: &Config, args: &[String]) -> Result<()> {
     let mut json = false;
@@ -171,6 +281,9 @@ async fn main() -> Result<()> {
     if raw_args.len() >= 2 && raw_args[1] == "gain" {
         return run_gain_cli(&cfg, &raw_args[2..]);
     }
+    if raw_args.len() >= 2 && raw_args[1] == "agent" {
+        return run_agent_cli(&cfg, &raw_args[2..]);
+    }
 
     init_tracing();
     tracing::info!(?cfg, "prompto starting");
@@ -181,7 +294,40 @@ async fn main() -> Result<()> {
         host_count = store.snapshot().hosts.len(),
         "inventory loaded"
     );
-    spawn_sighup_reloader(store.clone());
+    // Read before anything else can fail late: a typo such as
+    // `requried` must stop the server, not silently mean "off".
+    let auth_mode = AuthMode::parse(&env_or("PROMPTO_AUTH", "off"))?;
+    // Off must not depend on agents.toml: an unreadable or malformed file
+    // would otherwise stop a box that doesn't use it. It isn't read at
+    // all, and SIGHUP leaves it alone. In optional/required a load failure
+    // at startup is fatal.
+    let agents = if auth_mode == AuthMode::Off {
+        if cfg.agents_path.exists() {
+            tracing::info!(
+                path = %cfg.agents_path.display(),
+                "PROMPTO_AUTH=off — agents file ignored"
+            );
+        }
+        None
+    } else {
+        let agents = AgentStore::load_from(cfg.agents_path.clone())
+            .with_context(|| format!("loading agents from {}", cfg.agents_path.display()))?;
+        let agent_count = agents.snapshot().agents.len();
+        tracing::info!(
+            auth = auth_mode.as_str(),
+            agent_count,
+            path = %cfg.agents_path.display(),
+            "agent tokens loaded"
+        );
+        if auth_mode == AuthMode::Required && agent_count == 0 {
+            tracing::warn!(
+                "PROMPTO_AUTH=required with no agents — every HTTP request will get 401 \
+                 until `prompto agent add` + SIGHUP"
+            );
+        }
+        Some(agents)
+    };
+    spawn_sighup_reloader(store.clone(), agents.clone());
 
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
     let needs_vault: Vec<String> = store
@@ -226,7 +372,12 @@ async fn main() -> Result<()> {
 
     if stdio_mode {
         tracing::info!("transport: stdio");
-        let service = prompto.serve(stdio()).await.context("stdio serve")?;
+        // Whoever can talk to our stdin launched us: agent `local`.
+        let service = prompto
+            .with_identity(Identity::local())
+            .serve(stdio())
+            .await
+            .context("stdio serve")?;
         service.waiting().await?;
     } else {
         tracing::info!("transport: streamable-http on {}", cfg.bind);
@@ -286,12 +437,16 @@ async fn main() -> Result<()> {
             }
         );
 
-        tracing::warn!(
-            "GET /log is UNAUTHENTICATED — anyone who can reach this listener can read \
-             journals on any inventory host granting sudo_exec. Same limits as the \
-             service_logs tool (sudo_exec gate, unit-name validation, 1..1000 lines), \
-             but no credential is required."
-        );
+        // `optional` still serves anonymous callers, so /log stays open.
+        if auth_mode != AuthMode::Required {
+            tracing::warn!(
+                auth = auth_mode.as_str(),
+                "GET /log is UNAUTHENTICATED — anyone who can reach this listener can read \
+                 journals on any inventory host granting sudo_exec. Same limits as the \
+                 service_logs tool (sudo_exec gate, unit-name validation, 1..1000 lines), \
+                 but no credential is required."
+            );
+        }
 
         let app = build_router(HttpParams {
             store,
@@ -301,6 +456,10 @@ async fn main() -> Result<()> {
             trusted_proxies,
             allowed_hosts,
             legacy_session_mode,
+            auth: AuthConfig {
+                mode: auth_mode,
+                store: agents.unwrap_or_default(),
+            },
             cancel: cancel.clone(),
         });
 

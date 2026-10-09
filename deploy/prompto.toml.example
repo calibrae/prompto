@@ -29,6 +29,9 @@ capabilities = ["exec", "virt"]
 #   chassis = "vm"                # cold_iron (default) | vm — a vm is never WOL'd
 #   hypervisor = "hypervisor"     # host with `virt` that runs this guest
 #   aliases = ["other-name"]
+#   extra_ips = ["198.51.100.4", "2001:db8::4"]   # other addresses this machine
+#                                 # calls prompto from (Wi-Fi, VPN, IPv6); the
+#                                 # self-targeting guard refuses those too
 #   sudo_password_vault_path = "hosts/sudo"   # needs PROMPTO_VAULT_TOKEN
 #   request_id_env = "off"        # export | setenv | off — how PROMPTO_REQUEST_ID
 #                                 # reaches remote commands. Default: export on

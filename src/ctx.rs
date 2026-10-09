@@ -14,9 +14,9 @@ use std::net::IpAddr;
 use std::time::Instant;
 use ulid::Ulid;
 
-/// An authenticated caller. Placeholder for roadmap E2 (role tokens,
-/// later OIDC): nothing builds one yet, so [`CallCtx::agent`] is always
-/// `None`. Shape follows the design doc's `Agent { name, groups }`.
+/// The calling agent: a role from `agents.toml` (see `crate::agent`), or
+/// the pseudo-agents `anonymous` (no valid token, `PROMPTO_AUTH=optional`)
+/// and `local` (stdio). Later also OIDC identities (E9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
     pub name: String,
@@ -30,11 +30,11 @@ pub struct CallCtx {
     /// Real client IP (see `caller::resolve_client_ip`). `None` on
     /// transports that carry no address (stdio, unit tests).
     pub caller_ip: Option<IpAddr>,
-    /// Set by E2's auth middleware; always `None` today.
+    /// Set by the auth middleware (`crate::agent`). `None` only with
+    /// `PROMPTO_AUTH=off` on HTTP.
     pub agent: Option<Agent>,
-    /// Claude session ID sent as context by the client (E2/E7, the
-    /// `X-Prompto-Session` header). Context only, never proof of identity.
-    /// Always `None` today.
+    /// Claude session ID sent as context by the client in the
+    /// `X-Prompto-Session` header. Context only, never proof of identity.
     pub session_id: Option<String>,
     /// When the call started, for `duration_ms`.
     pub started: Instant,
@@ -50,6 +50,18 @@ impl CallCtx {
             session_id: None,
             started: Instant::now(),
         }
+    }
+
+    /// Attach the caller's identity (agent and session).
+    pub fn with_identity(mut self, id: crate::agent::Identity) -> Self {
+        self.agent = id.agent;
+        self.session_id = id.session_id;
+        self
+    }
+
+    /// Agent name for log fields: the agent, or `-` with auth off.
+    pub fn agent_name(&self) -> &str {
+        self.agent.as_ref().map_or("-", |a| a.name.as_str())
     }
 
     /// The request ID in its canonical 26-char Crockford base32 form.

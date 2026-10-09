@@ -125,6 +125,7 @@ async fn spawn_server() -> Server {
         trusted_proxies: Arc::new(prompto::caller::DEFAULT_TRUSTED_PROXIES.to_vec()),
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode: false,
+        auth: Default::default(),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
