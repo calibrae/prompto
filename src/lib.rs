@@ -10,6 +10,7 @@ pub mod batch;
 pub mod caller;
 pub mod claudemgr;
 pub mod diagnose;
+pub mod error_class;
 pub mod files;
 pub mod filters;
 pub mod host;
