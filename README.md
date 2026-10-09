@@ -163,6 +163,7 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_VAULT_TOKEN` | unset | Enables vault-backed sudo. Periodic token — see above. |
 | `PROMPTO_VAULT_ADDR` | `http://127.0.0.1:8200` | Vault address. |
 | `PROMPTO_VAULT_MOUNT` | `secret` | KV v2 mount holding the sudo secrets. |
+| `PROMPTO_VAULT_CACERT` | unset | PEM file (one or more certs) trusted as extra roots for the vault client, on top of the bundled webpki roots — for a vault behind a private CA. The system trust store is not consulted. Unreadable or certificate-less file = startup error. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
