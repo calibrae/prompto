@@ -24,7 +24,17 @@
 //! that would skip it.
 //!
 //! Root-capable calls ([`is_root_capable`]) are a separate policy grant
-//! from ordinary ones: a rule must say `sudo = true` to grant them.
+//! from ordinary ones: a rule must say `sudo = true` to grant them. That
+//! covers prompto's own root paths only — an exec grant
+//! ([`ARBITRARY_EXEC_TOOLS`]) is a shell as `ssh_user`, which is root
+//! wherever that user is root or has passwordless sudo.
+//!
+//! Steps 1–3 answer before policy does, so an agent with no grant at all
+//! can still tell `unknown_host` from `refused_capability` from
+//! `refused_self_target` — i.e. probe which names exist and what they
+//! carry, though `inventory_list` hides hosts it has no grant on. That is
+//! a known, accepted property: the self-target guard must stay
+//! unconditional, which means it cannot wait for policy.
 //!
 //! The only way to resolve a host without the guard is [`lookup`], for
 //! tools that read the inventory and never contact the host
@@ -54,6 +64,60 @@ pub const ROOT_TOOLS: &[&str] = &[
 
 /// Tools that are root-capable only with an argument (`sudo = true`).
 pub const SUDO_FLAG_TOOLS: &[&str] = &["file_write"];
+
+/// Tools that run whatever the caller sends on the host, with the
+/// capability each needs there. They are ordinary calls (a `sudo = false`
+/// rule grants them), but the code runs as the host's `ssh_user` — so on
+/// a host where that user is root, or can `sudo` without a password, an
+/// exec grant is a root grant in all but name. `sudo = true` gates only
+/// prompto's own root paths; `policy::lint` warns about the rest.
+pub const ARBITRARY_EXEC_TOOLS: &[(&str, Capability)] = &[
+    ("ssh_exec", Capability::Exec),
+    ("ssh_batch", Capability::Exec),
+    ("bash_exec", Capability::Exec),
+    ("python_exec", Capability::Exec),
+    ("node_exec", Capability::Exec),
+    ("ruby_exec", Capability::Exec),
+    ("perl_exec", Capability::Exec),
+    ("deno_exec", Capability::Exec),
+    ("claude_exec", Capability::ClaudeExec),
+    // A stdio server's command runs on the client whenever claude starts.
+    ("mcp_add", Capability::ClaudeAdmin),
+];
+
+/// Every other tool: neither root-capable nor arbitrary exec. Each tool
+/// is in exactly one of [`ROOT_TOOLS`] ∪ [`SUDO_FLAG_TOOLS`],
+/// [`ARBITRARY_EXEC_TOOLS`] and this list — a test fails on a tool that
+/// isn't, so a new tool can't fall under `tools = ["*"]` unclassified.
+pub const ORDINARY_TOOLS: &[&str] = &[
+    "host_wake",
+    "host_status",
+    "host_diagnose",
+    "vm_list",
+    "vm_state",
+    "vm_start",
+    "vm_ensure_up",
+    "file_read",
+    "file_list",
+    "file_stat",
+    "rsync_sync",
+    "port_scan",
+    "inventory_list",
+    "inventory_get_host",
+    "mcp_list",
+    "mcp_get",
+    "mcp_remove",
+    "mcp_restart_claudecli",
+    "mcp_status",
+    "mcp_reconnect_hint",
+    "prompto_gain",
+];
+
+/// Whether `tool` runs arbitrary caller-supplied code
+/// ([`ARBITRARY_EXEC_TOOLS`]).
+pub fn is_arbitrary_exec(tool: &str) -> bool {
+    ARBITRARY_EXEC_TOOLS.iter().any(|(t, _)| *t == tool)
+}
 
 /// Whether a call is root-capable, i.e. needs a `sudo = true` policy
 /// rule. Everything gated on the `sudo_exec` capability runs something

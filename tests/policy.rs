@@ -50,6 +50,7 @@ ip = "127.0.0.31"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 groups = ["lab"]
+sudo_password_vault_path = "lab/t2"
 capabilities = ["exec", "sudo_exec"]
 
 [host.loopback]
@@ -271,6 +272,19 @@ fn args_for(tool: &str) -> Value {
     }
 }
 
+/// Every tool name `tools/list` advertises.
+async fn list_tools(s: &Server) -> Vec<String> {
+    let list = rpc(s.addr, Some("pto_alpha"), "tools/list", json!({})).await;
+    let tools: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{list}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(tools.len() >= 38, "tools/list looks short: {tools:?}");
+    tools
+}
+
 // ---------------------------------------------------------------------------
 // Router tests
 // ---------------------------------------------------------------------------
@@ -284,14 +298,7 @@ fn args_for(tool: &str) -> Value {
 #[tokio::test]
 async fn every_tool_is_refused_by_default_deny() {
     let s = spawn_with(AuthMode::Required, "").await;
-    let list = rpc(s.addr, Some("pto_alpha"), "tools/list", json!({})).await;
-    let tools: Vec<String> = list["result"]["tools"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{list}"))
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    assert!(tools.len() >= 38, "tools/list looks short: {tools:?}");
+    let tools = list_tools(&s).await;
 
     let mut wrong = Vec::new();
     for tool in &tools {
@@ -318,6 +325,70 @@ async fn every_tool_is_refused_by_default_deny() {
         ),
         "{msg}"
     );
+}
+
+/// Every tool `tools/list` advertises is in exactly one class: root-
+/// capable (`ROOT_TOOLS` ∪ `SUDO_FLAG_TOOLS`), arbitrary exec
+/// (`ARBITRARY_EXEC_TOOLS`) or ordinary (`ORDINARY_TOOLS`), and no list
+/// names a tool that doesn't exist. A new tool fails here until someone
+/// decides what it is, instead of quietly falling under `tools = ["*"]`.
+///
+/// The lists are then held to what the server does: under `tools =
+/// ["*"]` without sudo, exactly the always-root tools are refused (a
+/// sudo-gated tool missing from `ROOT_TOOLS` shows up as refused but
+/// unlisted), and each exec tool needs the capability it is listed with.
+#[tokio::test]
+async fn every_tool_is_classified() {
+    use prompto::authz::{ARBITRARY_EXEC_TOOLS, ORDINARY_TOOLS, ROOT_TOOLS, SUDO_FLAG_TOOLS};
+    let s = spawn_with(
+        AuthMode::Required,
+        "[[rule]]\nagents = [\"alpha\"]\nhosts = [\"*\"]\ntools = [\"*\"]\n",
+    )
+    .await;
+    let tools = list_tools(&s).await;
+    let root: Vec<&str> = ROOT_TOOLS.iter().chain(SUDO_FLAG_TOOLS).copied().collect();
+    let exec: Vec<&str> = ARBITRARY_EXEC_TOOLS.iter().map(|(t, _)| *t).collect();
+    let classes = [&root[..], &exec[..], ORDINARY_TOOLS];
+
+    let mut wrong = Vec::new();
+    for tool in &tools {
+        let n = classes
+            .iter()
+            .filter(|c| c.contains(&tool.as_str()))
+            .count();
+        if n != 1 {
+            wrong.push(format!("{tool}: in {n} classes, want exactly 1"));
+        }
+    }
+    for t in classes.concat() {
+        if !tools.iter().any(|x| x == t) {
+            wrong.push(format!("{t}: classified, but not in tools/list"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    for tool in &tools {
+        let resp = call(&s, Some("pto_alpha"), tool, args_for(tool)).await;
+        let refused = resp["error"]["data"]["error_class"] == "refused_policy";
+        if refused != ROOT_TOOLS.contains(&tool.as_str()) {
+            wrong.push(format!("{tool}: refused={refused}: {resp}"));
+        }
+    }
+    // t2 has exec and sudo_exec only.
+    for (tool, cap) in ARBITRARY_EXEC_TOOLS {
+        let mut args = args_for(tool);
+        for k in ["host", "client"] {
+            if args.get(k).is_some() {
+                args[k] = "t2".into();
+            }
+        }
+        let resp = call(&s, Some("pto_alpha"), tool, args).await;
+        let lacks = resp["error"]["data"]["error_class"] == "refused_capability";
+        if lacks == (cap.as_str() == "exec") {
+            wrong.push(format!("{tool}: listed with {}: {resp}", cap.as_str()));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 const SUDO_SPLIT: &str = r#"
@@ -472,7 +543,7 @@ sudo = true
         assert_eq!(class(&resp), Some("refused_self_target"), "{tool}: {resp}");
     }
     assert_ok(
-        &call(&s, Some("pto_alpha"), "ssh_sudo_exec", exec("t2")).await,
+        &call(&s, Some("pto_alpha"), "ssh_sudo_exec", exec("t1")).await,
         "the same policy does grant other hosts",
     );
 }
@@ -573,6 +644,128 @@ async fn auth_off_applies_no_policy() {
     }
     let t1 = ok_text(&call(&s, None, "inventory_get_host", json!({"name": "one"})).await);
     assert_eq!(t1["groups"], json!(["lab"]));
+}
+
+/// Inventory output with auth off, as captured from the pre-E3-follow-up
+/// build (hosts sorted by name, `request_id` dropped): visibility
+/// filtering must not change a byte of it.
+const GOLDEN_LIST: &str = r#"{"count":3,"hosts":[{"name":"loopback","ip":"127.0.0.1","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"]},{"name":"t1","ip":"127.0.0.30","mac":"02:00:00:00:00:30","ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":["one"],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["wake","exec","sudo_exec","virt","claude_admin","claude_exec"],"groups":["lab"]},{"name":"t2","ip":"127.0.0.31","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":"lab/t2","hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"],"groups":["lab"]}]}"#;
+const GOLDEN_GET_T2: &str = r#"{"name":"t2","queried_as":null,"ip":"127.0.0.31","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":"lab/t2","hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"],"groups":["lab"]}"#;
+
+/// A tool result without its `request_id`, hosts sorted by name (the
+/// inventory is a hash map, so their order is not stable).
+fn normalized(resp: &Value) -> Value {
+    let mut v = ok_text(resp);
+    v.as_object_mut().unwrap().remove("request_id");
+    if let Some(hosts) = v.get_mut("hosts").and_then(Value::as_array_mut) {
+        hosts.sort_by_key(|h| h["name"].as_str().unwrap().to_string());
+    }
+    v
+}
+
+#[tokio::test]
+async fn auth_off_inventory_output_is_unchanged() {
+    let s = spawn_with(AuthMode::Off, "").await;
+    let list = normalized(&call(&s, None, "inventory_list", json!({})).await);
+    assert_eq!(list.to_string(), GOLDEN_LIST);
+    let t2 = normalized(&call(&s, None, "inventory_get_host", json!({"name": "t2"})).await);
+    assert_eq!(t2.to_string(), GOLDEN_GET_T2);
+}
+
+const VISIBILITY: &str = r#"
+[[rule]]
+agents = ["alpha", "beta"]
+hosts = ["*"]
+tools = ["inventory_list"]
+
+[[rule]]
+agents = ["alpha"]
+hosts = ["t1"]
+tools = ["ssh_exec"]
+
+[[rule]]
+agents = ["alpha"]
+hosts = ["t2"]
+tools = ["inventory_get_host"]
+
+[[rule]]
+agents = ["alpha"]
+hosts = ["t2"]
+tools = ["ssh_sudo_exec"]
+sudo = true
+
+[[rule]]
+agents = ["beta"]
+hosts = ["group:lab"]
+tools = ["inventory_get_host"]
+"#;
+
+/// With policy on, `inventory_list` shows only the hosts the agent has a
+/// grant on (`loopback`: none — and `hosts = ["*"]` on the hostless
+/// inventory_list grant doesn't count), and `sudo_password_vault_path`
+/// only where it has a `sudo = true` grant. `inventory_get_host` hides
+/// the vault path the same way.
+#[tokio::test]
+async fn inventory_shows_only_granted_hosts() {
+    let s = spawn_with(AuthMode::Required, VISIBILITY).await;
+    let names = |v: &Value| -> Vec<String> {
+        v["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let host = |v: &Value, n: &str| {
+        v["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == n)
+            .unwrap()
+            .clone()
+    };
+
+    let alpha = normalized(&call(&s, Some("pto_alpha"), "inventory_list", json!({})).await);
+    assert_eq!(names(&alpha), ["t1", "t2"], "{alpha}");
+    assert_eq!(alpha["count"], 2);
+    assert_eq!(host(&alpha, "t2")["sudo_password_vault_path"], "lab/t2");
+    assert!(host(&alpha, "t1").get("sudo_password_vault_path").is_none());
+    // Everything else reads as with auth off.
+    let golden: Value = serde_json::from_str(GOLDEN_LIST).unwrap();
+    assert_eq!(host(&alpha, "t2"), host(&golden, "t2"));
+
+    let beta = normalized(&call(&s, Some("pto_beta"), "inventory_list", json!({})).await);
+    assert_eq!(names(&beta), ["t1", "t2"], "{beta}");
+    assert!(host(&beta, "t2").get("sudo_password_vault_path").is_none());
+
+    let get = |token, name| {
+        let s = &s;
+        async move {
+            normalized(
+                &call(
+                    s,
+                    Some(token),
+                    "inventory_get_host",
+                    json!({ "name": name }),
+                )
+                .await,
+            )
+        }
+    };
+    assert_eq!(get("pto_alpha", "t2").await.to_string(), GOLDEN_GET_T2);
+    let t2 = get("pto_beta", "t2").await;
+    assert!(t2.get("sudo_password_vault_path").is_none(), "{t2}");
+    assert_eq!(t2["ssh_user"], "admin");
+    // No grant on loopback: refused, as before.
+    let resp = call(
+        &s,
+        Some("pto_beta"),
+        "inventory_get_host",
+        json!({"name": "loopback"}),
+    )
+    .await;
+    assert_eq!(class(&resp), Some("refused_policy"), "{resp}");
 }
 
 fn ok_text(resp: &Value) -> Value {
@@ -698,8 +891,9 @@ fn spawn_binary(dir: &Path, mode: &str) -> Proc {
 const GRANT_LIST: &str =
     "[[rule]]\nagents = [\"alpha\"]\nhosts = [\"*\"]\ntools = [\"inventory_list\"]\n";
 
-/// SIGHUP reloads policy.toml: a new grant applies; a broken file keeps
-/// the previous policy (and says so); a removed grant is refused next.
+/// SIGHUP reloads policy.toml: a new grant applies; a broken file fails
+/// closed — deny-all, saying why and since when, not the previous policy
+/// — until a valid file is loaded; a removed grant is refused next.
 #[tokio::test]
 async fn sighup_reloads_policy_fail_safe() {
     let dir = tempfile::tempdir().unwrap();
@@ -721,13 +915,31 @@ async fn sighup_reloads_policy_fail_safe() {
 
     std::fs::write(dir.path().join("policy.toml"), "[[rule]]\nagents = 1\n").unwrap();
     p.sighup().await;
+    let log = p.stderr();
     assert!(
-        p.stderr()
-            .contains("policy reload failed — keeping previous"),
-        "{}",
-        p.stderr()
+        log.contains("policy reload failed — DENYING every call")
+            && log.contains("POLICY FILE INVALID"),
+        "{log}"
     );
-    assert_ok(&list().await, "previous policy kept");
+    let resp = list().await;
+    assert_eq!(
+        class(&resp),
+        Some("refused_policy"),
+        "previous policy kept: {resp}"
+    );
+    let msg = resp["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("(policy file invalid since ")
+            && msg.contains(
+                ": parse policy TOML: TOML parse error at line 2, column 10: invalid type"
+            )
+            && msg.contains("every call is denied until a valid file is loaded"),
+        "{msg}"
+    );
+
+    std::fs::write(dir.path().join("policy.toml"), GRANT_LIST).unwrap();
+    p.sighup().await;
+    assert_ok(&list().await, "valid again");
 
     std::fs::write(dir.path().join("policy.toml"), "").unwrap();
     p.sighup().await;

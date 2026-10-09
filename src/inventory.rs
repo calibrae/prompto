@@ -250,6 +250,13 @@ pub struct HostConfig {
     /// (`[a-z0-9_-]`); they mean nothing outside policy.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Whether `ssh_user` can `sudo` without a password here; unset means
+    /// unknown. Informational: prompto's own sudo paths don't read it.
+    /// `policy lint` uses it to warn when a rule without `sudo = true`
+    /// grants an exec tool on a host where that shell can become root
+    /// anyway (`true` or unset, or `ssh_user = "root"`).
+    #[serde(default)]
+    pub nopasswd_sudo: Option<bool>,
 }
 
 impl HostConfig {

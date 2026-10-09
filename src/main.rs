@@ -109,7 +109,15 @@ fn log_policy_lint(policy: &Policy, inv: &prompto::inventory::Inventory, agents:
 
 /// Startup/reload warnings that make a deny-all policy loud.
 fn warn_if_deny_all(policy: &Policy, mode: AuthMode) {
-    if let Some(path) = &policy.missing {
+    if let Some(bad) = &policy.invalid {
+        tracing::error!(
+            since = %bad.since,
+            error = %bad.error,
+            auth = mode.as_str(),
+            "POLICY FILE INVALID — every tool call is DENIED (refused_policy) until a valid \
+             file is loaded and the server is reloaded"
+        );
+    } else if let Some(path) = &policy.missing {
         tracing::warn!(
             path = %path.display(),
             auth = mode.as_str(),
@@ -126,9 +134,10 @@ fn warn_if_deny_all(policy: &Policy, mode: AuthMode) {
 
 /// SIGHUP re-reads the inventory, and — only when auth is on (`policy`
 /// is `None` with `PROMPTO_AUTH=off`) — `agents.toml` and `policy.toml`,
-/// independently: a bad file keeps its previous version live and logs
-/// why, without blocking the others. The policy is then linted against
-/// whatever is now live.
+/// independently, without one blocking the others. A bad inventory or
+/// agents file keeps its previous version live and logs why; a bad
+/// policy file fails closed (deny-all, see `PolicyStore::reload`). The
+/// policy is then linted against whatever is now live.
 #[cfg(unix)]
 fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mode: AuthMode) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -155,7 +164,7 @@ fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mo
             match p.policy.reload() {
                 Ok(n) => tracing::info!(rule_count = n, "policy reloaded on SIGHUP"),
                 Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "policy reload failed — keeping previous")
+                    tracing::error!(error = %format!("{e:#}"), "policy reload failed — DENYING every call until a valid file is loaded")
                 }
             }
             let live = p.policy.snapshot();

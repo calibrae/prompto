@@ -37,18 +37,38 @@
 //!   its aliases (`*` and `?` are wildcards), or is `group:<g>` with `<g>`
 //!   in the host's inventory `groups`. Tools that target no host
 //!   (`inventory_list`, `prompto_gain`, `mcp_reconnect_hint`) skip this
-//!   dimension.
+//!   dimension: a rule grants them when it names the agent and the tool,
+//!   whatever its `hosts` say.
 //! - **tool**: one of `tools` matches the tool name (`*`, `?` wildcards).
 //! - **sudo**: the rule's `sudo` equals whether the call is root-capable
 //!   (see `authz::is_root_capable`). A `sudo = false` rule (the default)
 //!   never grants a root-capable call, whatever its `tools` say —
 //!   `tools = ["*"]` grants every *ordinary* tool, not `ssh_sudo_exec`.
 //!   A `sudo = true` rule grants only root-capable calls, so root access
-//!   is always a separate, explicit grant.
+//!   *through prompto's own root paths* is always a separate, explicit
+//!   grant. It is not "no root" on the host: an exec tool
+//!   (`authz::ARBITRARY_EXEC_TOOLS`) is a shell as `ssh_user`, which is
+//!   root wherever that user is root or has passwordless sudo. `lint`
+//!   warns about those grants (inventory `nopasswd_sudo`).
 //!
 //! A matching rule with `approval` other than `none` refuses the call
 //! with `approval_required`: tickets and human approval arrive with E6,
 //! and until then such a rule fails closed.
+//!
+//! # Reload
+//!
+//! SIGHUP re-reads the file. A missing file is deny-all. A malformed one
+//! is fatal at startup; on reload it **fails closed** — the live policy
+//! becomes deny-all and every refusal says `policy file invalid since
+//! <time>: <error>` until a valid file is loaded. The previous policy is
+//! not kept, because it may be broader than the one being written.
+//!
+//! # Inventory visibility
+//!
+//! `inventory_list` shows an agent only the hosts some rule grants it a
+//! tool on, and `sudo_password_vault_path` only where it has a
+//! `sudo = true` grant (see [`Visibility`]); `inventory_get_host` hides
+//! the vault path the same way.
 //!
 //! # What policy cannot do
 //!
@@ -270,6 +290,48 @@ pub struct Policy {
     /// Set when the file did not exist: no rules, and deny messages say
     /// why.
     pub missing: Option<PathBuf>,
+    /// Set when a SIGHUP reload found the file malformed: no rules (the
+    /// previous policy is dropped, not kept), and deny messages say why.
+    pub invalid: Option<Invalid>,
+}
+
+/// Why the live policy is deny-all after a failed reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invalid {
+    /// RFC 3339 time of the failed reload.
+    pub since: String,
+    /// The load error, on one line and without the TOML source excerpt.
+    pub error: String,
+}
+
+impl Invalid {
+    pub fn new(e: &anyhow::Error) -> Self {
+        Invalid {
+            since: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            error: one_line_error(e),
+        }
+    }
+}
+
+/// `e`'s cause chain on one line. The `toml` crate's message quotes the
+/// offending source line (`2 | agents = 1`, a caret under it); that is
+/// dropped — the line and column numbers stay — so a deny message doesn't
+/// hand whole lines of the policy to every agent. (The parser's own
+/// message may still quote the one bad value.)
+fn one_line_error(e: &anyhow::Error) -> String {
+    let excerpt = |l: &str| {
+        let t = l.trim();
+        t.is_empty()
+            || t.starts_with('|')
+            || t.split_once('|')
+                .is_some_and(|(n, _)| n.trim().chars().all(|c| c.is_ascii_digit()))
+    };
+    format!("{e:#}")
+        .lines()
+        .filter(|l| !excerpt(l))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 /// What policy says about one call.
@@ -279,6 +341,19 @@ pub enum Outcome {
     /// A rule matched but demands an approval prompto cannot check yet.
     ApprovalRequired(Approval),
     Deny,
+}
+
+/// What the inventory tools (`inventory_list`, `inventory_get_host`) may
+/// show an agent of one host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Visibility {
+    /// Some rule grants the agent a host-targeting tool on the host — any
+    /// tool, with or without sudo, approval or not. Hosts without one are
+    /// left out of `inventory_list`.
+    pub listed: bool,
+    /// Some `sudo = true` rule grants it a root-capable call there. Only
+    /// then is the host's `sudo_password_vault_path` shown.
+    pub sudo: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,7 +412,7 @@ impl Policy {
         }
         Ok(Policy {
             rules,
-            missing: None,
+            ..Default::default()
         })
     }
 
@@ -411,8 +486,8 @@ impl Policy {
                 Self::from_toml_str(&raw, &source).with_context(|| format!("{}", path.display()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy {
-                rules: vec![],
                 missing: Some(path.to_path_buf()),
+                ..Default::default()
             }),
             Err(e) => Err(e).with_context(|| format!("read policy file {}", path.display())),
         }
@@ -421,6 +496,28 @@ impl Policy {
     /// The first rule matching `r`.
     pub fn first_match(&self, r: &Request) -> Option<&Rule> {
         self.rules.iter().find(|rule| rule.matches(r))
+    }
+
+    /// Which of `host` the inventory tools may show `agent`: every
+    /// host-targeting tool of `tools`, in each of its root variants, is
+    /// tried against the rules.
+    pub fn visibility(&self, agent: Subject, host: Target, tools: &[&str]) -> Visibility {
+        let mut v = Visibility::default();
+        for &tool in tools.iter().filter(|t| !authz::HOSTLESS_TOOLS.contains(t)) {
+            for &root in authz::root_variants(tool) {
+                let req = Request {
+                    agent,
+                    host: Some(host),
+                    tool,
+                    root,
+                };
+                if self.first_match(&req).is_some() {
+                    v.listed = true;
+                    v.sudo |= root;
+                }
+            }
+        }
+        v
     }
 
     /// Decide `r`. See the module docs for the semantics.
@@ -461,7 +558,13 @@ impl Policy {
             };
         }
         let mut why = String::from("no rule matched");
-        if let Some(path) = &self.missing {
+        if let Some(bad) = &self.invalid {
+            why = format!(
+                "policy file invalid since {}: {}; every call is denied until a valid file \
+                 is loaded",
+                bad.since, bad.error
+            );
+        } else if let Some(path) = &self.missing {
             why = format!(
                 "no policy loaded: {} does not exist, so every call is denied",
                 path.display()
@@ -519,17 +622,31 @@ impl PolicyStore {
         self.inner.load_full()
     }
 
-    /// Re-read the file. On error the live policy is left unchanged; a
-    /// file that has disappeared becomes deny-all. Returns the rule count.
+    /// Re-read the file. Returns the rule count. Fails closed: a file
+    /// that is malformed (or unreadable) replaces the live policy with
+    /// deny-all, marked [`Policy::invalid`], and the error is returned;
+    /// a file that has disappeared becomes deny-all too. The previous
+    /// policy is never kept — it may be broader than what the operator
+    /// was trying to write.
     pub fn reload(&self) -> Result<usize> {
         let path = self
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("no policy path configured — cannot reload"))?;
-        let new = Policy::from_path(path)?;
-        let n = new.rules.len();
-        self.inner.store(Arc::new(new));
-        Ok(n)
+        match Policy::from_path(path) {
+            Ok(new) => {
+                let n = new.rules.len();
+                self.inner.store(Arc::new(new));
+                Ok(n)
+            }
+            Err(e) => {
+                self.inner.store(Arc::new(Policy {
+                    invalid: Some(Invalid::new(&e)),
+                    ..Default::default()
+                }));
+                Err(e)
+            }
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -558,24 +675,12 @@ impl Enforcer {
         host: Option<(&str, &HostConfig)>,
         root: bool,
     ) -> Result<String, ClassifiedError> {
-        let deny = |msg: String| {
-            Err(ClassifiedError::refused(ErrorClass::RefusedPolicy, msg).with_rule(DEFAULT_DENY))
-        };
-        let Some(agent) = &ctx.agent else {
-            return deny(format!(
-                "refused_policy: no agent identity for {tool}, and policy grants only to agents"
-            ));
-        };
-        // Groups come from the live store, by name, so a SIGHUP that
-        // changes them (or revokes the agent) applies to a session that
-        // authenticated before it.
-        let groups = match agent_groups(&self.agents.snapshot(), &agent.name) {
-            Ok(g) => g,
-            Err(msg) => return deny(msg),
-        };
+        let (name, groups) = self.subject(ctx, tool).map_err(|msg| {
+            ClassifiedError::refused(ErrorClass::RefusedPolicy, msg).with_rule(DEFAULT_DENY)
+        })?;
         let req = Request {
             agent: Subject {
-                name: &agent.name,
+                name,
                 groups: &groups,
             },
             host: host.map(|(n, h)| Target::of(n, h)),
@@ -587,7 +692,7 @@ impl Enforcer {
             Outcome::Allow => {
                 tracing::info!(
                     request_id = %ctx.request_id,
-                    agent = %agent.name,
+                    agent = %name,
                     tool,
                     host = host.map(|h| h.0),
                     root,
@@ -600,6 +705,41 @@ impl Enforcer {
             Outcome::Deny => ErrorClass::RefusedPolicy,
         };
         Err(ClassifiedError::refused(class, d.message).with_rule(d.rule))
+    }
+
+    /// The caller's name and current groups, or why policy grants it
+    /// nothing. Groups come from the live store, by name, so a SIGHUP
+    /// that changes them (or revokes the agent) applies to a session that
+    /// authenticated before it.
+    fn subject<'c>(&self, ctx: &'c CallCtx, tool: &str) -> Result<(&'c str, Vec<String>), String> {
+        let Some(agent) = &ctx.agent else {
+            return Err(format!(
+                "refused_policy: no agent identity for {tool}, and policy grants only to agents"
+            ));
+        };
+        let groups = agent_groups(&self.agents.snapshot(), &agent.name)?;
+        Ok((&agent.name, groups))
+    }
+
+    /// What the inventory tools may show the caller of `host`; nothing
+    /// for a caller policy grants nothing. `tools` is the server's tool
+    /// list.
+    pub fn visibility(
+        &self,
+        ctx: &CallCtx,
+        host: (&str, &HostConfig),
+        tools: &[&str],
+    ) -> Visibility {
+        let Ok((name, groups)) = self.subject(ctx, "inventory") else {
+            return Visibility::default();
+        };
+        let agent = Subject {
+            name,
+            groups: &groups,
+        };
+        self.policy
+            .snapshot()
+            .visibility(agent, Target::of(host.0, host.1), tools)
     }
 }
 
@@ -652,10 +792,12 @@ impl std::fmt::Display for Finding {
 
 /// Check `policy` against the inventory, the agents and the tool list.
 ///
-/// Errors: references to agents, agent groups, hosts, host groups or
-/// tools that don't exist (a typo there silently grants nothing).
-/// Warnings: globs that match nothing, disabled agents, approval modes
-/// that refuse until E6, and rules that can never decide a call —
+/// Errors: references to agents, hosts, host groups or tools that don't
+/// exist (a typo there silently grants nothing). Warnings: agent groups
+/// nobody is in yet, globs that match nothing, disabled agents, approval
+/// modes that refuse until E6, exec grants without `sudo = true` on hosts
+/// where the shell is root anyway ([`authz::ARBITRARY_EXEC_TOOLS`]), and
+/// rules that can never decide a call —
 /// because an earlier rule always wins (shadowed) or because nothing
 /// matches them at all. Reachability is exact, not heuristic: every
 /// (agent, host, tool, root) combination the files allow is enumerated.
@@ -680,9 +822,11 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
                     Some(_) => {}
                 },
                 AgentPat::Group(g) => {
+                    // A warning, not an error: a group may be prepared
+                    // before its first agent is added.
                     if !agents.agents.values().any(|e| e.groups.contains(g)) {
                         push(
-                            Level::Error,
+                            Level::Warning,
                             rule,
                             format!("no agent in agents.toml is in group {g:?}"),
                         )
@@ -733,6 +877,9 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
                 ),
             }
         }
+        if let Some(msg) = exec_as_root(rule, inv, tools) {
+            push(Level::Warning, rule, msg)
+        }
         if rule.approval != Approval::None {
             push(
                 Level::Warning,
@@ -748,6 +895,57 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
     reachability(policy, inv, agents, tools, &mut out);
     out.sort_by_key(|f| f.level);
     out
+}
+
+/// The `sudo = false` rule's arbitrary-exec grants on hosts where that
+/// shell can become root anyway — `ssh_user` is root, or the inventory
+/// says `nopasswd_sudo = true` or doesn't say. One message per rule,
+/// naming the tools and each host with its reason; `None` when there are
+/// none. A host counts only if it carries the capability one of those
+/// tools needs, so a rule with `hosts = ["*"]` doesn't list every box.
+fn exec_as_root(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> {
+    if rule.sudo {
+        return None;
+    }
+    let exec: Vec<_> = authz::ARBITRARY_EXEC_TOOLS
+        .iter()
+        .filter(|(t, _)| tools.contains(t) && rule.matches_tool(t))
+        .collect();
+    if exec.is_empty() {
+        return None;
+    }
+    let mut hosts: Vec<String> = inv
+        .hosts
+        .iter()
+        .filter(|(n, h)| {
+            rule.matches_host(&Target::of(n, h)) && exec.iter().any(|(_, cap)| h.has(*cap))
+        })
+        .filter_map(|(n, h)| {
+            let why = if h.ssh_user == "root" {
+                "ssh_user is root"
+            } else {
+                match h.nopasswd_sudo {
+                    Some(true) => "nopasswd_sudo = true",
+                    None => "nopasswd_sudo unset",
+                    Some(false) => return None,
+                }
+            };
+            Some(format!("{n} ({why})"))
+        })
+        .collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    hosts.sort();
+    let names: Vec<&str> = exec.iter().map(|(t, _)| *t).collect();
+    Some(format!(
+        "grants arbitrary-exec tools ({}) without sudo = true on hosts where that shell can \
+         become root: {}. sudo = true gates only prompto's own root paths; an exec grant runs \
+         as ssh_user. Narrow the rule, or set nopasswd_sudo = false on hosts whose sudo needs \
+         a password",
+        names.join(", "),
+        hosts.join(", ")
+    ))
 }
 
 /// Flag rules that never decide any call.
@@ -859,6 +1057,7 @@ ssh_user = "u"
 ssh_key = "/k"
 aliases = ["a1"]
 groups = ["build"]
+nopasswd_sudo = false
 capabilities = ["exec", "sudo_exec"]
 
 [host.bravo]
@@ -866,12 +1065,14 @@ ip = "192.0.2.2"
 ssh_user = "u"
 ssh_key = "/k"
 groups = ["build", "web"]
+nopasswd_sudo = false
 capabilities = ["exec", "sudo_exec"]
 
 [host.web-1]
 ip = "192.0.2.3"
 ssh_user = "u"
 ssh_key = "/k"
+nopasswd_sudo = false
 capabilities = ["exec"]
 "#;
 
@@ -1217,7 +1418,7 @@ approval = "ticket"
         );
         for want in [
             "error: policy.toml:1: unknown agent \"ghost\"",
-            "error: policy.toml:1: no agent in agents.toml is in group \"nobody\"",
+            "warning: policy.toml:1: no agent in agents.toml is in group \"nobody\"",
             "error: policy.toml:1: unknown host \"nohost\"",
             "error: policy.toml:1: no inventory host is in group \"nogroup\"",
             "error: policy.toml:1: unknown tool \"ssh_exce\"",
@@ -1230,6 +1431,93 @@ approval = "ticket"
         assert_eq!(f.len(), 8, "{f:#?}");
         // Errors sort first.
         assert!(f[0].starts_with("error") && f[7].starts_with("warning"));
+    }
+
+    /// An exec grant without `sudo = true` is a root shell wherever
+    /// `ssh_user` is root or can sudo without a password: one warning per
+    /// rule, naming the tools and each such host with its reason.
+    #[test]
+    fn lint_warns_on_exec_grants_where_the_shell_is_root() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.pw]
+ip = "192.0.2.1"
+ssh_user = "u"
+ssh_key = "/k"
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.nopw]
+ip = "192.0.2.2"
+ssh_user = "u"
+ssh_key = "/k"
+nopasswd_sudo = true
+capabilities = ["exec"]
+
+[host.unknown]
+ip = "192.0.2.3"
+ssh_user = "u"
+ssh_key = "/k"
+capabilities = ["exec"]
+
+[host.rootuser]
+ip = "192.0.2.4"
+ssh_user = "root"
+ssh_key = "/k"
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.noexec]
+ip = "192.0.2.5"
+ssh_user = "root"
+ssh_key = "/k"
+capabilities = ["virt"]
+"#,
+        )
+        .unwrap();
+        let tools = [
+            "ssh_exec",
+            "bash_exec",
+            "file_read",
+            "ssh_sudo_exec",
+            "host_status",
+        ];
+        let lint_of = |policy: &str| -> Vec<String> {
+            let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
+            lint(&p, &inv, &agents(), &tools)
+                .iter()
+                .map(|f| f.to_string())
+                .collect()
+        };
+        let f = lint_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"*\"]\n\
+             [[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"ssh_sudo_exec\"]\nsudo = true\n",
+        );
+        assert_eq!(
+            f,
+            [
+                "warning: policy.toml:1: grants arbitrary-exec tools (ssh_exec, bash_exec) \
+                 without sudo = true on hosts where that shell can become root: nopw \
+                 (nopasswd_sudo = true), rootuser (ssh_user is root), unknown (nopasswd_sudo \
+                 unset). sudo = true gates only prompto's own root paths; an exec grant runs as \
+                 ssh_user. Narrow the rule, or set nopasswd_sudo = false on hosts whose sudo \
+                 needs a password"
+            ],
+            "pw has a sudo password; noexec can't exec; the sudo rule is explicit"
+        );
+        // Only hosts the rule names; nothing for non-exec tools.
+        assert!(
+            lint_of("[[rule]]\nagents = [\"dev\"]\nhosts = [\"pw\"]\ntools = [\"*\"]\n").is_empty()
+        );
+        assert!(
+            lint_of("[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"file_read\", \"host_status\"]\n")
+                .is_empty()
+        );
+        let f = lint_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"unknown\"]\ntools = [\"ssh_exec\"]\n",
+        );
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(f[0].contains("(ssh_exec)") && f[0].contains("unknown (nopasswd_sudo unset)"));
     }
 
     #[test]
@@ -1381,7 +1669,27 @@ approval = "ticket"
         assert_eq!(store.reload().unwrap(), 2);
         std::fs::write(&path, "[[rule]]\nagents = \"dev\"\n").unwrap();
         assert!(store.reload().is_err());
-        assert_eq!(store.snapshot().rules.len(), 2, "kept the previous policy");
+        // Fail closed: the previous (possibly broader) policy is dropped.
+        let live = store.snapshot();
+        assert!(live.rules.is_empty(), "kept the previous policy");
+        let bad = live.invalid.as_ref().expect("marked invalid");
+        let d = decide(&live, "dev", &[], Some("alpha"), "ssh_exec", false);
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert_eq!(d.rule, DEFAULT_DENY);
+        assert_eq!(
+            d.message,
+            format!(
+                "refused_policy: agent dev has no grant for ssh_exec on alpha (policy file \
+                 invalid since {}: {}; every call is denied until a valid file is loaded). Ask \
+                 the operator for a policy.toml rule if you need it.",
+                bad.since, bad.error
+            )
+        );
+        assert!(bad.error.contains("invalid type"), "{}", bad.error);
+        // A valid file lifts it.
+        std::fs::write(&path, grant).unwrap();
+        assert_eq!(store.reload().unwrap(), 1);
+        assert!(store.snapshot().invalid.is_none());
         std::fs::remove_file(&path).unwrap();
         assert_eq!(store.reload().unwrap(), 0);
         assert!(
@@ -1390,12 +1698,68 @@ approval = "ticket"
         );
     }
 
+    /// The deny message carries the error's line and column but not the
+    /// policy line the `toml` crate quotes.
+    #[test]
+    fn invalid_error_is_one_line_without_the_source_excerpt() {
+        let e = Policy::from_toml_str("[[rule]]\nagents = 1 # some-comment\n", "policy.toml")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("some-comment"), "{e:#}");
+        let bad = Invalid::new(&e);
+        assert_eq!(
+            bad.error,
+            "parse policy TOML: TOML parse error at line 2, column 10: invalid type: integer \
+             `1`, expected a sequence"
+        );
+        chrono::DateTime::parse_from_rfc3339(&bad.since).unwrap();
+    }
+
+    /// The inventory tools show a host when any rule grants the agent a
+    /// host-targeting tool there, and the vault path only with a sudo
+    /// grant. Hostless grants don't count, whatever their `hosts` say.
+    #[test]
+    fn visibility_follows_grants() {
+        let p = Policy::from_toml_str(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"alpha\"]\ntools = [\"host_status\"]\n\
+             [[rule]]\nagents = [\"dev\"]\nhosts = [\"bravo\"]\ntools = [\"file_write\"]\nsudo = true\n\
+             [[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"inventory_list\"]\n\
+             [[rule]]\nagents = [\"eve\"]\nhosts = [\"web-1\"]\ntools = [\"ssh_exec\"]\napproval = \"human\"\n",
+            "policy.toml",
+        )
+        .unwrap();
+        let inv = inv();
+        let see = |agent: &str, host: &str| {
+            p.visibility(
+                Subject {
+                    name: agent,
+                    groups: &[],
+                },
+                Target::of(host, inv.get(host).unwrap()),
+                &tools(),
+            )
+        };
+        let v = |listed, sudo| Visibility { listed, sudo };
+        assert_eq!(see("dev", "alpha"), v(true, false));
+        assert_eq!(see("dev", "bravo"), v(true, true));
+        assert_eq!(
+            see("dev", "web-1"),
+            v(false, false),
+            "inventory_list is hostless"
+        );
+        assert_eq!(
+            see("eve", "web-1"),
+            v(true, false),
+            "an approval rule is a grant"
+        );
+        assert_eq!(see("eve", "alpha"), v(false, false));
+    }
+
     #[test]
     fn shipped_example_parses() {
         let p = Policy::from_toml_str(include_str!("../deploy/policy.toml.example"), "policy.toml")
             .unwrap();
         assert_eq!(p.rules.len(), 6);
-        assert_eq!(p.rules[0].name(), "policy.toml:28 (infra-router-sudo)");
+        assert_eq!(p.rules[0].name(), "policy.toml:33 (infra-router-sudo)");
     }
 
     #[test]

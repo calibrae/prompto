@@ -12,7 +12,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use mcp_gain::Tracker;
@@ -28,8 +28,9 @@ use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
-use crate::inventory::{Capability, InventoryStore};
+use crate::inventory::{Capability, HostConfig, InventoryStore};
 use crate::mcpprobe;
+use crate::policy::Visibility;
 use crate::portscan;
 use crate::router::{self, Tier};
 use crate::rsync;
@@ -544,6 +545,23 @@ impl Prompto {
             host,
             need,
         )
+    }
+
+    /// What the inventory tools may show this caller of `host`: all of it
+    /// with policy off.
+    fn visibility(&self, ctx: &CallCtx, name: &str, host: &HostConfig) -> Visibility {
+        match &self.policy {
+            None => Visibility {
+                listed: true,
+                sudo: true,
+            },
+            Some(p) => {
+                static TOOLS: OnceLock<Vec<String>> = OnceLock::new();
+                let tools = TOOLS.get_or_init(Self::tool_names);
+                let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+                p.visibility(ctx, (name, host), &tools)
+            }
+        }
     }
 
     /// The gate for a tool that targets no host. See
@@ -1124,7 +1142,12 @@ impl Prompto {
             let hosts: Vec<serde_json::Value> = inv
                 .hosts
                 .iter()
-                .map(|(name, h)| {
+                .filter_map(|(name, h)| {
+                    // With policy on: only hosts the agent has a grant on.
+                    let seen = self.visibility(&ctx, name, h);
+                    if !seen.listed {
+                        return None;
+                    }
                     let mut v = serde_json::json!({
                         "name": name,
                         "ip": h.ip,
@@ -1141,7 +1164,8 @@ impl Prompto {
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     });
                     with_groups(&mut v, &h.groups);
-                    v
+                    hide_vault_path(&mut v, seen);
+                    Some(v)
                 })
                 .collect();
             Ok(serde_json::json!({
@@ -1191,6 +1215,7 @@ impl Prompto {
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             });
             with_groups(&mut v, &h.groups);
+            hide_vault_path(&mut v, self.visibility(&ctx, &canon, h));
             Ok(v)
         }
         .await;
@@ -1810,6 +1835,17 @@ impl Prompto {
 /// ID follows in its own `[request_id=…]` block, like the advisor's.
 /// Add a host's policy `groups` to its inventory view — only when it has
 /// some, so an inventory without groups reads exactly as before E3.
+/// Drop `sudo_password_vault_path` for a caller without a `sudo = true`
+/// grant on the host. The key goes, rather than becoming `null`, which
+/// would claim the host has no vault-held password.
+fn hide_vault_path(v: &mut serde_json::Value, seen: Visibility) {
+    if !seen.sudo
+        && let Some(m) = v.as_object_mut()
+    {
+        m.remove("sudo_password_vault_path");
+    }
+}
+
 fn with_groups(v: &mut serde_json::Value, groups: &[String]) {
     if !groups.is_empty() {
         v["groups"] = groups.into();
