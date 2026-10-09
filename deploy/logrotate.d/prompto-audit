@@ -1,0 +1,19 @@
+# /etc/logrotate.d/prompto-audit — rotate prompto's audit log.
+#
+# Rename-based on purpose. prompto stats the path before every write and
+# reopens it when it is no longer the file it has open, so no signal or
+# postrotate is needed. Do NOT use copytruncate: lines written between
+# the copy and the truncate would be lost, which an audit log can't
+# afford. delaycompress keeps the file just rotated away uncompressed
+# until the next rotation, so a write racing the rename still lands in a
+# file that exists. `prompto audit` reads the .N and .N.gz siblings.
+/var/lib/prompto/audit.jsonl {
+    weekly
+    rotate 52
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocopytruncate
+    create 0640 prompto prompto-audit
+}

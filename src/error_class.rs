@@ -6,17 +6,25 @@
 //! spots it, puts `error_class`, the exit code and a stderr tail into the
 //! MCP error's `data`, and prefixes the message with the class.
 //!
-//! `rsync_sync` classifies its own failures, and `authz::authorize`
+//! It is the one enum for every failure path of every tool, and the
+//! audit log's `error_class` (`crate::audit`). `authz::authorize`
 //! classifies every refusal (`unknown_host`, `refused_capability`,
 //! `refused_self_target`, and with a policy `refused_policy` /
-//! `approval_required`). The enum is meant to grow into
-//! the audit log's `error_class` (roadmap S4.4: `refused_ticket`,
-//! `sudo_guard`, …), so names are stable
-//! `snake_case` strings and nothing here is rsync-specific except the
-//! `rsync_*` variants themselves.
+//! `approval_required`); argument validation is `invalid_args`; a remote
+//! command that ran and failed is classified from its exit status and
+//! stderr by [`classify_exec`] (`ssh_connect`, `ssh_auth`, `timeout`,
+//! `sudo_guard`, `remote_nonzero`); `rsync_sync` adds its own `rsync_*`
+//! and `dest_*` classes. An error that reaches `finish_tool` without a
+//! class is a bug: it is reported as `internal`, logged, and counted in
+//! [`unclassified_count`], which a test sweeping every tool holds at zero.
+//! `aborted` exists only in the audit log: a call cut off before it
+//! finished (shutdown, panic), recorded by a drop guard.
+//! Names are stable `snake_case` strings.
 
+use crate::ssh::{ExecOutput, SUDO_GUARD_EXIT};
 use serde::Serialize;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,10 +69,28 @@ pub enum ErrorClass {
     RsyncTimeout,
     /// prompto's timeout for the call expired and the command was killed.
     Timeout,
+    /// The vault sudo path's guard fired (exit 97): sudo did not read the
+    /// password, so the host has a passwordless rule. Nothing ran.
+    SudoGuard,
+    /// Fetching a secret from vault failed (unreachable, denied, missing
+    /// or unusable field). Nothing ran on the host.
+    Vault,
+    /// A non-SSH service prompto relays to failed (the apytti gateway
+    /// behind `claude_exec`).
+    Upstream,
+    /// Refused by a kill switch (reserved for E5).
+    Killed,
+    /// A required approval ticket was missing or invalid (reserved for
+    /// E6).
+    RefusedTicket,
     /// The remote command exited non-zero for a reason not listed above.
     RemoteNonzero,
     /// prompto itself failed (spawning ssh, a signal, …).
     Internal,
+    /// The call never finished: the client went away or cancelled, the
+    /// handler panicked, or prompto shut down while it ran. Whether the
+    /// action took effect is unknown.
+    Aborted,
 }
 
 impl ErrorClass {
@@ -87,9 +113,62 @@ impl ErrorClass {
             Self::RsyncPartial => "rsync_partial",
             Self::RsyncTimeout => "rsync_timeout",
             Self::Timeout => "timeout",
+            Self::SudoGuard => "sudo_guard",
+            Self::Vault => "vault",
+            Self::Upstream => "upstream",
+            Self::Killed => "killed",
+            Self::RefusedTicket => "refused_ticket",
             Self::RemoteNonzero => "remote_nonzero",
             Self::Internal => "internal",
+            Self::Aborted => "aborted",
         }
+    }
+}
+
+impl ErrorClass {
+    /// Every variant, for exhaustive tests and the CLI.
+    pub const ALL: &'static [ErrorClass] = &[
+        Self::UnknownHost,
+        Self::RefusedCapability,
+        Self::RefusedSelfTarget,
+        Self::RefusedPolicy,
+        Self::ApprovalRequired,
+        Self::InvalidArgs,
+        Self::SshConnect,
+        Self::SshAuth,
+        Self::DestSshConnect,
+        Self::DestSshAuth,
+        Self::RsyncMissing,
+        Self::RsyncUsage,
+        Self::RsyncProtocol,
+        Self::RsyncIo,
+        Self::RsyncPartial,
+        Self::RsyncTimeout,
+        Self::Timeout,
+        Self::SudoGuard,
+        Self::Vault,
+        Self::Upstream,
+        Self::Killed,
+        Self::RefusedTicket,
+        Self::RemoteNonzero,
+        Self::Internal,
+        Self::Aborted,
+    ];
+
+    /// A refusal: the call was stopped before anything ran, by
+    /// authorization (the audit `decision` is `deny`). `invalid_args` is
+    /// not one — the caller's input was wrong, nobody refused it.
+    pub fn is_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::UnknownHost
+                | Self::RefusedCapability
+                | Self::RefusedSelfTarget
+                | Self::RefusedPolicy
+                | Self::ApprovalRequired
+                | Self::Killed
+                | Self::RefusedTicket
+        )
     }
 }
 
@@ -122,6 +201,18 @@ impl ClassifiedError {
             exit_code: None,
             stderr_tail: None,
             message: err.to_string(),
+            rule: None,
+        }
+    }
+
+    /// A remote command that ran and failed: class from [`classify_exec`],
+    /// its exit code, and `message` (which already quotes stderr).
+    pub fn exec_failure(out: &ExecOutput, sudo: bool, message: impl Into<String>) -> Self {
+        Self {
+            class: classify_exec(out, sudo).unwrap_or(ErrorClass::RemoteNonzero),
+            exit_code: out.exit_code,
+            stderr_tail: None,
+            message: message.into(),
             rule: None,
         }
     }
@@ -175,6 +266,106 @@ impl fmt::Display for ClassifiedError {
 
 impl std::error::Error for ClassifiedError {}
 
+/// Return early with a [`ClassifiedError`] of class `$class`:
+/// `fail!(InvalidArgs, "path {p:?} is empty")`.
+#[macro_export]
+macro_rules! fail {
+    ($class:ident, $($arg:tt)*) => {
+        return Err($crate::error_class::ClassifiedError::refused(
+            $crate::error_class::ErrorClass::$class,
+            format!($($arg)*),
+        )
+        .into())
+    };
+}
+
+/// Attach a class to an error that has none. An error that already
+/// carries a [`ClassifiedError`] keeps its own class.
+pub trait Classify<T> {
+    fn class(self, class: ErrorClass) -> anyhow::Result<T>;
+}
+
+impl<T, E: Into<anyhow::Error>> Classify<T> for Result<T, E> {
+    fn class(self, class: ErrorClass) -> anyhow::Result<T> {
+        self.map_err(|e| {
+            let e: anyhow::Error = e.into();
+            if e.downcast_ref::<ClassifiedError>().is_some() {
+                e
+            } else {
+                ClassifiedError::refused(class, format!("{e:#}")).into()
+            }
+        })
+    }
+}
+
+impl<T> Classify<T> for Option<T> {
+    fn class(self, class: ErrorClass) -> anyhow::Result<T> {
+        self.ok_or_else(|| ClassifiedError::refused(class, "missing value").into())
+    }
+}
+
+/// Why a remote command failed, or `None` if it succeeded (exit 0, not
+/// timed out). `sudo` says whether it ran through prompto's sudo path,
+/// where exit 97 with the guard's message is [`ErrorClass::SudoGuard`].
+///
+/// Exit 255 is OpenSSH's own failure status: the connection or the login
+/// failed, told apart by ssh's messages. A remote command can exit 255
+/// too; without ssh's messages that is `remote_nonzero`.
+pub fn classify_exec(out: &ExecOutput, sudo: bool) -> Option<ErrorClass> {
+    if out.timed_out {
+        return Some(ErrorClass::Timeout);
+    }
+    let stderr = out.stderr.as_str();
+    match out.exit_code {
+        Some(0) => None,
+        // Killed by a signal, or prompto failed to feed stdin.
+        None => Some(ErrorClass::Internal),
+        Some(255) if ssh_auth_refused(stderr) => Some(ErrorClass::SshAuth),
+        Some(255) if ssh_connect_failed(stderr) => Some(ErrorClass::SshConnect),
+        Some(SUDO_GUARD_EXIT) if sudo && stderr.contains(SUDO_GUARD_MESSAGE) => {
+            Some(ErrorClass::SudoGuard)
+        }
+        Some(_) => Some(ErrorClass::RemoteNonzero),
+    }
+}
+
+/// What the sudo guard prints on stderr (see `ssh::SUDO_STDIN_SHELL`).
+pub const SUDO_GUARD_MESSAGE: &str = "prompto: sudo did not read the password";
+
+/// OpenSSH refused the login. Its message lists auth methods —
+/// `Permission denied (publickey,password).` — which is what tells it
+/// apart from a file error such as rsync's `Permission denied (13)`.
+pub fn ssh_auth_refused(stderr: &str) -> bool {
+    stderr
+        .match_indices("Permission denied (")
+        .any(|(i, m)| stderr[i + m.len()..].starts_with(|c: char| c.is_ascii_alphabetic()))
+        || stderr.contains("Permission denied, please try again")
+        || stderr.contains("Too many authentication failures")
+        || stderr.contains("Host key verification failed")
+}
+
+/// OpenSSH could not open the connection at all.
+pub fn ssh_connect_failed(stderr: &str) -> bool {
+    stderr.contains("ssh: connect to host")
+        || stderr.contains("ssh: Could not resolve hostname")
+        || stderr.contains("kex_exchange_identification")
+        || stderr.contains("Connection closed by")
+        || stderr.contains("Connection reset by")
+}
+
+static UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// Note an error that reached `finish_tool` with no class. That is a bug
+/// in the tool; it is reported as `internal`.
+pub fn note_unclassified() {
+    UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many tool errors went unclassified since the process started.
+pub fn unclassified_count() -> u64 {
+    UNCLASSIFIED.load(Ordering::Relaxed)
+}
+
 /// Lines kept by [`stderr_tail`].
 pub const TAIL_LINES: usize = 10;
 /// Byte cap of [`stderr_tail`].
@@ -224,6 +415,105 @@ mod tests {
                 serde_json::Value::String(c.as_str().into())
             );
         }
+    }
+
+    #[test]
+    fn all_lists_every_variant_once_with_unique_names() {
+        let names: std::collections::HashSet<_> =
+            ErrorClass::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), ErrorClass::ALL.len());
+        // A new variant must be added to ALL: the match below won't
+        // compile without it, and the count must then be bumped.
+        let n = |c: ErrorClass| match c {
+            ErrorClass::UnknownHost
+            | ErrorClass::RefusedCapability
+            | ErrorClass::RefusedSelfTarget
+            | ErrorClass::RefusedPolicy
+            | ErrorClass::ApprovalRequired
+            | ErrorClass::InvalidArgs
+            | ErrorClass::SshConnect
+            | ErrorClass::SshAuth
+            | ErrorClass::DestSshConnect
+            | ErrorClass::DestSshAuth
+            | ErrorClass::RsyncMissing
+            | ErrorClass::RsyncUsage
+            | ErrorClass::RsyncProtocol
+            | ErrorClass::RsyncIo
+            | ErrorClass::RsyncPartial
+            | ErrorClass::RsyncTimeout
+            | ErrorClass::Timeout
+            | ErrorClass::SudoGuard
+            | ErrorClass::Vault
+            | ErrorClass::Upstream
+            | ErrorClass::Killed
+            | ErrorClass::RefusedTicket
+            | ErrorClass::RemoteNonzero
+            | ErrorClass::Internal
+            | ErrorClass::Aborted => 1,
+        };
+        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 25);
+    }
+
+    fn out(code: Option<i32>, stderr: &str, timed_out: bool) -> ExecOutput {
+        ExecOutput {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            exit_code: code,
+            timed_out,
+        }
+    }
+
+    #[test]
+    fn classify_exec_names_each_failure() {
+        let c = |code, err, sudo| classify_exec(&out(code, err, false), sudo);
+        assert_eq!(c(Some(0), "", false), None);
+        assert_eq!(
+            classify_exec(&out(None, "", true), false),
+            Some(ErrorClass::Timeout)
+        );
+        assert_eq!(c(None, "", false), Some(ErrorClass::Internal));
+        assert_eq!(
+            c(
+                Some(255),
+                "ssh: connect to host 192.0.2.1 port 22: Connection refused",
+                false
+            ),
+            Some(ErrorClass::SshConnect)
+        );
+        assert_eq!(
+            c(Some(255), "u@h: Permission denied (publickey).", false),
+            Some(ErrorClass::SshAuth)
+        );
+        assert_eq!(c(Some(255), "", false), Some(ErrorClass::RemoteNonzero));
+        let guard =
+            "prompto: sudo did not read the password - this host has a passwordless sudo rule";
+        assert_eq!(c(Some(97), guard, true), Some(ErrorClass::SudoGuard));
+        // Only on the sudo path, and only with the guard's message.
+        assert_eq!(c(Some(97), guard, false), Some(ErrorClass::RemoteNonzero));
+        assert_eq!(c(Some(97), "", true), Some(ErrorClass::RemoteNonzero));
+        assert_eq!(c(Some(1), "nope", false), Some(ErrorClass::RemoteNonzero));
+    }
+
+    /// The guard's message in the shipped shell text is the one
+    /// `classify_exec` looks for.
+    #[test]
+    fn guard_message_matches_the_sudo_shell() {
+        assert!(crate::ssh::SUDO_STDIN_SHELL.contains(SUDO_GUARD_MESSAGE));
+    }
+
+    #[test]
+    fn classify_keeps_an_existing_class() {
+        let inner: anyhow::Result<()> =
+            Err(ClassifiedError::refused(ErrorClass::Timeout, "slow").into());
+        let e = inner.class(ErrorClass::Internal).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<ClassifiedError>().unwrap().class,
+            ErrorClass::Timeout
+        );
+        let plain: anyhow::Result<()> = Err(anyhow::anyhow!("boom"));
+        let e = plain.class(ErrorClass::Vault).unwrap_err();
+        let c = e.downcast_ref::<ClassifiedError>().unwrap();
+        assert_eq!((c.class, c.message.as_str()), (ErrorClass::Vault, "boom"));
     }
 
     #[test]

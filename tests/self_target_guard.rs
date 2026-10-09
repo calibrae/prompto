@@ -87,6 +87,7 @@ async fn serve(
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode,
         auth: Default::default(),
+        audit: Default::default(),
         cancel: cancel.clone(),
     });
 

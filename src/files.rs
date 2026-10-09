@@ -2,7 +2,7 @@
 //! `ssh host cat /path` and `ssh host "cat > /path" < content` dance
 //! with a tight, validated, capability-gated pair.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::time::Duration;
 
 use crate::ctx::CallCtx;
@@ -19,17 +19,20 @@ pub const MAX_READ_BYTES: u64 = 1_048_576;
 /// let the path escape the argument position.
 pub fn validate_path(p: &str) -> Result<()> {
     if p.is_empty() {
-        bail!("path is empty");
+        crate::fail!(InvalidArgs, "path is empty");
     }
     if p.len() > 4096 {
-        bail!("path too long");
+        crate::fail!(InvalidArgs, "path too long");
     }
     let bad = [
         '`', '$', '\\', '"', '\'', '\n', '\r', ';', '&', '|', '>', '<', '*', '?', '(', ')', '{',
         '}', '\t', ' ',
     ];
     if p.chars().any(|c| bad.contains(&c)) {
-        bail!("path {p:?} contains shell metacharacter or whitespace");
+        crate::fail!(
+            InvalidArgs,
+            "path {p:?} contains shell metacharacter or whitespace"
+        );
     }
     Ok(())
 }
@@ -38,13 +41,13 @@ pub fn validate_path(p: &str) -> Result<()> {
 /// 5 chars (so e.g. "01777" still fits).
 pub fn validate_mode(m: &str) -> Result<()> {
     if m.is_empty() {
-        bail!("mode is empty");
+        crate::fail!(InvalidArgs, "mode is empty");
     }
     if m.len() > 5 {
-        bail!("mode too long");
+        crate::fail!(InvalidArgs, "mode too long");
     }
     if !m.chars().all(|c| c.is_ascii_digit()) {
-        bail!("mode {m:?} must be octal digits only");
+        crate::fail!(InvalidArgs, "mode {m:?} must be octal digits only");
     }
     Ok(())
 }
@@ -65,11 +68,16 @@ pub async fn read(
         .exec(ctx, host, &cmd, Some(Duration::from_secs(15)), false)
         .await?;
     if !res.ok() {
-        bail!(
-            "head failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "head failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res)
 }
@@ -98,11 +106,16 @@ pub async fn write(
         )
         .await?;
     if !res.ok() {
-        bail!(
-            "tee {path} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            sudo,
+            format!(
+                "tee {path} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res)
 }
@@ -361,11 +374,16 @@ pub async fn chmod(
         .exec(ctx, host, &cmd, Some(Duration::from_secs(10)), sudo)
         .await?;
     if !res.ok() {
-        bail!(
-            "chmod {mode} {path} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            sudo,
+            format!(
+                "chmod {mode} {path} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(())
 }

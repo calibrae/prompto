@@ -7,6 +7,8 @@
 //! LAN.
 
 use anyhow::{Context, Result};
+
+use crate::error_class::{ClassifiedError, Classify, ErrorClass};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -61,15 +63,26 @@ impl ApyttiClient {
             .timeout(total_timeout)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("POST {url}: {e:#}"))?;
+            .map_err(|e| {
+                let class = if e.is_timeout() {
+                    ErrorClass::Timeout
+                } else {
+                    ErrorClass::Upstream
+                };
+                ClassifiedError::refused(class, format!("POST {url}: {e:#}"))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("apytti returned {status}: {}", body.trim());
+            crate::fail!(Upstream, "apytti returned {status}: {}", body.trim());
         }
-        let parsed: AskResponse = resp.json().await.context("parse apytti response")?;
+        let parsed: AskResponse = resp
+            .json()
+            .await
+            .context("parse apytti response")
+            .class(ErrorClass::Upstream)?;
         if let Some(err) = &parsed.error {
-            anyhow::bail!("apytti reported error: {err}");
+            crate::fail!(Upstream, "apytti reported error: {err}");
         }
         Ok(parsed)
     }

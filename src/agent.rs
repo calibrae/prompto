@@ -327,6 +327,10 @@ pub struct Identity {
     /// `None` only with `PROMPTO_AUTH=off`.
     pub agent: Option<Agent>,
     pub session_id: Option<String>,
+    /// Why an `optional`-mode caller ended up `anonymous` although it
+    /// presented a credential (`revoked token for <agent>`, `invalid
+    /// token`). Goes into the audit record as `auth_note`.
+    pub auth_note: Option<String>,
 }
 
 impl Identity {
@@ -338,6 +342,7 @@ impl Identity {
                 groups: vec![],
             }),
             session_id: None,
+            auth_note: None,
         }
     }
 
@@ -348,6 +353,7 @@ impl Identity {
                 groups: vec![],
             }),
             session_id,
+            auth_note: None,
         }
     }
 }
@@ -438,6 +444,7 @@ pub fn authenticate_request(
         AuthResult::Valid(agent) => Decision::Proceed(Identity {
             agent: Some(agent),
             session_id,
+            auth_note: None,
         }),
         AuthResult::Revoked(name) => {
             tracing::warn!(
@@ -450,7 +457,10 @@ pub fn authenticate_request(
             if required {
                 Decision::Reject("revoked token")
             } else {
-                Decision::Proceed(Identity::anonymous(session_id))
+                Decision::Proceed(Identity {
+                    auth_note: Some(format!("revoked token for {name}")),
+                    ..Identity::anonymous(session_id)
+                })
             }
         }
         AuthResult::Unknown => {
@@ -463,7 +473,10 @@ pub fn authenticate_request(
             if required {
                 Decision::Reject("invalid bearer token")
             } else {
-                Decision::Proceed(Identity::anonymous(session_id))
+                Decision::Proceed(Identity {
+                    auth_note: Some("invalid token".into()),
+                    ..Identity::anonymous(session_id)
+                })
             }
         }
     }
@@ -798,6 +811,13 @@ mod tests {
                     groups: vec!["g".into()],
                 }),
                 session_id: s.map(Into::into),
+                auth_note: None,
+            })
+        };
+        let anon_note = |note: &str| {
+            Decision::Proceed(Identity {
+                auth_note: Some(note.into()),
+                ..Identity::anonymous(None)
             })
         };
 
@@ -812,11 +832,11 @@ mod tests {
         assert_eq!(authenticate_request(&opt, None, None, None), anon);
         assert_eq!(
             authenticate_request(&opt, Some("Bearer nope"), None, None),
-            anon
+            anon_note("invalid token")
         );
         assert_eq!(
             authenticate_request(&opt, Some("Bearer old"), None, None),
-            anon
+            anon_note("revoked token for beta")
         );
         assert_eq!(
             authenticate_request(&opt, Some("Bearer good"), Some("s1"), None),

@@ -1,10 +1,11 @@
 //! prompto — bootstrap, transport selection, SIGHUP-driven inventory,
-//! agents and policy reload, and the `gain` / `agent` / `policy` CLI
-//! subcommands.
+//! agents and policy reload, and the `gain` / `agent` / `policy` /
+//! `audit` CLI subcommands.
 
 use anyhow::{Context, Result};
 use mcp_gain::Tracker;
 use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode, Identity};
+use prompto::audit::{self, Audit, AuditLog};
 use prompto::baselines::BASELINES;
 use prompto::caller;
 use prompto::inventory::InventoryStore;
@@ -53,6 +54,9 @@ pub struct Config {
     pub gain_enabled: bool,
     pub agents_path: PathBuf,
     pub policy_path: PathBuf,
+    pub audit_path: PathBuf,
+    /// `PROMPTO_AUDIT_GROUP`: group for an audit file prompto creates.
+    pub audit_group: Option<String>,
 }
 
 impl Config {
@@ -67,18 +71,103 @@ impl Config {
             gain_enabled: env_bool("PROMPTO_GAIN_ENABLED", true),
             agents_path: env_or("PROMPTO_AGENTS", "/etc/prompto/agents.toml").into(),
             policy_path: env_or("PROMPTO_POLICY", "/etc/prompto/policy.toml").into(),
+            audit_path: env_or("PROMPTO_AUDIT_LOG", audit::DEFAULT_PATH).into(),
+            audit_group: std::env::var("PROMPTO_AUDIT_GROUP")
+                .ok()
+                .filter(|g| !g.trim().is_empty()),
         }
     }
 }
 
+/// Logs go to stderr (journald captures them under systemd). Audit
+/// records (`audit::TARGET`) are always kept at info, whatever
+/// `RUST_LOG` says. Under systemd (`JOURNAL_STREAM` set) they go to the
+/// journal natively instead, as structured fields prefixed `AUDIT_`
+/// (`journalctl AUDIT_AGENT=dev AUDIT_DECISION=deny`), and are left out
+/// of the stderr stream so they aren't logged twice.
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("prompto=info")),
-        )
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::prelude::*;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("prompto=info"))
+        .add_directive(
+            format!("{}=info", audit::TARGET)
+                .parse()
+                .expect("static directive"),
+        );
+    let stderr = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .compact()
-        .init();
+        .compact();
+    let journald = std::env::var_os("JOURNAL_STREAM")
+        .and_then(|_| tracing_journald::layer().ok())
+        .map(|j| j.with_field_prefix(Some("AUDIT".into())));
+    match journald {
+        Some(j) => tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr.with_filter(filter_fn(|m| m.target() != audit::TARGET)))
+            .with(j.with_filter(filter_fn(|m| m.target() == audit::TARGET)))
+            .init(),
+        None => tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr)
+            .init(),
+    }
+}
+
+/// Open the audit log. With auth on it is strict, and a log that can't
+/// be opened stops the server: it would refuse every call anyway. With
+/// auth off a failure only warns; records go to the journal until the
+/// file can be written (each write retries).
+fn open_audit(cfg: &Config, mode: AuthMode) -> Result<Audit> {
+    let strict = mode != AuthMode::Off;
+    let gid = match &cfg.audit_group {
+        None => None,
+        Some(g) => match audit::resolve_group(g) {
+            Ok(gid) => Some(gid),
+            Err(e) if strict => {
+                return Err(e).with_context(|| format!("PROMPTO_AUDIT_GROUP={g}"));
+            }
+            Err(e) => {
+                tracing::warn!(group = %g, error = %e, "PROMPTO_AUDIT_GROUP ignored");
+                None
+            }
+        },
+    };
+    let path = cfg.audit_path.clone();
+    let log = match AuditLog::open(path.clone(), gid, strict) {
+        Ok(log) => log,
+        Err(e) if strict => {
+            return Err(e).with_context(|| {
+                format!(
+                    "opening the audit log {} (PROMPTO_AUTH={} refuses every call it \
+                     cannot record)",
+                    path.display(),
+                    mode.as_str()
+                )
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "cannot open the audit log — PROMPTO_AUTH=off, so calls continue; records go \
+                 to the journal until it can be written"
+            );
+            AuditLog::unopened(path.clone(), gid, strict)
+        }
+    };
+    tracing::info!(
+        path = %path.display(),
+        strict,
+        "audit log: every tool call is recorded{}",
+        if strict {
+            "; a call that can't be recorded is refused"
+        } else {
+            ""
+        }
+    );
+    Ok(Audit::new(log))
 }
 
 /// Policy and the files it is checked against, for the SIGHUP lint.
@@ -440,6 +529,114 @@ fn run_policy_cli(cfg: &Config, args: &[String]) -> Result<i32> {
     }
 }
 
+const AUDIT_USAGE: &str = "\
+Usage: prompto audit [--agent NAME] [--host HOST] [--tool TOOL] [--since 10m|ISO]
+                     [--request-id ID] [--decision allow|deny] [--json]
+
+Reads $PROMPTO_AUDIT_LOG (default /var/lib/prompto/audit.jsonl) and its
+rotated siblings (.1, .2.gz, …; only those written since --since). Every
+given filter must match; --host matches the host, the name as typed, or
+rsync's dest. Default output is a table, oldest first; --json prints the
+matching records as JSON lines.";
+
+/// `prompto audit …`: query the audit log.
+fn run_audit_cli(cfg: &Config, args: &[String]) -> Result<()> {
+    let mut f = audit::Filter::default();
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((k, v)) if k.starts_with("--") => (k, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let mut val = || -> Result<String> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => Ok(it
+                    .next()
+                    .with_context(|| format!("{flag} requires a value"))?
+                    .clone()),
+            }
+        };
+        match flag {
+            "--agent" => f.agent = Some(val()?),
+            "--host" => f.host = Some(val()?),
+            "--tool" => f.tool = Some(val()?),
+            "--request-id" => f.request_id = Some(val()?),
+            "--since" => f.since = Some(audit::parse_since(&val()?, chrono::Utc::now())?),
+            "--decision" => {
+                let d = val()?;
+                if d != "allow" && d != "deny" {
+                    anyhow::bail!("--decision must be allow or deny");
+                }
+                f.decision = Some(d);
+            }
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{AUDIT_USAGE}");
+                return Ok(());
+            }
+            other => anyhow::bail!("unexpected argument {other:?}\n{AUDIT_USAGE}"),
+        }
+    }
+    let mut rows = Vec::new();
+    let (mut seen, mut bad) = (0usize, 0usize);
+    for file in audit::files_to_read(&cfg.audit_path, f.since) {
+        for line in audit::read_file(&file)?.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // A fragment left by a cut-short write costs only itself.
+            let (found, fragments) = audit::parse_line(line);
+            bad += fragments;
+            let Some((rec, text)) = found else {
+                continue;
+            };
+            seen += 1;
+            if !f.matches(&rec) {
+                continue;
+            }
+            if json {
+                println!("{}", audit::json_for_terminal(text));
+            } else {
+                rows.push(audit::table_row(&rec));
+            }
+        }
+    }
+    if !json {
+        let head = [
+            "TIME (UTC)",
+            "AGENT",
+            "TOOL",
+            "HOST",
+            "DECISION",
+            "RESULT",
+            "DURATION",
+            "DETAIL",
+        ]
+        .map(String::from);
+        let mut width = [0usize; 7];
+        for r in std::iter::once(&head).chain(&rows) {
+            for (w, c) in width.iter_mut().zip(r.iter()) {
+                *w = (*w).max(c.chars().count());
+            }
+        }
+        for r in std::iter::once(&head).chain(&rows) {
+            let mut line = String::new();
+            for (w, c) in width.iter().zip(r.iter()) {
+                line.push_str(&format!("{c:<w$}  "));
+            }
+            line.push_str(&r[7]);
+            println!("{}", line.trim_end());
+        }
+        eprintln!("{} of {seen} records", rows.len());
+    }
+    if bad > 0 {
+        eprintln!("warning: skipped {bad} unreadable fragments (not valid JSON)");
+    }
+    Ok(())
+}
+
 fn run_gain_cli(cfg: &Config, args: &[String]) -> Result<()> {
     let mut json = false;
     let mut since_secs: Option<u64> = None;
@@ -495,6 +692,9 @@ async fn main() -> Result<()> {
     }
     if raw_args.len() >= 2 && raw_args[1] == "agent" {
         return run_agent_cli(&cfg, &raw_args[2..]);
+    }
+    if raw_args.len() >= 2 && raw_args[1] == "audit" {
+        return run_audit_cli(&cfg, &raw_args[2..]);
     }
     if raw_args.len() >= 2 && raw_args[1] == "policy" {
         let code = run_policy_cli(&cfg, &raw_args[2..])?;
@@ -576,6 +776,7 @@ async fn main() -> Result<()> {
         _ => None,
     };
     spawn_sighup_reloader(store.clone(), reload, auth_mode);
+    let audit = open_audit(&cfg, auth_mode)?;
 
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
     let needs_vault: Vec<String> = store
@@ -630,6 +831,7 @@ async fn main() -> Result<()> {
         let service = prompto
             .with_identity(Identity::local())
             .with_policy(auth.enforcer())
+            .with_audit(audit)
             .serve(stdio())
             .await
             .context("stdio serve")?;
@@ -712,6 +914,7 @@ async fn main() -> Result<()> {
             allowed_hosts,
             legacy_session_mode,
             auth,
+            audit,
             cancel: cancel.clone(),
         });
 

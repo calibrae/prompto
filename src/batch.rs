@@ -13,7 +13,7 @@
 //! lets the parser ignore stray banner lines from `.bashrc` / MOTD /
 //! whatever else the remote shell sprinkles before the script runs.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::Serialize;
@@ -132,7 +132,8 @@ pub fn parse_output(stdout: &str, commands: &[String]) -> Result<BatchOutput> {
     let mut out = Vec::with_capacity(commands.len());
     for (i, slot) in items.into_iter().enumerate() {
         let Some(item) = slot else {
-            bail!(
+            crate::fail!(
+                RemoteNonzero,
                 "batch protocol: missing record for command {} (\"{}\"); remote bash may have crashed mid-batch",
                 i,
                 commands[i]

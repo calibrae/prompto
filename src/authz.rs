@@ -83,12 +83,21 @@ pub const ARBITRARY_EXEC_TOOLS: &[(&str, Capability)] = &[
     ("claude_exec", Capability::ClaudeExec),
     // A stdio server's command runs on the client whenever claude starts.
     ("mcp_add", Capability::ClaudeAdmin),
+    // Writing a file the user's shell reads (~/.bashrc, ~/.ssh/rc, a
+    // crontab, a systemd user unit) is code execution as ssh_user. Its
+    // `sudo = true` variant is root-capable (`SUDO_FLAG_TOOLS`); this is
+    // the other one.
+    ("file_write", Capability::Exec),
+    // The same, on the dest host: files land there as its ssh_user.
+    ("rsync_sync", Capability::Exec),
 ];
 
 /// Every other tool: neither root-capable nor arbitrary exec. Each tool
 /// is in exactly one of [`ROOT_TOOLS`] ∪ [`SUDO_FLAG_TOOLS`],
-/// [`ARBITRARY_EXEC_TOOLS`] and this list — a test fails on a tool that
-/// isn't, so a new tool can't fall under `tools = ["*"]` unclassified.
+/// [`ARBITRARY_EXEC_TOOLS`] and this list — except that a
+/// [`SUDO_FLAG_TOOLS`] tool is also arbitrary exec without the flag
+/// (`file_write`). A test fails on a tool that isn't, so a new tool can't
+/// fall under `tools = ["*"]` unclassified.
 pub const ORDINARY_TOOLS: &[&str] = &[
     "host_wake",
     "host_status",
@@ -100,7 +109,6 @@ pub const ORDINARY_TOOLS: &[&str] = &[
     "file_read",
     "file_list",
     "file_stat",
-    "rsync_sync",
     "port_scan",
     "inventory_list",
     "inventory_get_host",

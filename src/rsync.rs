@@ -37,7 +37,9 @@ use anyhow::{Result, bail};
 use std::time::Duration;
 
 use crate::ctx::CallCtx;
-use crate::error_class::{ClassifiedError, ErrorClass, stderr_tail};
+use crate::error_class::{
+    ClassifiedError, ErrorClass, ssh_auth_refused, ssh_connect_failed, stderr_tail,
+};
 use crate::files::validate_path;
 use crate::inventory::HostConfig;
 use crate::ssh::{ExecOutput, SshClient};
@@ -47,17 +49,20 @@ use crate::ssh::{ExecOutput, SshClient};
 /// shell metacharacters that could break out of the rsync arg.
 pub fn validate_exclude(p: &str) -> Result<()> {
     if p.is_empty() {
-        bail!("exclude pattern is empty");
+        crate::fail!(InvalidArgs, "exclude pattern is empty");
     }
     if p.len() > 256 {
-        bail!("exclude pattern too long");
+        crate::fail!(InvalidArgs, "exclude pattern too long");
     }
     let bad = [
         '`', '$', '\\', '"', '\'', '\n', '\r', ';', '&', '|', '>', '<', '(', ')', '{', '}', '\t',
         ' ',
     ];
     if p.chars().any(|c| bad.contains(&c)) {
-        bail!("exclude pattern {p:?} contains shell metacharacter or whitespace");
+        crate::fail!(
+            InvalidArgs,
+            "exclude pattern {p:?} contains shell metacharacter or whitespace"
+        );
     }
     Ok(())
 }
@@ -189,27 +194,6 @@ fn rsync_spoke(stderr: &str) -> bool {
         let l = l.trim_start();
         l.starts_with("rsync: ") || l.starts_with("rsync error: ")
     })
-}
-
-/// OpenSSH refused the login. Its message lists auth methods —
-/// `Permission denied (publickey,password).` — which is what tells it
-/// apart from rsync's file errors, `Permission denied (13)`.
-fn ssh_auth_refused(stderr: &str) -> bool {
-    stderr
-        .match_indices("Permission denied (")
-        .any(|(i, m)| stderr[i + m.len()..].starts_with(|c: char| c.is_ascii_alphabetic()))
-        || stderr.contains("Permission denied, please try again")
-        || stderr.contains("Too many authentication failures")
-        || stderr.contains("Host key verification failed")
-}
-
-/// OpenSSH could not open the connection at all.
-fn ssh_connect_failed(stderr: &str) -> bool {
-    stderr.contains("ssh: connect to host")
-        || stderr.contains("ssh: Could not resolve hostname")
-        || stderr.contains("kex_exchange_identification")
-        || stderr.contains("Connection closed by")
-        || stderr.contains("Connection reset by")
 }
 
 fn command_not_found(stderr: &str) -> bool {

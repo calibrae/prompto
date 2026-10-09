@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::ctx::CallCtx;
+use crate::error_class::{Classify, ErrorClass};
 use crate::inventory::{HostConfig, RequestIdEnv};
 use crate::vault::VaultClient;
 use std::sync::Arc;
@@ -168,7 +169,7 @@ impl SshClient {
         sudo: bool,
     ) -> Result<ExecOutput> {
         if cmd.trim().is_empty() {
-            bail!("empty command");
+            crate::fail!(InvalidArgs, "empty command");
         }
         if sudo {
             if let Some(pw) = self.sudo_password(host).await? {
@@ -205,7 +206,7 @@ impl SshClient {
         sudo: bool,
     ) -> Result<ExecOutput> {
         if cmd.trim().is_empty() {
-            bail!("empty command");
+            crate::fail!(InvalidArgs, "empty command");
         }
         if sudo {
             if let Some(pw) = self.sudo_password(host).await? {
@@ -225,8 +226,15 @@ impl SshClient {
             .await
     }
 
-    /// The host's sudo password from vault, if it declares one.
+    /// The host's sudo password from vault, if it declares one. Every
+    /// failure is classified `vault`: nothing has run on the host yet.
     async fn sudo_password(&self, host: &HostConfig) -> Result<Option<String>> {
+        self.fetch_sudo_password(host)
+            .await
+            .class(crate::error_class::ErrorClass::Vault)
+    }
+
+    async fn fetch_sudo_password(&self, host: &HostConfig) -> Result<Option<String>> {
         let Some(path) = host.sudo_password_vault_path.as_deref() else {
             return Ok(None);
         };
@@ -277,7 +285,10 @@ impl SshClient {
             .kill_on_drop(true);
 
         let dur = cmd_timeout.unwrap_or(self.default_timeout);
-        let mut child = command.spawn().context("spawn ssh")?;
+        let mut child = command
+            .spawn()
+            .context("spawn ssh")
+            .class(ErrorClass::Internal)?;
 
         if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, child.stdin.take()) {
             if let Err(e) = stdin.write_all(bytes).await {
@@ -300,7 +311,9 @@ impl SshClient {
                 exit_code: out.status.code(),
                 timed_out: false,
             }),
-            Ok(Err(e)) => Err(e).context("ssh wait_with_output"),
+            Ok(Err(e)) => Err(e)
+                .context("ssh wait_with_output")
+                .class(ErrorClass::Internal),
             Err(_) => Ok(ExecOutput {
                 stdout: String::new(),
                 stderr: format!("ssh command timed out after {}s", dur.as_secs()),

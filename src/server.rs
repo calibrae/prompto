@@ -8,6 +8,7 @@
 
 use crate::advisor::Advisor;
 use crate::agent::{self, AuthConfig, Decision};
+use crate::audit::{self, Audit};
 use crate::authz::Need;
 use crate::caller;
 use crate::error_class::ErrorClass;
@@ -74,6 +75,9 @@ pub struct HttpParams {
     /// `PROMPTO_AUTH` and the agent token store. `Default` is auth off,
     /// which is today's behaviour.
     pub auth: AuthConfig,
+    /// The audit log (`crate::audit`): every tool call, `GET /log` and
+    /// every 401.
+    pub audit: Audit,
     pub cancel: CancellationToken,
 }
 
@@ -92,17 +96,22 @@ async fn capture_caller_ip(
 ) -> Response {
     // Resolve inside a block so nothing borrowing `req` survives into
     // the await below (the future must stay `Send`).
-    let client = {
+    let (client, ua) = {
         let headers = req.headers();
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-        caller::resolve_client_ip(
+        let client = caller::resolve_client_ip(
             addr.ip(),
             &trusted,
             get("x-real-ip"),
             get("x-forwarded-for"),
-        )
+        );
+        (client, get("user-agent").map(str::to_string))
     };
-    caller::scoped(client, next.run(req)).await
+    caller::scoped(
+        client,
+        caller::scoped_user_agent(ua.as_deref(), next.run(req)),
+    )
+    .await
 }
 
 /// axum middleware: authenticate the caller (`PROMPTO_AUTH`) and install
@@ -117,9 +126,22 @@ async fn capture_caller_ip(
 async fn authenticate(
     auth: AuthConfig,
     owners: SessionOwners,
+    audit: Audit,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // Every 401 is an audit record (`type = auth`, rate-limited).
+    let refuse = |path: &str, reason: &str, session: Option<String>, mcp: Option<String>| {
+        audit.write_auth(
+            caller::current(),
+            caller::user_agent(),
+            session,
+            mcp,
+            path,
+            reason,
+        );
+        unauthorized(path, reason)
+    };
     let decision = {
         let headers = req.headers();
         // A header that isn't visible ASCII is "present but invalid",
@@ -154,11 +176,25 @@ async fn authenticate(
                     mode = auth.mode.as_str(),
                     "refused: Mcp-Session-Id belongs to another agent"
                 );
-                return unauthorized(req.uri().path(), "session belongs to another agent");
+                // Both IDs shortened as in the journal line above: the
+                // record must not hand out a replayable session handle.
+                return refuse(
+                    req.uri().path(),
+                    "session belongs to another agent",
+                    id.session_id.as_deref().map(sessions::redact),
+                    Some(sessions::redact(mcp_session)),
+                );
             }
             agent::scoped(id, next.run(req)).await
         }
-        Decision::Reject(reason) => unauthorized(req.uri().path(), reason),
+        Decision::Reject(reason) => {
+            let session = req
+                .headers()
+                .get(agent::SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(agent::parse_session);
+            refuse(req.uri().path(), reason, session, None)
+        }
     }
 }
 
@@ -205,6 +241,7 @@ struct LogState {
     store: InventoryStore,
     ssh: Arc<SshClient>,
     policy: Option<crate::policy::Enforcer>,
+    audit: Audit,
 }
 
 #[derive(serde::Deserialize)]
@@ -236,23 +273,50 @@ async fn log_handler(
     axum::extract::State(state): axum::extract::State<LogState>,
     axum::extract::Query(q): axum::extract::Query<LogQuery>,
 ) -> impl axum::response::IntoResponse {
-    let ctx = crate::ctx::CallCtx::new(caller::current()).with_identity(agent::current());
-    let status_and_body = log_tail(&state, &ctx, &q).await;
-    ([(REQUEST_ID_HEADER, ctx.request_id())], status_and_body)
+    let mut ctx = crate::ctx::CallCtx::new(caller::current()).with_identity(agent::current());
+    ctx.user_agent = caller::user_agent();
+    let (status, body, err) = match log_tail(&state, &ctx, &q).await {
+        Ok(out) => (axum::http::StatusCode::OK, out, None),
+        Err((status, e)) => (status, format!("{e:#}\n"), Some(e)),
+    };
+    audit_log_call(&state, &ctx, &q, err.as_ref(), body.len() as u64);
+    ([(REQUEST_ID_HEADER, ctx.request_id())], (status, body))
+}
+
+/// `/log`'s audit record: the call it is, `service_logs`.
+fn audit_log_call(
+    state: &LogState,
+    ctx: &crate::ctx::CallCtx,
+    q: &LogQuery,
+    err: Option<&anyhow::Error>,
+    bytes: u64,
+) {
+    let args = serde_json::json!({ "host": q.host, "unit": q.unit, "lines": q.lines });
+    let payload = serde_json::Value::Null;
+    let outcome = match err {
+        Some(e) => audit::Outcome::Failure(e),
+        None => audit::Outcome::Success(&payload),
+    };
+    let verdict = audit::judge("service_logs", &outcome, &ctx.notes(), true);
+    let mut rec = audit::tool_record(ctx, "service_logs", args).with_verdict(verdict);
+    (rec.host, rec.queried_as) = audit::resolve_host(&state.store.snapshot(), Some(&q.host));
+    rec.path = Some("/log".into());
+    rec.bytes = bytes;
+    state.audit.write(rec);
 }
 
 async fn log_tail(
     state: &LogState,
     ctx: &crate::ctx::CallCtx,
     q: &LogQuery,
-) -> (axum::http::StatusCode, String) {
+) -> Result<String, (axum::http::StatusCode, anyhow::Error)> {
     use axum::http::StatusCode;
 
     // Validate up front so a malformed unit is a 400 (caller's fault),
     // not a 502 from the exec layer. `journalctl_tail` re-checks — this
     // is for the status code, never the safety.
     if let Err(e) = crate::claudemgr::validate_unit_name(&q.unit) {
-        return (StatusCode::BAD_REQUEST, format!("{e}\n"));
+        return Err((StatusCode::BAD_REQUEST, e));
     }
     // Same gate as the tool, under the tool's name, so `/log` keeps
     // exactly the tool's limits — the self-target guard included.
@@ -272,14 +336,21 @@ async fn log_tail(
                 ErrorClass::RefusedPolicy | ErrorClass::ApprovalRequired => StatusCode::FORBIDDEN,
                 _ => StatusCode::BAD_REQUEST,
             };
-            return (status, format!("{e}\n"));
+            return Err((status, e.into()));
         }
     };
-    let lines = q.lines.unwrap_or(50);
-    match crate::claudemgr::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines).await {
-        Ok(out) => (StatusCode::OK, out),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}\n")),
+    // Same audit gate as the tools: nothing runs that can't be recorded.
+    if let Err(e) = state.audit.preflight(ctx, "service_logs") {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, e.into()));
     }
+    ctx.note(|n| {
+        n.authorized = true;
+        n.rule = target.rule.clone();
+    });
+    let lines = q.lines.unwrap_or(50);
+    crate::claudemgr::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
 /// Response header carrying the request ID on `GET /log`.
@@ -319,6 +390,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         stop_vm_step,
         trusted_proxies,
         auth,
+        audit,
         ..
     } = p;
 
@@ -330,6 +402,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     // Policy is enforced on /mcp and /log alike, `None` with auth off.
     let policy = auth.enforcer();
     let policy_for_log = policy.clone();
+    let audit_for_log = audit.clone();
+    let audit_for_auth = audit.clone();
 
     let service = StreamableHttpService::new(
         move || {
@@ -349,7 +423,9 @@ pub fn build_router(p: HttpParams) -> axum::Router {
                 caller::current(),
             )
             .with_identity(agent::current())
-            .with_policy(policy.clone()))
+            .with_policy(policy.clone())
+            .with_audit(audit.clone())
+            .with_user_agent(caller::user_agent()))
         },
         BoundSessionManager::new(LocalSessionManager::default(), owners).into(),
         http_config,
@@ -359,6 +435,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         store: store_for_log,
         ssh: ssh_for_log,
         policy: policy_for_log,
+        audit: audit_for_log,
     };
 
     axum::Router::new()
@@ -372,7 +449,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         .layer(middleware::from_fn(move |req, next| {
             let auth = auth.clone();
             let owners = owners_for_auth.clone();
-            async move { authenticate(auth, owners, req, next).await }
+            let audit = audit_for_auth.clone();
+            async move { authenticate(auth, owners, audit, req, next).await }
         }))
         .layer(middleware::from_fn(
             move |conn: ConnectInfo<SocketAddr>, req, next| {

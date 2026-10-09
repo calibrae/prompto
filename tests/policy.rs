@@ -156,6 +156,7 @@ async fn spawn(mode: AuthMode, agents: AgentStore, policy: PolicyStore) -> Serve
             store: agents,
             policy,
         },
+        audit: Default::default(),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -356,8 +357,15 @@ async fn every_tool_is_classified() {
             .iter()
             .filter(|c| c.contains(&tool.as_str()))
             .count();
-        if n != 1 {
-            wrong.push(format!("{tool}: in {n} classes, want exactly 1"));
+        // A sudo-flag tool is root-capable with the flag and arbitrary
+        // exec without it (`file_write`), so it is in both.
+        let want = if SUDO_FLAG_TOOLS.contains(&tool.as_str()) {
+            2
+        } else {
+            1
+        };
+        if n != want {
+            wrong.push(format!("{tool}: in {n} classes, want exactly {want}"));
         }
     }
     for t in classes.concat() {
@@ -859,6 +867,7 @@ fn command(dir: &Path, mode: &str) -> std::process::Command {
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
+        .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
         .env("RUST_LOG", "prompto=info");
     c
 }
@@ -928,13 +937,20 @@ async fn sighup_reloads_policy_fail_safe() {
         "previous policy kept: {resp}"
     );
     let msg = resp["error"]["message"].as_str().unwrap();
+    // The agent gets the time only; the parser's detail and the path
+    // are in the journal.
+    assert!(msg.contains("(policy file invalid since "), "{msg}");
     assert!(
-        msg.contains("(policy file invalid since ")
-            && msg.contains(
-                ": parse policy TOML: TOML parse error at line 2, column 10: invalid type"
-            )
-            && msg.contains("every call is denied until a valid file is loaded"),
-        "{msg}"
+        !msg.contains("parse policy TOML") && !msg.contains("invalid type"),
+        "parser detail reached the agent: {msg}"
+    );
+    assert!(
+        !msg.contains(&dir.path().display().to_string()),
+        "path reached the agent: {msg}"
+    );
+    assert!(
+        log.contains("parse policy TOML: TOML parse error at line 2, column 10: invalid type"),
+        "parser detail missing from the journal: {log}"
     );
 
     std::fs::write(dir.path().join("policy.toml"), GRANT_LIST).unwrap();

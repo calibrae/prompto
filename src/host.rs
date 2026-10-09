@@ -1,13 +1,14 @@
 //! Host-level operations — wake, sleep, status. Compositions on top of
 //! `wol`, `ssh`, and (optionally) `virt`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::ctx::CallCtx;
+use crate::error_class::{Classify, ErrorClass};
 use crate::inventory::HostConfig;
 use crate::ssh::SshClient;
 
@@ -24,9 +25,11 @@ pub struct HostStatus {
 /// Send a WOL magic packet to the host. Caller must have checked `wake`
 /// capability.
 pub async fn wake(host: &HostConfig) -> Result<()> {
-    let mac_str = host.mac.as_deref().context("host has no MAC configured")?;
-    let mac = crate::wol::parse_mac(mac_str)?;
-    crate::wol::send(mac).await
+    let Some(mac_str) = host.mac.as_deref() else {
+        crate::fail!(RefusedCapability, "host has no MAC configured");
+    };
+    let mac = crate::wol::parse_mac(mac_str).class(ErrorClass::Internal)?;
+    crate::wol::send(mac).await.class(ErrorClass::Internal)
 }
 
 /// Probe SSH reachability with a TCP connect. 2 s default — fast feedback,
@@ -74,7 +77,8 @@ pub async fn wait_until_up(host: &HostConfig, total_timeout: Duration) -> Result
             return Ok(s);
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
+            crate::fail!(
+                Timeout,
                 "host {} not reachable after {}s",
                 host.ip,
                 total_timeout.as_secs()

@@ -7,7 +7,7 @@
 //! gets its own MCP surface, baseline tokens, and filter integration —
 //! this module is plumbing only.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::borrow::Cow;
 use std::time::Duration;
 
@@ -24,7 +24,8 @@ pub const ALLOWED_INTERPRETERS: &[&str] = &[
 
 pub fn validate_interpreter(name: &str) -> Result<()> {
     if !ALLOWED_INTERPRETERS.contains(&name) {
-        bail!(
+        crate::fail!(
+            InvalidArgs,
             "interpreter {name:?} not in allow-list (allowed: {:?})",
             ALLOWED_INTERPRETERS
         );
@@ -40,14 +41,15 @@ pub fn validate_arg(value: &str) -> Result<()> {
         return Ok(());
     }
     if value.len() > 1024 {
-        bail!("script arg too long");
+        crate::fail!(InvalidArgs, "script arg too long");
     }
     let bad_chars = [
         '`', '$', '\\', '"', '\'', '\n', '\r', ';', '&', '|', '>', '<', '*', '?', '(', ')', '{',
         '}', '\t', ' ',
     ];
     if value.chars().any(|c| bad_chars.contains(&c)) {
-        bail!(
+        crate::fail!(
+            InvalidArgs,
             "arg {value:?} contains shell metacharacter or whitespace — pass it via the script body instead"
         );
     }

@@ -12,7 +12,7 @@
 //! invocation re-reads the config), which is exactly the Telegram-via-
 //! claudecli use case.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ use crate::ssh::SshClient;
 /// names, scopes, and URLs without opening shell injection.
 pub fn validate_token(field: &str, value: &str) -> Result<()> {
     if value.is_empty() {
-        bail!("{field} is empty");
+        crate::fail!(InvalidArgs, "{field} is empty");
     }
     if value.len() > 256 {
-        bail!("{field} too long");
+        crate::fail!(InvalidArgs, "{field} too long");
     }
     let ok = value.chars().all(|c| {
         c.is_ascii_alphanumeric()
@@ -40,7 +40,7 @@ pub fn validate_token(field: &str, value: &str) -> Result<()> {
             )
     });
     if !ok {
-        bail!("{field} {value:?} contains illegal characters");
+        crate::fail!(InvalidArgs, "{field} {value:?} contains illegal characters");
     }
     Ok(())
 }
@@ -84,11 +84,16 @@ pub async fn list(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig) -> Result<S
         .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
         .await?;
     if !res.ok() {
-        bail!(
-            "claude mcp list failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "claude mcp list failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout)
 }
@@ -100,11 +105,16 @@ pub async fn get(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig, name: &str) 
         .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
         .await?;
     if !res.ok() {
-        bail!(
-            "claude mcp get {name} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "claude mcp get {name} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout)
 }
@@ -129,12 +139,17 @@ pub async fn add(
         .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
         .await?;
     if !res.ok() {
-        bail!(
-            "claude mcp add {name} failed (exit={:?}): {} / {}",
-            res.exit_code,
-            res.stdout.trim(),
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "claude mcp add {name} failed (exit={:?}): {} / {}",
+                res.exit_code,
+                res.stdout.trim(),
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(format!("{}\n{}", res.stdout.trim(), res.stderr.trim())
         .trim()
@@ -157,11 +172,16 @@ pub async fn remove(
         .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
         .await?;
     if !res.ok() {
-        bail!(
-            "claude mcp remove {name} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "claude mcp remove {name} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout.trim().to_string())
 }
@@ -183,11 +203,16 @@ pub async fn journalctl_tail(
         .exec(ctx, host, &cmd, Some(Duration::from_secs(15)), true)
         .await?;
     if !res.ok() {
-        bail!(
-            "journalctl -u {unit} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            true,
+            format!(
+                "journalctl -u {unit} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout)
 }
@@ -196,16 +221,19 @@ pub async fn journalctl_tail(
 /// shape as VM-name validation — the value flows into the remote shell.
 pub fn validate_unit_name(unit: &str) -> Result<()> {
     if unit.is_empty() {
-        bail!("unit name is empty");
+        crate::fail!(InvalidArgs, "unit name is empty");
     }
     if unit.len() > 64 {
-        bail!("unit name too long");
+        crate::fail!(InvalidArgs, "unit name too long");
     }
     let ok = unit
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@'));
     if !ok {
-        bail!("unit name {unit:?} contains illegal characters");
+        crate::fail!(
+            InvalidArgs,
+            "unit name {unit:?} contains illegal characters"
+        );
     }
     Ok(())
 }
@@ -239,7 +267,8 @@ pub async fn restart_claudecli(
     if r2.stdout.contains("OK_TMUX") {
         Ok("restarted via tmux".to_string())
     } else {
-        bail!(
+        crate::fail!(
+            RemoteNonzero,
             "could not restart claudecli (systemd: {}, tmux: {})",
             r1.stderr.trim(),
             r2.stderr.trim()
