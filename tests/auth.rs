@@ -99,6 +99,10 @@ impl Drop for Server {
 }
 
 async fn spawn_server_with(auth: AuthConfig) -> Server {
+    spawn_server_full(auth, false).await
+}
+
+async fn spawn_server_full(auth: AuthConfig, legacy_session_mode: bool) -> Server {
     init_logs();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -110,7 +114,7 @@ async fn spawn_server_with(auth: AuthConfig) -> Server {
         stop_vm_step: Duration::from_secs(5),
         trusted_proxies: Arc::new(prompto::caller::DEFAULT_TRUSTED_PROXIES.to_vec()),
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
-        legacy_session_mode: false,
+        legacy_session_mode,
         auth,
         cancel: cancel.clone(),
     });
@@ -128,12 +132,13 @@ async fn spawn_server_with(auth: AuthConfig) -> Server {
     Server { addr, cancel }
 }
 
-/// A store holding `alpha` (token `pto_alpha`, groups `ops`) and the
-/// revoked `retired` (token `pto_retired`).
+/// A store holding `alpha` (token `pto_alpha`), `beta` (`pto_beta`), both
+/// in group `ops`, and the revoked `retired` (token `pto_retired`).
 fn store() -> AgentStore {
     let mut a = Agents::default();
     for (name, token, disabled) in [
         ("alpha", "pto_alpha", false),
+        ("beta", "pto_beta", false),
         ("retired", "pto_retired", true),
     ] {
         a.agents.insert(
@@ -252,18 +257,39 @@ async fn get_log(server: &Server, auth: Option<&str>) -> (u16, String) {
 // Modes
 // ---------------------------------------------------------------------------
 
-/// Default (off): no token needed, any token ignored, no agent attached.
-/// This is the existing deployment's behaviour.
+/// Default (off): no token needed, any token ignored, no agent attached,
+/// and `X-Prompto-Session` neither parsed nor warned about — the existing
+/// deployment's behaviour, logs included. The session can't tag the log
+/// lines here, so they are found by the call's request ID.
 #[tokio::test]
 async fn off_needs_no_token_and_attributes_nothing() {
     let s = spawn_server_with(AuthConfig::default()).await;
-    for token in [None, Some("garbage")] {
-        let sess = unique("off");
-        let (status, lines) = refused_call(&s, &sess, token).await;
-        assert_eq!(status, 200);
+    let tag = unique("off");
+    let bad = format!("{tag} not=valid");
+    for (token, sess) in [(None, tag.as_str()), (Some("Bearer garbage"), bad.as_str())] {
+        let mut headers = vec![("x-prompto-session", sess)];
+        if let Some(t) = token {
+            headers.push(("authorization", t));
+        }
+        let (status, body) = call(
+            &s,
+            "ssh_exec",
+            json!({ "host": "bare", "cmd": "true" }),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let rid = body["error"]["data"]["request_id"].as_str().unwrap();
+        let lines = log_lines(&format!("request_id=\"{rid}\""));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("agent=\"-\""), "{}", lines[0]);
+        assert!(!lines[0].contains("session_id"), "{}", lines[0]);
     }
+    assert!(
+        log_lines(&tag).is_empty(),
+        "off logged the session header: {:?}",
+        log_lines(&tag)
+    );
     let (status, body) = get_log(&s, None).await;
     assert_eq!(status, 400, "past auth, refused for capability: {body}");
 }
@@ -429,6 +455,186 @@ async fn session_header_is_bounded_and_charset_checked() {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy sessions (PROMPTO_LEGACY_SESSION_MODE=true)
+// ---------------------------------------------------------------------------
+
+/// POST one legacy-session message. Returns (status, response headers,
+/// parsed body or Null).
+async fn legacy_post(
+    server: &Server,
+    msg: Value,
+    mcp_session: Option<&str>,
+    token: Option<&str>,
+    prompto_session: &str,
+) -> (u16, reqwest::header::HeaderMap, Value) {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{}/mcp", server.addr))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("x-prompto-session", prompto_session);
+    if let Some(sid) = mcp_session {
+        req = req
+            .header("mcp-session-id", sid)
+            .header("mcp-protocol-version", "2025-11-25");
+    }
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.json(&msg).send().await.unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let text = resp.text().await.unwrap();
+    let body = text
+        .lines()
+        .find_map(|l| l.strip_prefix("data: ").filter(|d| d.starts_with('{')))
+        .or_else(|| Some(text.as_str()).filter(|t| t.starts_with('{')))
+        .map(|raw| serde_json::from_str(raw).unwrap())
+        .unwrap_or(Value::Null);
+    (status, headers, body)
+}
+
+/// Handshake a legacy session as `token`; returns its `Mcp-Session-Id`.
+async fn legacy_open(server: &Server, token: Option<&str>, tag: &str) -> String {
+    let (status, headers, body) = legacy_post(
+        server,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"prompto-tests","version":"0"}}}),
+        None,
+        token,
+        tag,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let sid = headers
+        .get("mcp-session-id")
+        .expect("legacy mode must hand out a session")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (status, _, _) = legacy_post(
+        server,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        Some(&sid),
+        token,
+        tag,
+    )
+    .await;
+    assert_eq!(status, 202);
+    sid
+}
+
+/// `ssh_exec` on `bare` inside the session (refused for capability).
+async fn legacy_refused_call(
+    server: &Server,
+    sid: &str,
+    token: Option<&str>,
+    tag: &str,
+) -> (u16, Value) {
+    let (status, _, body) = legacy_post(
+        server,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"ssh_exec","arguments":{"host":"bare","cmd":"true"}}}),
+        Some(sid),
+        token,
+        tag,
+    )
+    .await;
+    (status, body)
+}
+
+/// A legacy session runs as whoever created it, so it is bound to them:
+/// another agent, or nobody, presenting its `Mcp-Session-Id` gets a 401
+/// — in optional mode too — and the creator keeps working.
+#[tokio::test]
+async fn legacy_session_is_bound_to_its_creator() {
+    for mode in [AuthMode::Optional, AuthMode::Required] {
+        let s = spawn_server_full(
+            AuthConfig {
+                mode,
+                store: store(),
+            },
+            true,
+        )
+        .await;
+        let tag = unique("legacy");
+        let sid = legacy_open(&s, Some("pto_alpha"), &tag).await;
+
+        let mut intruders = vec![Some("pto_beta")];
+        if mode == AuthMode::Optional {
+            intruders.push(None); // anonymous riding alpha's session
+            intruders.push(Some("pto_garbage")); // degrades to anonymous
+        }
+        for who in intruders {
+            let (status, body) = legacy_refused_call(&s, &sid, who, &tag).await;
+            assert_401_jsonrpc(status, &body, "session belongs to another agent");
+            let ran = tool_lines(&tag);
+            assert!(ran.is_empty(), "{mode:?}/{who:?}: the call ran: {ran:?}");
+        }
+        let warns = log_lines(&sessions_redacted(&sid));
+        assert!(
+            warns.iter().any(|l| l.contains("belongs to another agent")),
+            "{warns:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&LOGS.lock().unwrap()).contains(&sid),
+            "full Mcp-Session-Id logged"
+        );
+
+        // The creator is unaffected and still attributed.
+        let (status, body) = legacy_refused_call(&s, &sid, Some("pto_alpha"), &tag).await;
+        assert_eq!(status, 200, "{mode:?}: {body}");
+        let lines = tool_lines(&tag);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("agent=\"alpha\""), "{}", lines[0]);
+    }
+}
+
+/// An anonymous creator (optional mode) can't be ridden by an agent
+/// either: the binding is to the name, `anonymous` included.
+#[tokio::test]
+async fn legacy_anonymous_session_refuses_an_agent() {
+    let s = spawn_server_full(
+        AuthConfig {
+            mode: AuthMode::Optional,
+            store: store(),
+        },
+        true,
+    )
+    .await;
+    let tag = unique("legacy-anon");
+    let sid = legacy_open(&s, None, &tag).await;
+    let (status, body) = legacy_refused_call(&s, &sid, Some("pto_alpha"), &tag).await;
+    assert_401_jsonrpc(status, &body, "session belongs to another agent");
+    let (status, _) = legacy_refused_call(&s, &sid, None, &tag).await;
+    assert_eq!(status, 200);
+    let lines = log_lines(&tag);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("agent=\"anonymous\""), "{}", lines[0]);
+}
+
+/// With auth off nobody is identified and sessions work as today.
+#[tokio::test]
+async fn legacy_session_with_auth_off_is_unchanged() {
+    let s = spawn_server_full(AuthConfig::default(), true).await;
+    let sid = legacy_open(&s, None, "x").await;
+    let (status, body) = legacy_refused_call(&s, &sid, Some("anything"), "x").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// The "tool call failed" lines for `tag`: proof a call actually ran.
+fn tool_lines(tag: &str) -> Vec<String> {
+    log_lines(tag)
+        .into_iter()
+        .filter(|l| l.contains("tool call failed"))
+        .collect()
+}
+
+fn sessions_redacted(sid: &str) -> String {
+    prompto::sessions::redact(sid)
+}
+
+// ---------------------------------------------------------------------------
 // extra_ips
 // ---------------------------------------------------------------------------
 
@@ -485,6 +691,11 @@ fn agent_cli(agents: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn spawn_binary(dir: &Path, agents: &Path) -> Proc {
+    spawn_binary_mode(dir, agents, "required")
+}
+
+/// The server on a free port; its stderr goes to `dir/stderr.log`.
+fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -493,12 +704,13 @@ fn spawn_binary(dir: &Path, agents: &Path) -> Proc {
     let child = std::process::Command::new(BIN)
         .env("PROMPTO_INVENTORY", write_inventory(dir))
         .env("PROMPTO_AGENTS", agents)
-        .env("PROMPTO_AUTH", "required")
+        .env("PROMPTO_AUTH", mode)
         .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
-        .stderr(std::process::Stdio::null())
+        .env("RUST_LOG", "prompto=info")
+        .stderr(std::fs::File::create(dir.join("stderr.log")).unwrap())
         .spawn()
         .unwrap();
     // Owned by `Proc` from here, whose Drop kills and reaps it.
@@ -593,6 +805,57 @@ fn cli_refuses_duplicates_reserved_names_and_unknown_revokes() {
     assert!(!agent_cli(&agents, &["add", "anonymous"]).status.success());
     assert!(!agent_cli(&agents, &["add", "Bad Name"]).status.success());
     assert!(!agent_cli(&agents, &["revoke", "two"]).status.success());
+}
+
+/// `PROMPTO_AUTH=off` must not depend on agents.toml: a malformed or
+/// unreadable file neither stops startup nor is touched on SIGHUP, and
+/// its presence is mentioned once. The same files are fatal in
+/// optional/required.
+#[tokio::test]
+async fn off_ignores_a_broken_agents_file() {
+    for broken in ["malformed", "unreadable"] {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents.toml");
+        if broken == "malformed" {
+            std::fs::write(&agents, "[agent.x]\ntoken_sha256 = \"short\"\n").unwrap();
+        } else {
+            // A directory: read_to_string fails whoever runs the test.
+            std::fs::create_dir(&agents).unwrap();
+        }
+
+        let p = spawn_binary_mode(dir.path(), &agents, "off");
+        assert_eq!(status_with(&p, None).await, 200, "{broken}");
+        sighup(&p).await;
+        assert_eq!(status_with(&p, None).await, 200, "{broken}: after SIGHUP");
+        let log = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
+        assert_eq!(
+            log.matches("agents file ignored").count(),
+            1,
+            "{broken}: {log}"
+        );
+        assert!(log.contains("inventory reloaded on SIGHUP"), "{log}");
+        assert!(
+            !log.contains("agents reload"),
+            "{broken}: SIGHUP read it: {log}"
+        );
+        drop(p);
+
+        for mode in ["optional", "required"] {
+            let out = std::process::Command::new(BIN)
+                .env("PROMPTO_INVENTORY", write_inventory(dir.path()))
+                .env("PROMPTO_AGENTS", &agents)
+                .env("PROMPTO_AUTH", mode)
+                .env("PROMPTO_BIND", "127.0.0.1:0")
+                .env("PROMPTO_GAIN_ENABLED", "false")
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{broken}/{mode} started");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("loading agents"),
+                "{broken}/{mode}: {out:?}"
+            );
+        }
+    }
 }
 
 #[test]

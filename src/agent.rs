@@ -388,6 +388,11 @@ pub fn authenticate_request(
     session_header: Option<&str>,
     caller: Option<std::net::IpAddr>,
 ) -> Decision {
+    // Off is today's behaviour, logs included: no identity, and the
+    // session header is neither parsed nor warned about.
+    if cfg.mode == AuthMode::Off {
+        return Decision::Proceed(Identity::default());
+    }
     let session_id = match session_header {
         None => None,
         Some(raw) => {
@@ -402,12 +407,6 @@ pub fn authenticate_request(
             s
         }
     };
-    if cfg.mode == AuthMode::Off {
-        return Decision::Proceed(Identity {
-            agent: None,
-            session_id,
-        });
-    }
     let required = cfg.mode == AuthMode::Required;
     let Some(raw) = authorization else {
         if required {
@@ -790,10 +789,8 @@ mod tests {
         let off = cfg(AuthMode::Off, a.clone());
         assert_eq!(
             authenticate_request(&off, Some("Bearer good"), Some("s1"), None),
-            Decision::Proceed(Identity {
-                agent: None,
-                session_id: Some("s1".into())
-            })
+            Decision::Proceed(Identity::default()),
+            "off ignores the token and the session header alike"
         );
 
         let opt = cfg(AuthMode::Optional, a.clone());

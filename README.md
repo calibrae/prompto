@@ -168,7 +168,9 @@ disabled = false
 - Until those land, the agent and session appear in the journald line of every failed call: `tool call failed request_id=… agent="builder" session_id="…"`.
 - Tool results don't echo the agent. The caller knows who it is, and an unchanged result shape keeps `off` byte-identical.
 
-**Session context.** A client may send `X-Prompto-Session: <id>` (the Claude session ID). It is context for the logs, never proof of identity: any holder of a role token can claim any session. Values over 128 characters or outside `A-Za-z0-9._:-` are dropped with a warning; the call itself proceeds.
+**Session context.** A client may send `X-Prompto-Session: <id>` (the Claude session ID). It is context for the logs, never proof of identity: any holder of a role token can claim any session. Values over 128 characters or outside `A-Za-z0-9._:-` are dropped with a warning; the call itself proceeds. With `off` the header is ignored entirely.
+
+**Legacy MCP sessions** (`PROMPTO_LEGACY_SESSION_MODE=true`) are bound to the agent that created them: a request carrying an `Mcp-Session-Id` created by a different agent (`anonymous` included) gets a 401, in `optional` as in `required`.
 
 ### Managing tokens
 
@@ -239,12 +241,12 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_VAULT_MOUNT` | `secret` | KV v2 mount holding the sudo secrets. |
 | `PROMPTO_VAULT_CACERT` | unset | PEM file (one or more certs) trusted as extra roots for the vault client, on top of the bundled webpki roots — for a vault behind a private CA. The system trust store is not consulted. Unreadable or certificate-less file = startup error. |
 | `PROMPTO_AUTH` | `off` | `off`, `optional` or `required`; see [Agent identity](#agent-identity-prompto_auth). Anything else is a startup error. |
-| `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents. Also used by `prompto agent`. |
+| `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents; unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto agent`. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
-Env is read once at startup: changes need a restart. Only the inventory and `agents.toml` reload on `SIGHUP`, each independently.
+Env is read once at startup: changes need a restart. Only the inventory and `agents.toml` (unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently.
 
 CLI:
 

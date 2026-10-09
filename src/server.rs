@@ -13,6 +13,7 @@ use crate::caller;
 use crate::filters::FilterChain;
 use crate::inventory::InventoryStore;
 use crate::mcp::Prompto;
+use crate::sessions::{self, BoundSessionManager, SessionOwners};
 use crate::ssh::SshClient;
 use axum::extract::ConnectInfo;
 use axum::middleware::{self, Next};
@@ -108,19 +109,23 @@ async fn capture_caller_ip(
 /// rmcp factory and `/log` snapshot like the caller IP.
 ///
 /// Runs inside [`capture_caller_ip`], so warnings carry the real client
-/// address. A refusal is a 401: a JSON-RPC error object on `/mcp` (so an
+/// address. It also holds legacy MCP sessions to their creator: a request
+/// whose agent differs from the one that created its `Mcp-Session-Id` is
+/// refused (see [`crate::sessions`]). A refusal is a 401: a JSON-RPC error object on `/mcp` (so an
 /// MCP client can show the reason), plain text on `/log`.
-async fn authenticate(auth: AuthConfig, req: axum::extract::Request, next: Next) -> Response {
-    use axum::http::{StatusCode, header};
-    use axum::response::IntoResponse;
-
+async fn authenticate(
+    auth: AuthConfig,
+    owners: SessionOwners,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     let decision = {
         let headers = req.headers();
         // A header that isn't visible ASCII is "present but invalid",
         // not "absent": in required mode it must not fall through to
         // the missing-token branch, and either way it is a warning.
         let authz = headers
-            .get(header::AUTHORIZATION)
+            .get(axum::http::header::AUTHORIZATION)
             .map(|v| v.to_str().unwrap_or(""));
         let session = headers
             .get(agent::SESSION_HEADER)
@@ -128,35 +133,68 @@ async fn authenticate(auth: AuthConfig, req: axum::extract::Request, next: Next)
         agent::authenticate_request(&auth, authz, session, caller::current())
     };
     match decision {
-        Decision::Proceed(id) => agent::scoped(id, next.run(req)).await,
-        Decision::Reject(reason) => {
-            let www = (header::WWW_AUTHENTICATE, r#"Bearer realm="prompto""#);
-            if req.uri().path() == "/log" {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [www],
-                    format!("unauthorized: {reason}\n"),
-                )
-                    .into_response()
-            } else {
-                let body = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": -32001,
-                        "message": format!(
-                            "unauthorized: {reason} — prompto requires `Authorization: Bearer <agent token>`"
-                        ),
-                    }
-                });
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [www, (header::CONTENT_TYPE, "application/json")],
-                    body.to_string(),
-                )
-                    .into_response()
+        Decision::Proceed(id) => {
+            // A legacy MCP session runs as whoever created it (the
+            // factory snapshots the identity once), so reusing someone
+            // else's `Mcp-Session-Id` would act as them. Refused in
+            // optional mode too. With auth off nobody is identified and
+            // there is nothing to compare.
+            if auth.mode != agent::AuthMode::Off
+                && let Some(mcp_session) = req
+                    .headers()
+                    .get(MCP_SESSION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                && !owners.check(mcp_session, &id)
+            {
+                tracing::warn!(
+                    caller_ip = ?caller::current(),
+                    agent = id.agent.as_ref().map(|a| a.name.as_str()),
+                    mcp_session = %sessions::redact(mcp_session),
+                    mode = auth.mode.as_str(),
+                    "refused: Mcp-Session-Id belongs to another agent"
+                );
+                return unauthorized(req.uri().path(), "session belongs to another agent");
             }
+            agent::scoped(id, next.run(req)).await
         }
+        Decision::Reject(reason) => unauthorized(req.uri().path(), reason),
+    }
+}
+
+/// rmcp's legacy session header.
+const MCP_SESSION_HEADER: &str = "mcp-session-id";
+
+/// The 401: a JSON-RPC error object on `/mcp` (so an MCP client can show
+/// the reason), plain text on `/log`.
+fn unauthorized(path: &str, reason: &str) -> Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let www = (header::WWW_AUTHENTICATE, r#"Bearer realm="prompto""#);
+    if path == "/log" {
+        (
+            StatusCode::UNAUTHORIZED,
+            [www],
+            format!("unauthorized: {reason}\n"),
+        )
+            .into_response()
+    } else {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32001,
+                "message": format!(
+                    "unauthorized: {reason} — prompto requires `Authorization: Bearer <agent token>`"
+                ),
+            }
+        });
+        (
+            StatusCode::UNAUTHORIZED,
+            [www, (header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -277,6 +315,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
 
     // Clones for the /log endpoint; the originals move into the factory.
     let store_for_log = store.clone();
+    let owners = SessionOwners::default();
+    let owners_for_auth = owners.clone();
     let ssh_for_log = ssh.clone();
 
     let service = StreamableHttpService::new(
@@ -298,7 +338,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
             )
             .with_identity(agent::current()))
         },
-        LocalSessionManager::default().into(),
+        BoundSessionManager::new(LocalSessionManager::default(), owners).into(),
         http_config,
     );
 
@@ -317,7 +357,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         // first, so authentication sees the resolved client address.
         .layer(middleware::from_fn(move |req, next| {
             let auth = auth.clone();
-            async move { authenticate(auth, req, next).await }
+            let owners = owners_for_auth.clone();
+            async move { authenticate(auth, owners, req, next).await }
         }))
         .layer(middleware::from_fn(
             move |conn: ConnectInfo<SocketAddr>, req, next| {

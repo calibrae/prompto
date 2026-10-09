@@ -77,11 +77,12 @@ fn init_tracing() {
         .init();
 }
 
-/// SIGHUP re-reads the inventory and `agents.toml`, independently: a bad
-/// file keeps its previous version live and logs why, without blocking
-/// the other.
+/// SIGHUP re-reads the inventory and `agents.toml` (the latter only when
+/// auth is on — `agents` is `None` with `PROMPTO_AUTH=off`),
+/// independently: a bad file keeps its previous version live and logs
+/// why, without blocking the other.
 #[cfg(unix)]
-fn spawn_sighup_reloader(store: InventoryStore, agents: AgentStore) {
+fn spawn_sighup_reloader(store: InventoryStore, agents: Option<AgentStore>) {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
         let mut sig = match signal(SignalKind::hangup()) {
@@ -96,6 +97,7 @@ fn spawn_sighup_reloader(store: InventoryStore, agents: AgentStore) {
                 Ok(n) => tracing::info!(host_count = n, "inventory reloaded on SIGHUP"),
                 Err(e) => tracing::error!(?e, "inventory reload failed — keeping previous"),
             }
+            let Some(agents) = &agents else { continue };
             match agents.reload() {
                 Ok(n) => tracing::info!(agent_count = n, "agents reloaded on SIGHUP"),
                 Err(e) => {
@@ -128,7 +130,7 @@ fn spawn_vault_renewal(vault: Arc<VaultClient>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reloader(_store: InventoryStore, _agents: AgentStore) {}
+fn spawn_sighup_reloader(_store: InventoryStore, _agents: Option<AgentStore>) {}
 
 const AGENT_USAGE: &str = "\
 Usage: prompto agent add <name> [--groups a,b]   mint a token (printed once)
@@ -295,21 +297,36 @@ async fn main() -> Result<()> {
     // Read before anything else can fail late: a typo such as
     // `requried` must stop the server, not silently mean "off".
     let auth_mode = AuthMode::parse(&env_or("PROMPTO_AUTH", "off"))?;
-    let agents = AgentStore::load_from(cfg.agents_path.clone())
-        .with_context(|| format!("loading agents from {}", cfg.agents_path.display()))?;
-    let agent_count = agents.snapshot().agents.len();
-    tracing::info!(
-        auth = auth_mode.as_str(),
-        agent_count,
-        path = %cfg.agents_path.display(),
-        "agent tokens loaded"
-    );
-    if auth_mode == AuthMode::Required && agent_count == 0 {
-        tracing::warn!(
-            "PROMPTO_AUTH=required with no agents — every HTTP request will get 401 \
-             until `prompto agent add` + SIGHUP"
+    // Off must not depend on agents.toml: an unreadable or malformed file
+    // would otherwise stop a box that doesn't use it. It isn't read at
+    // all, and SIGHUP leaves it alone. In optional/required a load failure
+    // at startup is fatal.
+    let agents = if auth_mode == AuthMode::Off {
+        if cfg.agents_path.exists() {
+            tracing::info!(
+                path = %cfg.agents_path.display(),
+                "PROMPTO_AUTH=off — agents file ignored"
+            );
+        }
+        None
+    } else {
+        let agents = AgentStore::load_from(cfg.agents_path.clone())
+            .with_context(|| format!("loading agents from {}", cfg.agents_path.display()))?;
+        let agent_count = agents.snapshot().agents.len();
+        tracing::info!(
+            auth = auth_mode.as_str(),
+            agent_count,
+            path = %cfg.agents_path.display(),
+            "agent tokens loaded"
         );
-    }
+        if auth_mode == AuthMode::Required && agent_count == 0 {
+            tracing::warn!(
+                "PROMPTO_AUTH=required with no agents — every HTTP request will get 401 \
+                 until `prompto agent add` + SIGHUP"
+            );
+        }
+        Some(agents)
+    };
     spawn_sighup_reloader(store.clone(), agents.clone());
 
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
@@ -441,7 +458,7 @@ async fn main() -> Result<()> {
             legacy_session_mode,
             auth: AuthConfig {
                 mode: auth_mode,
-                store: agents,
+                store: agents.unwrap_or_default(),
             },
             cancel: cancel.clone(),
         });
