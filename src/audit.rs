@@ -1287,6 +1287,188 @@ impl Audit {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Operator records (`prompto kill`)
+// ---------------------------------------------------------------------------
+
+/// Who ran an operator command: the real uid and its name, and
+/// `SUDO_USER` when it came through sudo (the uid is then 0).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Operator {
+    pub uid: u32,
+    pub user: Option<String>,
+    pub sudo_user: Option<String>,
+}
+
+impl Operator {
+    pub fn current() -> Self {
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let clean = |s: &str| {
+            let s: String = s.chars().filter(|&c| !is_terminal_hazard(c)).collect();
+            clamp(s.trim(), MAX_FIELD)
+        };
+        Operator {
+            uid,
+            user: user_name(uid).map(|u| clean(&u)),
+            sudo_user: std::env::var("SUDO_USER")
+                .ok()
+                .map(|u| clean(&u))
+                .filter(|u| !u.is_empty()),
+        }
+    }
+
+    /// `root (sudo: ops)`, `ops`, `uid 1234`.
+    pub fn display(r: &Value) -> String {
+        let s = |k: &str| r.get(k).and_then(Value::as_str);
+        let user = match (s("user"), r.get("uid").and_then(Value::as_u64)) {
+            (Some(u), _) => u.to_string(),
+            (None, Some(uid)) => format!("uid {uid}"),
+            (None, None) => "?".into(),
+        };
+        match s("sudo_user") {
+            Some(su) => format!("{user} (sudo: {su})"),
+            None => user,
+        }
+    }
+}
+
+/// The name of `uid` in the password database.
+fn user_name(uid: u32) -> Option<String> {
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: every pointer is valid for the call; `buf` outlives the
+    // use of `pw`'s strings, which point into it.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: getpwuid_r succeeded, so pw_name is a NUL-terminated string
+    // in `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// `"type": "kill"`: an operator set (`on`) or lifted (`off`) a kill
+/// switch with `prompto kill` / `unkill`. Written by the CLI, not the
+/// server, so a switch set while the server is down is recorded too. A
+/// switch made by hand (`touch /etc/prompto/kill`) has no such record;
+/// the calls it refuses are recorded either way.
+#[derive(Clone, Debug, Serialize)]
+pub struct KillRecord {
+    pub ts: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub request_id: String,
+    /// `on` or `off`.
+    pub action: &'static str,
+    pub scope: crate::kill::Scope,
+    /// The agent, host or session; `null` for the global switch.
+    pub target: Option<String>,
+    /// As the server will show it (`kill::sanitize_reason`); `null` for
+    /// `off` and for a switch set without one.
+    pub reason: Option<String>,
+    /// The kill file.
+    pub file: String,
+    pub by: Operator,
+}
+
+impl KillRecord {
+    pub fn new(
+        on: bool,
+        scope: crate::kill::Scope,
+        target: Option<&str>,
+        reason: &str,
+        file: &Path,
+        by: Operator,
+    ) -> Self {
+        KillRecord {
+            ts: now_ts(),
+            kind: "kill",
+            request_id: ulid::Ulid::generate().to_string(),
+            action: if on { "on" } else { "off" },
+            scope,
+            target: target.map(|t| clamp(t, MAX_FIELD)),
+            reason: on
+                .then(|| crate::kill::sanitize_reason(reason))
+                .flatten()
+                .map(|r| clamp(&r, MAX_FIELD)),
+            file: clamp(&file.display().to_string(), MAX_PATH),
+            by,
+        }
+    }
+}
+
+/// Append one record to the audit file from an operator command (not
+/// the server), in one `write(2)` like the server's (`O_APPEND`, so the
+/// two never interleave). An existing file keeps its owner and mode — a
+/// root CLI appending must not take it from the server. A missing one
+/// is created the way the server would create it: mode [`FILE_MODE`],
+/// owned by the owner of its directory (the server's state directory),
+/// group `gid` (`PROMPTO_AUDIT_GROUP`) or the directory's. If it can't
+/// be handed over, it is removed again rather than left for a server
+/// that couldn't write it.
+pub fn append_operator_record(
+    path: &Path,
+    gid: Option<u32>,
+    rec: &impl Serialize,
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(rec).map_err(io::Error::other)?;
+    line.push(b'\n');
+    let file = match OpenOptions::new().append(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create_like_the_server(path, gid)?,
+        Err(e) => return Err(e),
+    };
+    let n = (&file).write(&line)?;
+    if n != line.len() {
+        return Err(io::Error::other(format!(
+            "short write ({n} of {} bytes)",
+            line.len()
+        )));
+    }
+    Ok(())
+}
+
+fn create_like_the_server(path: &Path, gid: Option<u32>) -> io::Result<File> {
+    let file = match OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(FILE_MODE)
+        .open(path)
+    {
+        Ok(f) => f,
+        // The server created it meanwhile: append to its file.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return OpenOptions::new().append(true).open(path);
+        }
+        Err(e) => return Err(e),
+    };
+    let hand_over = || -> io::Result<()> {
+        file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE))?;
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let d = std::fs::metadata(dir)?;
+        let m = file.metadata()?;
+        let (uid, gid) = (d.uid(), gid.unwrap_or(d.gid()));
+        if (m.uid(), m.gid()) != (uid, gid) {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+        }
+        Ok(())
+    };
+    if let Err(e) = hand_over() {
+        let _ = std::fs::remove_file(path);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("created it but could not give it to its directory's owner ({e}); removed it"),
+        ));
+    }
+    Ok(file)
+}
+
 /// The record as a `tracing` event at [`TARGET`]. Field names are the
 /// record's keys, except `type`, which is `record_type` (a keyword).
 fn emit_event(r: &Record) {
@@ -1359,7 +1541,8 @@ pub fn resolve_group(spec: &str) -> io::Result<u32> {
 #[derive(Clone, Debug, Default)]
 pub struct Filter {
     pub agent: Option<String>,
-    /// Matches `host`, `queried_as` or rsync's `dest_*`.
+    /// Matches `host`, `queried_as` or rsync's `dest_*`, or the target
+    /// of a host kill record.
     pub host: Option<String>,
     pub tool: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
@@ -1375,6 +1558,9 @@ impl Filter {
             ["host", "queried_as", "dest_host", "dest_queried_as"]
                 .iter()
                 .any(|k| s(k) == Some(h))
+                || (s("type") == Some("kill")
+                    && s("scope") == Some("host")
+                    && s("target") == Some(h))
         });
         let since_ok = self.since.is_none_or(|since| {
             s("ts")
@@ -1602,6 +1788,9 @@ pub fn table_row(r: &Value) -> [String; 8] {
             None => class.to_string(),
         }
     };
+    if s("type") == "kill" {
+        return kill_row(r, &time);
+    }
     let detail = if s("type") == "auth" {
         format!("{} {}", s("path"), s("reason"))
     } else {
@@ -1652,6 +1841,36 @@ pub fn table_row(r: &Value) -> [String; 8] {
             "{}ms",
             r.get("duration_ms").and_then(Value::as_u64).unwrap_or(0)
         ),
+        cell(&detail, 80),
+    ]
+}
+
+/// A `"type": "kill"` record as a table row: the operator in the agent
+/// column, `(kill)` as the tool, the host for a host kill, `on`/`off` as
+/// the result, scope, target and reason as the detail.
+fn kill_row(r: &Value, time: &str) -> [String; 8] {
+    let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("");
+    let by = r.get("by").map(Operator::display).unwrap_or_default();
+    let host = if s("scope") == "host" {
+        s("target")
+    } else {
+        "-"
+    };
+    let mut detail = format!("kill={}", s("scope"));
+    if !s("target").is_empty() {
+        detail = format!("{detail} {}", s("target"));
+    }
+    if !s("reason").is_empty() {
+        detail = format!("{detail} reason: {}", s("reason"));
+    }
+    [
+        cell(time, CELL_MAX),
+        cell(&by, CELL_MAX),
+        "(kill)".into(),
+        cell(host, CELL_MAX),
+        "-".into(),
+        cell(&format!("kill {}", s("action")), CELL_MAX),
+        "-".into(),
         cell(&detail, 80),
     ]
 }
@@ -2251,6 +2470,95 @@ mod tests {
         // Long cells are cut.
         let long = json!({ "type": "tool", "tool": "t".repeat(500) });
         assert_eq!(table_row(&long)[2].chars().count(), CELL_MAX);
+    }
+
+    /// A kill record carries the reason as the server shows it, clamped,
+    /// none for `off`; the table puts the operator in the agent column
+    /// and `--host` finds host kills.
+    #[test]
+    fn kill_records_read_like_the_switch() {
+        let by = Operator {
+            uid: 0,
+            user: Some("root".into()),
+            sudo_user: Some("ops".into()),
+        };
+        let r = KillRecord::new(
+            true,
+            crate::kill::Scope::Host,
+            Some("web1"),
+            "disk\x1b[2J full token=hunter2",
+            Path::new("/etc/prompto/kill.d/host-web1"),
+            by.clone(),
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["type"], "kill");
+        assert_eq!(v["action"], "on");
+        assert_eq!(v["scope"], "host");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains('\x1b') && !reason.contains("hunter2"),
+            "{reason}"
+        );
+        assert_eq!(v["by"]["sudo_user"], "ops");
+        let row = table_row(&v);
+        assert_eq!(row[1], "root (sudo: ops)");
+        assert_eq!(row[2], "(kill)");
+        assert_eq!(row[3], "web1");
+        assert_eq!(row[5], "kill on");
+        assert!(
+            row[7].starts_with("kill=host web1 reason: disk"),
+            "{}",
+            row[7]
+        );
+        let f = |h: &str| Filter {
+            host: Some(h.into()),
+            ..Default::default()
+        };
+        assert!(f("web1").matches(&v) && !f("web2").matches(&v));
+
+        let off = KillRecord::new(
+            false,
+            crate::kill::Scope::Global,
+            None,
+            "x",
+            Path::new("/k"),
+            by,
+        );
+        let v = serde_json::to_value(&off).unwrap();
+        assert_eq!(
+            (v["action"].as_str(), &v["reason"]),
+            (Some("off"), &Value::Null)
+        );
+        assert_eq!(table_row(&v)[3], "-");
+        assert_eq!(table_row(&v)[7], "kill=global");
+        assert!(!f("web1").matches(&v));
+    }
+
+    /// A file the CLI creates but can't hand to its directory's owner
+    /// and group is removed, not left for a server that couldn't write
+    /// it. Root can always chown, so this runs unprivileged only.
+    #[test]
+    fn an_operator_created_audit_file_is_handed_over_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        append_operator_record(&path, None, &json!({"type": "kill"})).unwrap();
+        let m = std::fs::metadata(&path).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, FILE_MODE);
+        let d = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!((m.uid(), m.gid()), (d.uid(), d.gid()));
+        std::fs::remove_file(&path).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // A group this process is not in: chown to it is EPERM.
+        let mut groups = vec![0 as libc::gid_t; 256];
+        let n = unsafe { libc::getgroups(256, groups.as_mut_ptr()) };
+        groups.truncate(n.max(0) as usize);
+        groups.push(unsafe { libc::getegid() });
+        let foreign = (1..60000).find(|g| !groups.contains(g)).unwrap();
+        let err = append_operator_record(&path, Some(foreign), &json!({})).unwrap_err();
+        assert!(err.to_string().contains("removed it"), "{err}");
+        assert!(!path.exists(), "left a file the server may not write");
     }
 
     #[test]

@@ -636,6 +636,75 @@ async fn kill_comes_before_lookup_self_target_and_policy() {
     }
 }
 
+/// A switch that was checkable at startup and isn't any more fails
+/// CLOSED: calls that need it are refused as `killed`, reason `kill
+/// switch unreadable: …`, `/log` too, and the record says `unreadable`.
+/// A symlink loop (`ELOOP`) stands in for a permission error, which
+/// root (and so a test run as root) never gets.
+#[tokio::test]
+async fn an_unreadable_switch_refuses_calls() {
+    for mode in [AuthMode::Off, AuthMode::Required] {
+        let s = spawn(mode).await;
+        let tok = s.token(mode);
+        assert_ok(
+            &call(&s, tok, "ssh_exec", exec("t1", "true")).await,
+            "before",
+        );
+        let before = s.argv_log();
+
+        std::os::unix::fs::symlink("kill", s.kill.file()).unwrap();
+        let resp = call(&s, tok, "ssh_exec", exec("t1", "true")).await;
+        assert_eq!(class(&resp), Some("killed"), "{mode:?}: {resp}");
+        let msg = message(&resp);
+        assert!(
+            msg.contains("kill switch unreadable") && msg.contains("fails closed"),
+            "{mode:?}: {msg}"
+        );
+        assert_killed_record(&s, &resp, "global", None);
+        let rec = s.record(&request_id(&resp));
+        assert_eq!(rec["kill"]["unreadable"], true, "{rec}");
+        assert!(
+            rec["kill"]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("kill switch unreadable: "),
+            "{rec}"
+        );
+        let (status, _) = get_log(&s, tok, "t1").await;
+        assert_eq!(status, 503, "{mode:?}");
+        std::fs::remove_file(s.kill.file()).unwrap();
+        assert_ok(
+            &call(&s, tok, "ssh_exec", exec("t1", "true")).await,
+            "fixed",
+        );
+
+        // kill.d: every call that names a host (or, with auth on, has an
+        // agent) needs it, and is refused.
+        std::os::unix::fs::symlink("kill.d", s.kill.dir()).unwrap();
+        let resp = call(&s, tok, "ssh_exec", exec("t2", "true")).await;
+        assert_eq!(class(&resp), Some("killed"), "{mode:?}: {resp}");
+        assert!(message(&resp).contains("kill switch unreadable"), "{resp}");
+        let scope = if mode == AuthMode::Off {
+            "host"
+        } else {
+            "agent"
+        };
+        let rec = s.record(&request_id(&resp));
+        assert_eq!(rec["kill"]["scope"], scope, "{rec}");
+        assert_eq!(rec["kill"]["unreadable"], true, "{rec}");
+        std::fs::remove_file(s.kill.dir()).unwrap();
+        assert_ok(
+            &call(&s, tok, "ssh_exec", exec("t2", "true")).await,
+            "fixed",
+        );
+        assert_eq!(
+            s.argv_log().lines().count(),
+            before.lines().count() + 2,
+            "{mode:?}: an unreadable switch let a call through"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI + binary
 // ---------------------------------------------------------------------------
@@ -659,6 +728,9 @@ fn kill_cli(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("PROMPTO_KILL_FILE", dir.join("kill"))
         .env("PROMPTO_INVENTORY", dir.join("prompto.toml"))
+        .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
+        .env_remove("PROMPTO_AUDIT_GROUP")
+        .env("SUDO_USER", "test-operator")
         .output()
         .unwrap()
 }
@@ -800,6 +872,51 @@ async fn cli_switches_a_running_server_without_restart() {
         .map(|r| r["kill"]["scope"].as_str().unwrap())
         .collect();
     assert_eq!(scopes, ["global", "host"], "{audit}");
+
+    // Every change made with the CLI is recorded, with who made it; the
+    // refused names and the no-op unkill are not.
+    let changes: Vec<(String, String, String, String)> = audit
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r["type"] == "kill")
+        .map(|r| {
+            assert_eq!(r["by"]["uid"], unsafe { libc::getuid() }, "{r}");
+            assert_eq!(r["by"]["sudo_user"], "test-operator", "{r}");
+            assert!(
+                r["request_id"].as_str().is_some_and(|i| i.len() == 26),
+                "{r}"
+            );
+            let f = |k: &str| r[k].as_str().unwrap_or("-").to_string();
+            (f("action"), f("scope"), f("target"), f("reason"))
+        })
+        .collect();
+    let want = [
+        ("on", "global", "-", "maintenance window"),
+        ("off", "global", "-", "-"),
+        ("on", "host", "t2", "bad disk"),
+        ("on", "host", "nosuch", "-"),
+        ("off", "host", "t2", "-"),
+        ("off", "host", "nosuch", "-"),
+    ];
+    let want: Vec<_> = want
+        .iter()
+        .map(|(a, b, c, d)| (a.to_string(), b.to_string(), c.to_string(), d.to_string()))
+        .collect();
+    assert_eq!(changes, want, "{audit}");
+    let o = kill_cli(dir.path(), &["audit", "--host", "t2"]);
+    let table = out_text(&o);
+    assert!(o.status.success(), "{table}");
+    let rows: Vec<&str> = table.lines().filter(|l| l.contains("(kill)")).collect();
+    assert_eq!(rows.len(), 2, "{table}");
+    assert!(
+        rows[0].contains("(sudo: test-operator)")
+            && rows[0].contains("kill on")
+            && rows[0].contains("kill=host t2 reason: bad disk"),
+        "{table}"
+    );
+    assert!(rows[1].contains("kill off"), "{table}");
+    // The host filter keeps the calls to t2 and drops the global switch.
+    assert!(!table.contains("kill=global maintenance"), "{table}");
     drop(p);
     let log = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
     assert!(log.contains("kill switches checked on every call"), "{log}");
@@ -818,4 +935,101 @@ async fn startup_warns_about_active_switches() {
         log.contains("KILL SWITCH ON") && log.contains("left on"),
         "{log}"
     );
+}
+
+/// A kill switch the server can't check at startup stops it, with an
+/// error that names the path and the way out — not a server whose panic
+/// button silently does nothing.
+#[test]
+fn startup_refuses_an_uncheckable_switch() {
+    for which in ["kill", "kill.d"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(which, dir.path().join(which)).unwrap();
+        std::fs::write(dir.path().join("prompto.toml"), INVENTORY).unwrap();
+        let o = std::process::Command::new(BIN)
+            .env("PROMPTO_INVENTORY", dir.path().join("prompto.toml"))
+            .env("PROMPTO_AUTH", "off")
+            .env("PROMPTO_BIND", "127.0.0.1:0")
+            .env("PROMPTO_GAIN_ENABLED", "false")
+            .env("PROMPTO_USAGE_LOG", dir.path().join("usage.jsonl"))
+            .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
+            .env("PROMPTO_KILL_FILE", dir.path().join("kill"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A server that does start would run forever: give it 10 s.
+        let mut child = o;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let o = child.wait_with_output().unwrap();
+        let text = out_text(&o);
+        assert!(!o.status.success(), "{which}: started anyway: {text}");
+        assert!(
+            text.contains("cannot check the kill switches")
+                && text.contains("PROMPTO_KILL_FILE")
+                && text.contains(which),
+            "{which}: {text}"
+        );
+    }
+}
+
+/// The panic button wins: when the audit record can't be written, the
+/// switch is still set (and lifted), the command still succeeds, and it
+/// says the change went unrecorded.
+#[test]
+fn cli_applies_the_kill_even_if_it_cannot_audit_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(BIN)
+            .args(args)
+            .env("PROMPTO_KILL_FILE", dir.path().join("kill"))
+            .env("PROMPTO_INVENTORY", dir.path().join("prompto.toml"))
+            .env(
+                "PROMPTO_AUDIT_LOG",
+                dir.path().join("no-such-dir").join("audit.jsonl"),
+            )
+            .output()
+            .unwrap()
+    };
+    let o = run(&["kill", "on", "fire"]);
+    let text = out_text(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(dir.path().join("kill").exists(), "{text}");
+    assert!(
+        text.contains("IS in effect") && text.contains("could not be recorded"),
+        "{text}"
+    );
+    let o = run(&["kill", "off"]);
+    assert!(o.status.success(), "{}", out_text(&o));
+    assert!(!dir.path().join("kill").exists());
+    assert!(out_text(&o).contains("could not be recorded"));
+}
+
+/// An audit file that exists keeps its mode when the CLI appends to it
+/// (the CLI runs as root; the file is the server's); a missing one is
+/// created 0640, the server's mode.
+#[test]
+fn cli_audit_record_keeps_the_files_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let audit = dir.path().join("audit.jsonl");
+    let o = kill_cli(dir.path(), &["kill", "agent", "dev", "why"]);
+    assert!(o.status.success(), "{}", out_text(&o));
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&audit), 0o640);
+    std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let o = kill_cli(dir.path(), &["unkill", "agent", "dev"]);
+    assert!(o.status.success(), "{}", out_text(&o));
+    assert_eq!(mode(&audit), 0o600, "the CLI changed the audit file's mode");
+    let text = std::fs::read_to_string(&audit).unwrap();
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(!out_text(&o).contains("could not be recorded"));
 }

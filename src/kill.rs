@@ -23,12 +23,16 @@
 //! (class `killed`) is still written to the audit log when the log can
 //! take it, and always to the journal.
 //!
-//! A file that can't be checked (permission denied on the directory) does
-//! **not** stop calls: making the box that controls every other box fall
-//! over because of a directory mode would be a new failure mode for
-//! deployments that never use kill switches. It is logged as an error
-//! instead, at startup and then at most once a minute, and `prompto kill
-//! status` reports it.
+//! A switch that can't be checked fails **closed**. At startup the
+//! server refuses to start if it can't check the global file or look
+//! inside `kill.d` ([`KillSwitch::probe`]): any `stat` error other than
+//! "absent" (permission denied on the directory, a symlink loop) stops
+//! it with an error naming the path, so an upgrade shows the problem at
+//! once instead of shipping a panic button that doesn't work. If a path
+//! that was checkable becomes uncheckable while running, every call that
+//! needs it is refused as `killed`, reason `kill switch unreadable: …`,
+//! and the server logs `KILL SWITCH UNREADABLE` (at most once a minute;
+//! each refusal is logged and audited anyway).
 //!
 //! Names are validated before they become file names ([`validate`]): no
 //! `/`, no leading `.`, so `kill host ../x` can't reach outside `kill.d`.
@@ -131,9 +135,14 @@ pub struct Kill {
     /// When it was set (the file's mtime), RFC 3339 UTC.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
-    /// The file's first line: bounded, control characters removed.
+    /// The file's first line: bounded, control characters removed. For
+    /// an unreadable switch, `kill switch unreadable: <path>: <error>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The switch could not be checked, so the call is refused anyway
+    /// (fail closed). It may not be set at all.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable: bool,
 }
 
 impl Kill {
@@ -158,6 +167,16 @@ impl Kill {
                 format!("prompto unkill session {t}"),
             ),
         };
+        if self.unreadable {
+            return format!(
+                "refused: prompto cannot check its {} kill switch ({}), so it fails closed and \
+                 refuses {what}. Nothing was run. Do not retry or work around it; stop and tell \
+                 the user. An operator fixes it by making the kill switch path checkable by \
+                 prompto again.",
+                self.scope.as_str(),
+                self.reason.as_deref().unwrap_or("kill switch unreadable"),
+            );
+        }
         let mut detail = format!("{} kill switch", self.scope.as_str());
         if let Some(s) = &self.since {
             detail.push_str(&format!(", set {s}"));
@@ -386,11 +405,15 @@ impl KillSwitch {
         }
     }
 
-    /// Can the server see the kill files? `Err` describes what it can't
-    /// check (logged at startup; see the module docs).
+    /// Can this process check every kill switch? The global file, the
+    /// directory and a name inside it (which needs search permission on
+    /// `kill.d`) are `stat`ed exactly as a call would. `Err` names the
+    /// path and the error; the server refuses to start on it (see the
+    /// module docs).
     pub fn probe(&self) -> std::result::Result<(), String> {
-        for p in [&self.file, &self.dir] {
-            if let Err(e) = std::fs::symlink_metadata(p)
+        // `.probe` is never a valid switch name, so it is normally absent.
+        for p in [&self.file, &self.dir, &self.dir.join(".probe")] {
+            if let Err(e) = std::fs::metadata(p)
                 && !absent(&e)
             {
                 return Err(format!("{}: {e}", p.display()));
@@ -422,14 +445,24 @@ fn absent(e: &io::Error) -> bool {
     )
 }
 
-/// The kill switch at `path`, if the file exists.
+/// The kill switch at `path`, if the file exists — or if it can't be
+/// told whether it exists (fail closed).
 fn read(path: &Path, scope: Scope, target: Option<&str>) -> Option<Kill> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if absent(&e) => return None,
         Err(e) => {
             unreadable(path, &e);
-            return None;
+            return Some(Kill {
+                scope,
+                target: target.map(str::to_string),
+                since: None,
+                reason: sanitize_reason(&format!(
+                    "kill switch unreadable: {}: {e}",
+                    path.display()
+                )),
+                unreadable: true,
+            });
         }
     };
     let since = meta.modified().ok().map(rfc3339);
@@ -445,6 +478,7 @@ fn read(path: &Path, scope: Scope, target: Option<&str>) -> Option<Kill> {
         target: target.map(str::to_string),
         since,
         reason,
+        unreadable: false,
     })
 }
 
@@ -474,7 +508,8 @@ fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Log, at most once a minute, that a kill file can't be checked.
+/// Log, at most once a minute, that a kill file can't be checked (each
+/// call it refuses is logged and audited on its own).
 fn unreadable(path: &Path, e: &io::Error) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
@@ -489,8 +524,8 @@ fn unreadable(path: &Path, e: &io::Error) {
         tracing::error!(
             path = %path.display(),
             error = %e,
-            "CANNOT CHECK KILL SWITCH — calls are NOT stopped by it until prompto can stat this \
-             path (fix the directory's permissions)"
+            "KILL SWITCH UNREADABLE — every call it applies to is REFUSED (killed, fail closed) \
+             until prompto can stat this path again (fix the permissions)"
         );
     }
 }
@@ -672,6 +707,62 @@ mod tests {
         assert_eq!(mode, 0o644);
         let dmode = std::fs::metadata(k.dir()).unwrap().permissions().mode() & 0o777;
         assert_eq!(dmode, 0o755);
+    }
+
+    /// A switch that can't be checked refuses (fail closed), at every
+    /// scope, and `probe` reports it. A symlink loop gives `ELOOP` even
+    /// as root, on Linux and macOS alike.
+    #[test]
+    fn an_uncheckable_switch_kills() {
+        let (d, k) = ks();
+        std::os::unix::fs::symlink("kill", k.file()).unwrap();
+        let g = k.global().expect("unreadable global must kill");
+        assert!(g.unreadable, "{g:?}");
+        assert_eq!(g.since, None);
+        let r = g.reason.as_deref().unwrap();
+        assert!(r.starts_with("kill switch unreadable: "), "{r}");
+        assert!(r.contains(&*k.file().to_string_lossy()), "{r}");
+        let msg = g.message();
+        assert!(msg.contains("fails closed"), "{msg}");
+        assert!(msg.contains("kill switch unreadable"), "{msg}");
+        assert!(k.probe().unwrap_err().contains("kill"), "probe");
+        assert_eq!(serde_json::to_value(&g).unwrap()["unreadable"], true);
+        std::fs::remove_file(k.file()).unwrap();
+        assert_eq!(k.global(), None);
+        assert_eq!(k.probe(), Ok(()));
+
+        // kill.d itself: every scoped check that needs it refuses.
+        std::os::unix::fs::symlink("kill.d", k.dir()).unwrap();
+        assert!(k.probe().is_err());
+        let s = Subject {
+            agent: Some("dev"),
+            ..Default::default()
+        };
+        let got = k.check(&s).expect("unreadable kill.d must kill");
+        assert_eq!((got.scope, got.unreadable), (Scope::Agent, true));
+        // A call that needs no file in kill.d is not affected.
+        assert_eq!(k.check(&Subject::default()), None);
+        drop(d);
+    }
+
+    /// Permission denied on `kill.d` (search bit off): `probe` sees it
+    /// although `kill.d` itself can be stat'ed, and calls are refused.
+    /// Root ignores modes, so this one only runs unprivileged.
+    #[test]
+    fn a_kill_dir_without_search_permission_is_uncheckable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_d, k) = ks();
+        std::fs::create_dir(k.dir()).unwrap();
+        std::fs::set_permissions(k.dir(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let probe = k.probe();
+        let got = k.named(Scope::Host, "web1");
+        std::fs::set_permissions(k.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(probe.unwrap_err().contains(".probe"), "probe");
+        assert!(got.expect("must kill").unreadable);
+        assert_eq!(k.probe(), Ok(()));
     }
 
     #[test]
