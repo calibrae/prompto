@@ -93,7 +93,10 @@ install -d -m750 -o root -g prompto /etc/prompto
 export BAO_ADDR=https://bao.sbx.lan:8200
 export BAO_TOKEN=$(jq -r .root_token /root/bao-init.json)
 bao secrets list -format=json | jq -e '."secret/"' >/dev/null || bao secrets enable -path=secret -version=2 kv >/dev/null
-bao kv put secret/prompto/sudo-default password=@/root/sbx-sudo-pw >/dev/null
+# prompto refuses a multi-line password: store it without the file's trailing newline
+( umask 077; tr -d '\n' < /root/sbx-sudo-pw > /root/sbx-sudo-pw.trim )
+bao kv put secret/prompto/sudo-default password=@/root/sbx-sudo-pw.trim >/dev/null
+rm -f /root/sbx-sudo-pw.trim
 bao policy write prompto-read - >/dev/null <<'HCL'
 path "secret/data/prompto/*" { capabilities = ["read"] }
 HCL
@@ -109,6 +112,7 @@ PROMPTO_USAGE_LOG=/var/lib/prompto/usage.jsonl
 RUST_LOG=prompto=info
 PROMPTO_VAULT_ADDR=https://bao.sbx.lan:8200
 PROMPTO_VAULT_MOUNT=secret
+PROMPTO_VAULT_CACERT=/etc/sbx-ca/ca.crt
 PROMPTO_VAULT_TOKEN=$TOK
 ENV
   )
@@ -221,5 +225,4 @@ done
 $S sbx-core 'sudo systemctl enable --now prompto-dev; sleep 2; systemctl is-active prompto-dev'
 }
 step_1; step_2; step_3; step_4; step_5; step_6
-# Known issue: reqwest "rustls-tls" uses webpki roots, so vault TLS to bao.sbx.lan fails (sbx-t2 sudo). Needs rustls-tls-native-roots.
 # Smoke test: sandbox/smoke (curl JSON-RPC from sbx-dev) - see /tmp/smoke.sh on sbx-dev.
