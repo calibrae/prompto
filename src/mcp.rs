@@ -90,6 +90,10 @@ pub struct Prompto {
     audit: Audit,
     /// The client's `User-Agent`, snapshotted like `caller_ip`.
     user_agent: Option<String>,
+    /// Kill switches (`crate::kill`), checked before anything else on
+    /// every call. The default paths unless set, so an instance built
+    /// without [`Prompto::with_kill`] still honours `/etc/prompto/kill`.
+    kill: crate::kill::KillSwitch,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -448,6 +452,7 @@ impl Prompto {
             policy: None,
             audit: Audit::null(),
             user_agent: None,
+            kill: Default::default(),
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
@@ -470,6 +475,12 @@ impl Prompto {
     /// Record every call made through this instance in `audit`.
     pub fn with_audit(mut self, audit: Audit) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// Check these kill switches (`crate::kill`) on every call.
+    pub fn with_kill(mut self, kill: crate::kill::KillSwitch) -> Self {
+        self.kill = kill;
         self
     }
 
@@ -717,6 +728,59 @@ impl Prompto {
         }
     }
 
+    /// The kill switch that stops this call, if any (`crate::kill`).
+    fn killed(&self, call: &audit::CallScope) -> Option<crate::kill::Kill> {
+        let hosts = crate::kill::hosts_in(&call.args, &self.inv.snapshot());
+        self.kill.check(&crate::kill::Subject {
+            agent: self.identity.agent.as_ref().map(|a| a.name.as_str()),
+            session: self.identity.session_id.as_deref(),
+            hosts,
+        })
+    }
+
+    /// Refuse a call stopped by a kill switch: before anything else ran
+    /// (no audit preflight — a broken log must not stop a kill), recorded
+    /// like any refusal, class `killed`, with the switch in the record.
+    fn refuse_killed(
+        &self,
+        call: &audit::CallScope,
+        kill: crate::kill::Kill,
+    ) -> Result<CallToolResponse, McpError> {
+        let mut ctx = self.new_ctx();
+        ctx.call = Some(call.clone());
+        ctx.note(|n| n.kill = Some(kill.clone()));
+        let err = anyhow::Error::new(kill.refusal());
+        let request_id = ctx.request_id();
+        let (msg, data) = error_parts(&err, err.downcast_ref(), &request_id);
+        let host = record_host(&call.args);
+        tracing::warn!(
+            request_id,
+            agent = ctx.agent_name(),
+            session_id = ctx.session_id.as_deref(),
+            tool = %call.tool,
+            host = host.as_deref(),
+            kill_scope = kill.scope.as_str(),
+            kill_target = kill.target.as_deref(),
+            error_class = ErrorClass::Killed.as_str(),
+            "tool call refused by a kill switch"
+        );
+        self.tracker.record(
+            &call.tool,
+            host.as_deref(),
+            false,
+            ctx.started.elapsed().as_millis() as u64,
+            msg.len() as u64,
+        );
+        let verdict = audit::judge(
+            &call.tool,
+            &audit::Outcome::Failure(&err),
+            &ctx.notes(),
+            false,
+        );
+        self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, msg.len() as u64);
+        Err(McpError::internal_error(msg, Some(data)))
+    }
+
     /// Record a call no handler recorded: its arguments did not parse, it
     /// named no tool, or (`res` is `None`) it never finished — dropped
     /// mid-way by a client that went away, a panic or a shutdown
@@ -774,13 +838,7 @@ impl Prompto {
             &ctx.notes(),
             false,
         );
-        let host = call
-            .args
-            .get("host")
-            .or_else(|| call.args.get("client"))
-            .or_else(|| call.args.get("source_host"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let host = record_host(&call.args);
         let bytes = if res.is_some() { msg.len() as u64 } else { 0 };
         // The record clamps the name (`Record::clamp_strings`).
         self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, bytes);
@@ -2076,6 +2134,15 @@ fn error_parts(
     (msg, data)
 }
 
+/// The host a record made from raw arguments names (`rsync_sync`'s
+/// `dest_host` is added by `audit_record`).
+fn record_host(args: &serde_json::Value) -> Option<String> {
+    ["host", "client", "source_host"]
+        .iter()
+        .find_map(|k| args.get(*k)?.as_str())
+        .map(str::to_string)
+}
+
 /// Writes the `aborted` record of a call whose future is dropped before
 /// it recorded anything (see `Prompto::audit_unrouted`).
 struct AbortGuard<'a> {
@@ -2103,6 +2170,10 @@ impl ServerHandler for Prompto {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let call = audit::CallScope::new(&request.name, request.arguments.clone());
+        // Kill switches come first, before rmcp even parses the arguments.
+        if let Some(kill) = self.killed(&call) {
+            return self.refuse_killed(&call, kill);
+        }
         // Dropped before the end (cancelled, panicked, shut down): the
         // guard writes an `aborted` record.
         let _guard = AbortGuard {

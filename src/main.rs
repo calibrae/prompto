@@ -9,6 +9,7 @@ use prompto::audit::{self, Audit, AuditLog};
 use prompto::baselines::BASELINES;
 use prompto::caller;
 use prompto::inventory::InventoryStore;
+use prompto::kill::{KillSwitch, Scope as KillScope};
 use prompto::mcp::Prompto;
 use prompto::policy::{Policy, PolicyStore};
 use prompto::server::{AllowedHosts, HttpParams, build_router};
@@ -57,6 +58,8 @@ pub struct Config {
     pub audit_path: PathBuf,
     /// `PROMPTO_AUDIT_GROUP`: group for an audit file prompto creates.
     pub audit_group: Option<String>,
+    /// `PROMPTO_KILL_FILE` / `PROMPTO_KILL_DIR`.
+    pub kill: KillSwitch,
 }
 
 impl Config {
@@ -75,6 +78,7 @@ impl Config {
             audit_group: std::env::var("PROMPTO_AUDIT_GROUP")
                 .ok()
                 .filter(|g| !g.trim().is_empty()),
+            kill: KillSwitch::from_env(),
         }
     }
 }
@@ -204,14 +208,14 @@ fn warn_if_deny_all(policy: &Policy, mode: AuthMode) {
             error = %bad.error,
             auth = mode.as_str(),
             "POLICY FILE INVALID — every tool call is DENIED (refused_policy) until a valid \
-             file is loaded and the server is reloaded"
+             file is written (re-read on the next call, or on SIGHUP)"
         );
     } else if let Some(path) = &policy.missing {
         tracing::warn!(
             path = %path.display(),
             auth = mode.as_str(),
             "POLICY FILE MISSING — every tool call is DENIED (refused_policy) until it \
-             exists and the server is reloaded"
+             exists (re-read on the next call, or on SIGHUP)"
         );
     } else if policy.rules.is_empty() {
         tracing::warn!(
@@ -247,7 +251,7 @@ fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mo
             match p.agents.reload() {
                 Ok(n) => tracing::info!(agent_count = n, "agents reloaded on SIGHUP"),
                 Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "agents reload failed — keeping previous")
+                    tracing::error!(error = %format!("{e:#}"), "agents reload failed — REFUSING every agent token until a valid file is read")
                 }
             }
             match p.policy.reload() {
@@ -293,7 +297,9 @@ Usage: prompto agent add <name> [--groups a,b]   mint a token (printed once)
        prompto agent revoke <name>               disable an agent's token
 
 Edits $PROMPTO_AGENTS (default /etc/prompto/agents.toml). A running server
-picks changes up on SIGHUP: systemctl reload prompto";
+re-reads it on the next request after it changes (SIGHUP also works); a file
+it cannot parse refuses every token until it is fixed. To stop an agent
+temporarily without revoking its token: prompto kill agent <name>";
 
 /// `prompto agent …`: edit `agents.toml`. Only the token's hash is ever
 /// written; the token itself goes to stdout once, everything else to
@@ -302,8 +308,8 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
     let path = &cfg.agents_path;
     let reload_hint = || {
         eprintln!(
-            "{} updated. Running servers keep the old list until reloaded: \
-             `systemctl reload prompto` (or kill -HUP <pid>).",
+            "{} updated. A running server with PROMPTO_AUTH=optional or required \
+             re-reads it on its next request (no SIGHUP needed).",
             path.display()
         )
     };
@@ -379,6 +385,184 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
         }
         Some("--help" | "-h" | "help") => println!("{AGENT_USAGE}"),
         _ => anyhow::bail!("{AGENT_USAGE}"),
+    }
+    Ok(())
+}
+
+/// Startup: where the kill switches are, and any that are already on.
+/// A switch the server can't check stops it (fail closed, see
+/// `prompto::kill`): better a failed upgrade than a panic button that
+/// silently does nothing.
+fn check_kill_switches(kill: &KillSwitch) -> Result<()> {
+    if let Err(e) = kill.probe() {
+        anyhow::bail!(
+            "cannot check the kill switches ({e}): prompto refuses to start rather than run \
+             with a kill switch it can't see. Let the user prompto runs as stat {} and search \
+             {} (the standard install has /etc/prompto 0750 root:prompto), or point \
+             PROMPTO_KILL_FILE / PROMPTO_KILL_DIR somewhere it can.",
+            kill.file().display(),
+            kill.dir().display()
+        );
+    }
+    tracing::info!(
+        file = %kill.file().display(),
+        dir = %kill.dir().display(),
+        "kill switches checked on every call (prompto kill …)"
+    );
+    match kill.list() {
+        Ok((kills, ignored)) => {
+            for k in kills {
+                tracing::warn!(
+                    scope = k.scope.as_str(),
+                    target = k.target.as_deref(),
+                    since = k.since.as_deref(),
+                    reason = k.reason.as_deref(),
+                    "KILL SWITCH ON — matching calls are refused (killed)"
+                );
+            }
+            for f in ignored {
+                tracing::warn!(file = %f, dir = %kill.dir().display(), "not a kill switch file — ignored");
+            }
+        }
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "cannot list kill switches"),
+    }
+    Ok(())
+}
+
+const KILL_USAGE: &str = "\
+Usage: prompto kill on [reason…]                stop every tool call (global)
+       prompto kill off                         lift the global kill
+       prompto kill agent <name> [reason…]      stop one agent's calls
+       prompto kill host <name> [reason…]       stop every call to one host
+       prompto kill session <id> [reason…]      stop one X-Prompto-Session
+       prompto unkill agent|host|session <name> lift a scoped kill
+       prompto kill status                      list what is stopped (as root)
+
+The global switch is $PROMPTO_KILL_FILE (default /etc/prompto/kill); scoped
+ones are files in kill.d next to it ($PROMPTO_KILL_DIR): agent-<name>,
+host-<name>, session-<id>. A running server checks them on every call, so
+a change applies to the next call: no restart, no SIGHUP. Creating or
+removing the files by hand works the same; the first line is the reason.
+Refused calls get error_class `killed` and are audited with the scope.
+Each `kill`/`unkill` that changes a switch is audited too (type `kill`:
+who, what, reason) in $PROMPTO_AUDIT_LOG; if that fails the switch still
+applies and a warning says so. A server that can't check a switch
+refuses to start, and refuses calls as `killed` if it can't later.
+Agent and session kills need PROMPTO_AUTH=optional or required: with off,
+calls carry no agent or session.";
+
+/// Record who set or lifted a switch in the audit log. The switch is
+/// already applied: a record that can't be written is reported, never
+/// fatal (the panic button wins).
+fn audit_kill(cfg: &Config, on: bool, scope: KillScope, target: Option<&str>, reason: &str) {
+    let file = cfg.kill.path(scope, target).unwrap_or_default();
+    let rec = audit::KillRecord::new(on, scope, target, reason, &file, audit::Operator::current());
+    let gid = cfg
+        .audit_group
+        .as_deref()
+        .and_then(|g| audit::resolve_group(g).ok());
+    if let Err(e) = audit::append_operator_record(&cfg.audit_path, gid, &rec) {
+        eprintln!(
+            "WARNING: the kill switch change above IS in effect, but it could not be recorded in \
+             the audit log {}: {e}",
+            cfg.audit_path.display()
+        );
+    }
+}
+
+/// `prompto kill …` / `prompto unkill …`: write or remove kill files,
+/// and record each change in the audit log.
+fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
+    let kill = &cfg.kill;
+    let reason = |rest: &[String]| rest.join(" ");
+    let applies = "The running server applies this from its next call (no restart).";
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--help" | "-h" | "help")
+    ) {
+        println!("{KILL_USAGE}");
+        return Ok(());
+    }
+    if unkill {
+        let (Some(kind), Some(name), None) = (args.first(), args.get(1), args.get(2)) else {
+            anyhow::bail!("{KILL_USAGE}");
+        };
+        let scope = KillScope::parse_named(kind)
+            .with_context(|| format!("unknown scope {kind:?}\n{KILL_USAGE}"))?;
+        if kill.clear(scope, Some(name))? {
+            eprintln!("{kind} {name} kill lifted. {applies}");
+            audit_kill(cfg, false, scope, Some(name), "");
+        } else {
+            eprintln!("{kind} {name} was not killed; nothing changed.");
+        }
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("on") => {
+            let why = reason(&args[1..]);
+            let path = kill.set(KillScope::Global, None, &why)?;
+            eprintln!(
+                "GLOBAL KILL ON ({}): every tool call and GET /log is refused. {applies} \
+                 Lift it with `prompto kill off`.",
+                path.display()
+            );
+            audit_kill(cfg, true, KillScope::Global, None, &why);
+        }
+        Some("off") if args.len() == 1 => {
+            if kill.clear(KillScope::Global, None)? {
+                eprintln!("global kill lifted. {applies}");
+                audit_kill(cfg, false, KillScope::Global, None, "");
+            } else {
+                eprintln!("the global kill was not on; nothing changed.");
+            }
+        }
+        Some("status") if args.len() == 1 => {
+            if let Err(e) = kill.probe() {
+                anyhow::bail!(
+                    "cannot check the kill switches as this user ({e}); run it with sudo. \
+                     The server itself refuses to start if it can't, and refuses calls as \
+                     `killed` if it stops being able to while running."
+                );
+            }
+            let (kills, ignored) = kill.list()?;
+            if kills.is_empty() {
+                println!("no kill switch is on");
+            }
+            for k in &kills {
+                println!(
+                    "{:<8} {:<24} since {:<21} {}",
+                    k.scope.as_str(),
+                    k.target.as_deref().unwrap_or("*"),
+                    k.since.as_deref().unwrap_or("?"),
+                    k.reason.as_deref().unwrap_or("")
+                );
+            }
+            for f in ignored {
+                eprintln!(
+                    "ignored (not a kill switch file): {}",
+                    kill.dir().join(f).display()
+                );
+            }
+        }
+        Some(kind) if args.len() >= 2 && KillScope::parse_named(kind).is_some() => {
+            let scope = KillScope::parse_named(kind).expect("checked");
+            let name = &args[1];
+            let why = reason(&args[2..]);
+            let path = kill.set(scope, Some(name), &why)?;
+            eprintln!("{kind} {name} KILLED ({}). {applies}", path.display());
+            audit_kill(cfg, true, scope, Some(name), &why);
+            if scope == KillScope::Host
+                && let Ok(inv) = prompto::inventory::Inventory::from_path(&cfg.inventory_path)
+                && inv.canonical(name).is_none()
+            {
+                eprintln!(
+                    "note: {name:?} is not a host or alias in {} (yet); the kill applies to \
+                     calls that name it.",
+                    cfg.inventory_path.display()
+                );
+            }
+        }
+        _ => anyhow::bail!("{KILL_USAGE}"),
     }
     Ok(())
 }
@@ -535,9 +719,11 @@ Usage: prompto audit [--agent NAME] [--host HOST] [--tool TOOL] [--since 10m|ISO
 
 Reads $PROMPTO_AUDIT_LOG (default /var/lib/prompto/audit.jsonl) and its
 rotated siblings (.1, .2.gz, …; only those written since --since). Every
-given filter must match; --host matches the host, the name as typed, or
-rsync's dest. Default output is a table, oldest first; --json prints the
-matching records as JSON lines.";
+given filter must match; --host matches the host, the name as typed,
+rsync's dest, or a host kill. Default output is a table, oldest first;
+--json prints the matching records as JSON lines. Kill switch changes
+(`prompto kill`/`unkill`) are rows with tool `(kill)` and the operator
+in the AGENT column.";
 
 /// `prompto audit …`: query the audit log.
 fn run_audit_cli(cfg: &Config, args: &[String]) -> Result<()> {
@@ -693,6 +879,9 @@ async fn main() -> Result<()> {
     if raw_args.len() >= 2 && raw_args[1] == "agent" {
         return run_agent_cli(&cfg, &raw_args[2..]);
     }
+    if raw_args.len() >= 2 && (raw_args[1] == "kill" || raw_args[1] == "unkill") {
+        return run_kill_cli(&cfg, raw_args[1] == "unkill", &raw_args[2..]);
+    }
     if raw_args.len() >= 2 && raw_args[1] == "audit" {
         return run_audit_cli(&cfg, &raw_args[2..]);
     }
@@ -710,6 +899,7 @@ async fn main() -> Result<()> {
         host_count = store.snapshot().hosts.len(),
         "inventory loaded"
     );
+    check_kill_switches(&cfg.kill)?;
     // Read before anything else can fail late: a typo such as
     // `requried` must stop the server, not silently mean "off".
     let auth_mode = AuthMode::parse(&env_or("PROMPTO_AUTH", "off"))?;
@@ -832,6 +1022,7 @@ async fn main() -> Result<()> {
             .with_identity(Identity::local())
             .with_policy(auth.enforcer())
             .with_audit(audit)
+            .with_kill(cfg.kill.clone())
             .serve(stdio())
             .await
             .context("stdio serve")?;
@@ -915,6 +1106,7 @@ async fn main() -> Result<()> {
             legacy_session_mode,
             auth,
             audit,
+            kill: cfg.kill.clone(),
             cancel: cancel.clone(),
         });
 

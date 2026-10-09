@@ -153,6 +153,7 @@ async fn spawn_server() -> Server {
         legacy_session_mode: false,
         auth: Default::default(),
         audit: Default::default(),
+        kill: prompto::kill::KillSwitch::in_dir(dir.path()),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

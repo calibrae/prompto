@@ -157,6 +157,7 @@ async fn spawn(mode: AuthMode, agents: AgentStore, policy: PolicyStore) -> Serve
             policy,
         },
         audit: Default::default(),
+        kill: prompto::kill::KillSwitch::in_dir(dir.path()),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -868,6 +869,7 @@ fn command(dir: &Path, mode: &str) -> std::process::Command {
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
         .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
+        .env("PROMPTO_KILL_FILE", dir.join("kill"))
         .env("RUST_LOG", "prompto=info");
     c
 }
@@ -960,6 +962,57 @@ async fn sighup_reloads_policy_fail_safe() {
     std::fs::write(dir.path().join("policy.toml"), "").unwrap();
     p.sighup().await;
     assert_eq!(class(&list().await), Some("refused_policy"));
+}
+
+/// Without SIGHUP: an edit to policy.toml applies to the next call, with
+/// the same fail-closed semantics — a broken file is deny-all, never the
+/// previous policy; a deleted one is deny-all. With `off` the file is
+/// still never read.
+#[tokio::test]
+async fn policy_changes_apply_without_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_files(dir.path(), Some(""));
+    let path = dir.path().join("policy.toml");
+    let p = spawn_binary(dir.path(), "required");
+    let list = || call_at(p.addr(), Some("pto_alpha"), "inventory_list", json!({}));
+    assert_eq!(class(&list().await), Some("refused_policy"));
+
+    std::fs::write(&path, GRANT_LIST).unwrap();
+    assert_ok(&list().await, "granted, no SIGHUP");
+    assert!(
+        p.stderr().contains("policy file changed — reloaded"),
+        "{}",
+        p.stderr()
+    );
+
+    std::fs::write(&path, "[[rule]]\nagents = 1\n").unwrap();
+    let resp = list().await;
+    assert_eq!(class(&resp), Some("refused_policy"), "kept: {resp}");
+    let msg = resp["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("(policy file invalid since "), "{msg}");
+    assert!(p.stderr().contains("POLICY FILE INVALID"), "{}", p.stderr());
+
+    std::fs::write(&path, GRANT_LIST).unwrap();
+    assert_ok(&list().await, "valid again");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(class(&list().await), Some("refused_policy"));
+    assert!(p.stderr().contains("POLICY FILE MISSING"), "{}", p.stderr());
+    assert!(!p.stderr().contains("SIGHUP"), "{}", p.stderr());
+    drop(p);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_files(dir.path(), Some(GRANT_LIST));
+    let p = spawn_binary(dir.path(), "off");
+    std::fs::write(dir.path().join("policy.toml"), "this is [not toml").unwrap();
+    assert_ok(
+        &call_at(p.addr(), None, "inventory_list", json!({})).await,
+        "off after a broken edit",
+    );
+    let log = p.stderr();
+    assert!(
+        !log.contains("POLICY FILE") && !log.contains("policy file changed"),
+        "{log}"
+    );
 }
 
 /// `off` doesn't read policy.toml: a broken one neither stops it nor is

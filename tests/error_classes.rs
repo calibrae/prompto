@@ -111,6 +111,7 @@ async fn spawn(mode: AuthMode, policy: &str) -> Server {
             policy: PolicyStore::new(Policy::from_toml_str(policy, "policy.toml").unwrap(), None),
         },
         audit: Audit::new(AuditLog::open(audit_path.clone(), None, mode != AuthMode::Off).unwrap()),
+        kill: prompto::kill::KillSwitch::in_dir(dir.path()),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

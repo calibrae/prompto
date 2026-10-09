@@ -78,6 +78,9 @@ pub struct HttpParams {
     /// The audit log (`crate::audit`): every tool call, `GET /log` and
     /// every 401.
     pub audit: Audit,
+    /// Kill switches (`crate::kill`), checked first on every tool call
+    /// and `GET /log`, in every auth mode.
+    pub kill: crate::kill::KillSwitch,
     pub cancel: CancellationToken,
 }
 
@@ -242,6 +245,7 @@ struct LogState {
     ssh: Arc<SshClient>,
     policy: Option<crate::policy::Enforcer>,
     audit: Audit,
+    kill: crate::kill::KillSwitch,
 }
 
 #[derive(serde::Deserialize)]
@@ -312,6 +316,26 @@ async fn log_tail(
 ) -> Result<String, (axum::http::StatusCode, anyhow::Error)> {
     use axum::http::StatusCode;
 
+    // Kill switches first, exactly as on /mcp: before validation, lookup,
+    // policy and the audit preflight. Global is the service switched off
+    // (503); a scoped kill refuses this caller or host (403).
+    let hosts = crate::kill::hosts_in(
+        &serde_json::json!({ "host": q.host }),
+        &state.store.snapshot(),
+    );
+    let subject = crate::kill::Subject {
+        agent: ctx.agent.as_ref().map(|a| a.name.as_str()),
+        session: ctx.session_id.as_deref(),
+        hosts,
+    };
+    if let Some(kill) = state.kill.check(&subject) {
+        let status = match kill.scope {
+            crate::kill::Scope::Global => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::FORBIDDEN,
+        };
+        ctx.note(|n| n.kill = Some(kill.clone()));
+        return Err((status, kill.refusal().into()));
+    }
     // Validate up front so a malformed unit is a 400 (caller's fault),
     // not a 502 from the exec layer. `journalctl_tail` re-checks — this
     // is for the status code, never the safety.
@@ -391,6 +415,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         trusted_proxies,
         auth,
         audit,
+        kill,
         ..
     } = p;
 
@@ -404,6 +429,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     let policy_for_log = policy.clone();
     let audit_for_log = audit.clone();
     let audit_for_auth = audit.clone();
+    let kill_for_log = kill.clone();
 
     let service = StreamableHttpService::new(
         move || {
@@ -425,6 +451,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
             .with_identity(agent::current())
             .with_policy(policy.clone())
             .with_audit(audit.clone())
+            .with_kill(kill.clone())
             .with_user_agent(caller::user_agent()))
         },
         BoundSessionManager::new(LocalSessionManager::default(), owners).into(),
@@ -436,6 +463,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         ssh: ssh_for_log,
         policy: policy_for_log,
         audit: audit_for_log,
+        kill: kill_for_log,
     };
 
     axum::Router::new()

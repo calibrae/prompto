@@ -120,6 +120,7 @@ async fn spawn_server_full(auth: AuthConfig, legacy_session_mode: bool) -> Serve
         legacy_session_mode,
         auth,
         audit: Default::default(),
+        kill: Default::default(),
         cancel: cancel.clone(),
     });
     let shutdown = cancel.clone();
@@ -742,6 +743,7 @@ fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
+        .env("PROMPTO_KILL_FILE", dir.join("kill"))
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
         .env("RUST_LOG", "prompto=info")
         .stderr(std::fs::File::create(dir.join("stderr.log")).unwrap())
@@ -780,12 +782,12 @@ async fn sighup(p: &Proc) {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
-/// The whole lifecycle without a restart: no agents → 401; `agent add`
-/// alone changes nothing until SIGHUP; after it the token works; a
-/// broken file on reload keeps the previous agents; `agent revoke` +
-/// SIGHUP → 401 again.
+/// The whole lifecycle without a restart or a signal (S5.2): no agents
+/// → 401; `agent add` works on the next request; a broken file fails
+/// closed (401, not the previous agents) until it is fixed; `agent
+/// revoke` → 401 on the next request. SIGHUP still re-reads too.
 #[tokio::test]
-async fn cli_add_and_revoke_take_effect_on_sighup() {
+async fn cli_add_and_revoke_take_effect_on_the_next_request() {
     let dir = tempfile::tempdir().unwrap();
     let agents = dir.path().join("agents.toml");
     let p = spawn_binary(dir.path(), &agents);
@@ -798,25 +800,30 @@ async fn cli_add_and_revoke_take_effect_on_sighup() {
     assert!(token.starts_with("pto_"), "stdout must be just the token");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("reload"),
-        "CLI must say to reload: {stderr}"
+        stderr.contains("next request"),
+        "CLI must say when it applies: {stderr}"
     );
     let file = std::fs::read_to_string(&agents).unwrap();
     assert!(!file.contains(&token), "token written to disk");
 
-    assert_eq!(status_with(&p, Some(&token)).await, 401, "no reload yet");
-    sighup(&p).await;
-    assert_eq!(status_with(&p, Some(&token)).await, 200);
+    assert_eq!(status_with(&p, Some(&token)).await, 200, "no SIGHUP needed");
 
-    // Fail-safe reload: a broken file keeps the previous agents.
+    // Fail-closed: a broken file refuses every token, the previous
+    // agents included, until it is fixed.
     std::fs::write(&agents, "[agent.x]\ntoken_sha256 = \"short\"\n").unwrap();
-    sighup(&p).await;
-    assert_eq!(status_with(&p, Some(&token)).await, 200);
+    assert_eq!(status_with(&p, Some(&token)).await, 401);
+    let log = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
+    assert!(log.contains("AGENTS FILE INVALID"), "{log}");
     std::fs::write(&agents, &file).unwrap();
+    assert_eq!(status_with(&p, Some(&token)).await, 200, "fixed");
 
     let out = agent_cli(&agents, &["revoke", "sbx-tester"]);
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(status_with(&p, Some(&token)).await, 200, "no reload yet");
+    assert_eq!(
+        status_with(&p, Some(&token)).await,
+        401,
+        "revoked, no SIGHUP"
+    );
     sighup(&p).await;
     assert_eq!(status_with(&p, Some(&token)).await, 401);
 
@@ -882,6 +889,7 @@ async fn off_ignores_a_broken_agents_file() {
                 .env("PROMPTO_BIND", "127.0.0.1:0")
                 .env("PROMPTO_GAIN_ENABLED", "false")
                 .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
+                .env("PROMPTO_KILL_FILE", dir.path().join("kill"))
                 .output()
                 .unwrap();
             assert!(!out.status.success(), "{broken}/{mode} started");
@@ -903,6 +911,7 @@ fn unknown_auth_mode_refuses_to_start() {
         .env("PROMPTO_BIND", "127.0.0.1:0")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
+        .env("PROMPTO_KILL_FILE", dir.path().join("kill"))
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -920,6 +929,7 @@ fn stdio_is_agent_local() {
         .env("PROMPTO_AUTH", "required")
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
+        .env("PROMPTO_KILL_FILE", dir.path().join("kill"))
         .env("RUST_LOG", "prompto=info")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

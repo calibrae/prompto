@@ -241,6 +241,7 @@ async fn spawn_opts(o: Opts) -> Server {
         legacy_session_mode: false,
         auth,
         audit: audit.clone(),
+        kill: prompto::kill::KillSwitch::in_dir(dir.path()),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -78,7 +78,8 @@ pub enum ErrorClass {
     /// A non-SSH service prompto relays to failed (the apytti gateway
     /// behind `claude_exec`).
     Upstream,
-    /// Refused by a kill switch (reserved for E5).
+    /// Refused by a kill switch (`crate::kill`): global, agent, host or
+    /// session. Nothing ran.
     Killed,
     /// A required approval ticket was missing or invalid (reserved for
     /// E6).
