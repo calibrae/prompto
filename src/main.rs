@@ -180,8 +180,8 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
             prompto::agent::write_atomic(path, &agents.to_toml_string()?)?;
             println!("{token}");
             eprintln!(
-                "agent {name:?} added. The token above is shown ONCE and is not stored — \
-                 save it now (e.g. in ~/.config/prompto/token, mode 0600)."
+                "agent {name:?} added. Its token went to stdout, ONCE, and is not stored \
+                 anywhere — save it now (e.g. ~/.config/prompto/token, mode 0600)."
             );
             reload_hint();
         }
