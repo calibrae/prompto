@@ -30,3 +30,8 @@ capabilities = ["exec", "virt"]
 #   hypervisor = "hypervisor"     # host with `virt` that runs this guest
 #   aliases = ["other-name"]
 #   sudo_password_vault_path = "hosts/sudo"   # needs PROMPTO_VAULT_TOKEN
+#   request_id_env = "off"        # export | setenv | off — how PROMPTO_REQUEST_ID
+#                                 # reaches remote commands. Default: export on
+#                                 # linux/macos, setenv on freebsd/windows. Use
+#                                 # "off" for keys restricted by command=, rrsync
+#                                 # or git-shell; "setenv" for a non-POSIX shell.

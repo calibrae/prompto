@@ -30,7 +30,7 @@ Every call is **capability-gated** by the per-host allowlist in the inventory. A
 
 `ssh_exec` stdout passes through a filter chain (cargo, git, journalctl, systemctl, pkg, k8s, zfs, …) that compacts known-noisy output and names the filter it applied. Compound commands (`;`, `&&`, `||`, `&`, newlines) are never filtered.
 
-**Self-targeting guard.** Every tool that reaches a host refuses one whose `ip` equals the calling agent's source IP (`error_class = refused_self_target`): an agent that wants to run something on its own machine should use its local shell, not loop through prompto as the inventory's `ssh_user` and around its own sandbox. Exempt, because they never log into the host or are a documented self-management path with no caller-supplied command: `host_wake`, `host_status`, `port_scan`, `inventory_get_host`, `mcp_list`, `mcp_get`, `mcp_status`, `mcp_restart_claudecli`. `rsync_sync` checks both ends. Behind a reverse proxy, the caller IP comes from `X-Real-IP` / `X-Forwarded-For`, honoured only when the TCP peer is in `PROMPTO_TRUSTED_PROXIES`.
+**Self-targeting guard.** Every tool that contacts a host refuses one whose `ip` is the calling agent's source IP, with no exceptions: logins, exec, files, `rsync_sync` (both ends), `vm_*`, `mcp_*` (including `mcp_restart_claudecli`), `claude_exec`, `host_wake`, `host_status`, `port_scan` and `GET /log`. The refusal is `error_class = refused_self_target` and reads `refused_self_target: you are calling from <host> (<ip>) — prompto never acts on the caller's own machine; run this in your local shell instead.` An agent that wants something done on its own machine uses its local shell, not a loop through prompto as the inventory's `ssh_user` and around its own sandbox. Only tools that never contact a host are unaffected: `inventory_list`, `inventory_get_host`, `mcp_reconnect_hint`, `prompto_gain`. The guard is not a policy setting, and no future policy or ticket can lift it. Addresses are compared in canonical form, so an IPv4 caller seen as `::ffff:a.b.c.d` is still matched. Behind a reverse proxy, the caller IP comes from `X-Real-IP` / `X-Forwarded-For`, honoured only when the TCP peer is in `PROMPTO_TRUSTED_PROXIES`.
 
 **Request IDs.** Every call gets a ULID `request_id`:
 
@@ -40,7 +40,8 @@ Every call is **capability-gated** by the per-host allowlist in the inventory. A
 - Classified failures are logged to journald with it.
 - The remote command sees it as `PROMPTO_REQUEST_ID`, so host-side logs can be joined with prompto's:
   - On `linux` and `macos` hosts the remote command is prefixed with `export PROMPTO_REQUEST_ID=…;`.
-  - On every host prompto also sends it with `ssh -o SetEnv`. sshd delivers that only with `AcceptEnv PROMPTO_*`, and it is the only route on `freebsd` hosts, whose login shell may be csh.
+  - On every host prompto also sends it with `ssh -o SetEnv`. sshd delivers that only with `AcceptEnv PROMPTO_*`, and it is the only route on `freebsd` and `windows` hosts, whose login shell may not be POSIX.
+  - The per-host `request_id_env` inventory field overrides this (see [Inventory](#inventory)). Set it to `off` for a key restricted by `command=`, rrsync or git-shell: those see the whole command line and reject the prefix.
   - `sudo -n` resets the environment, so commands run through passwordless sudo see the variable only with `Defaults env_keep += "PROMPTO_REQUEST_ID"` in the host's sudoers.
   - On vault hosts (below) the root shell always gets it.
 
@@ -104,6 +105,7 @@ capabilities = []
 | `aliases` | One machine, one entry, reachable by either name. Collisions with host names or other aliases are load errors. |
 | `apytti_url` | Gateway URL; required with `claude_exec`. |
 | `sudo_password_vault_path` / `sudo_password_vault_field` | Vault-held sudo password (field defaults to `password`). Requires `sudo_exec`. |
+| `request_id_env` | How `PROMPTO_REQUEST_ID` reaches remote commands. `export` adds an `export …;` prefix plus `ssh -o SetEnv`; it is the default on `linux` and `macos`. `setenv` uses `SetEnv` only, leaving the command line untouched; it is the default on `freebsd` and `windows`. `off` sends nothing: no prefix, no `SetEnv`, no `env` on the vault sudo path. Use `off` for keys restricted by `command=`, rrsync or git-shell. Use `setenv` for a non-POSIX login shell on Linux or macOS. Any other value is a load error. |
 
 The whole file is validated at load (unknown hypervisors, alias collisions, `wake` on a VM, malformed vault paths, …). `SIGHUP` reloads it without dropping the listener; a file that fails validation is rejected and the previous inventory stays live.
 
