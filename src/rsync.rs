@@ -175,6 +175,7 @@ pub async fn run(
             exit_code: res.exit_code,
             stderr_tail: Some(stderr_tail(&res.stderr)),
             message: explain(class, source_host, dest_host),
+            rule: None,
         });
     }
     Ok(res)

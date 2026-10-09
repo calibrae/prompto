@@ -33,6 +33,11 @@ capabilities = ["exec", "virt"]
 #                                 # calls prompto from (Wi-Fi, VPN, IPv6); the
 #                                 # self-targeting guard refuses those too
 #   sudo_password_vault_path = "hosts/sudo"   # needs PROMPTO_VAULT_TOKEN
+#   nopasswd_sudo = false         # can ssh_user sudo without a password? Unset =
+#                                 # unknown. `prompto policy lint` warns when a
+#                                 # non-sudo rule grants exec tools where this is
+#                                 # true/unset (or ssh_user is root): that shell
+#                                 # is root anyway.
 #   request_id_env = "off"        # export | setenv | off — how PROMPTO_REQUEST_ID
 #                                 # reaches remote commands. Default: export on
 #                                 # linux/macos, setenv on freebsd/windows. Use

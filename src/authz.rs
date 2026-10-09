@@ -12,13 +12,29 @@
 //! 3. it is not the caller's own machine (`refused_self_target`) —
 //!    **unconditionally**: no tool is exempt, and no policy (E3) or
 //!    ticket (E6) can grant it;
-//! 4. *(E3)* the agent's policy grants this tool on this host;
+//! 4. the agent's policy grants this tool on this host (`refused_policy`,
+//!    or `approval_required` when the matching rule wants an approval
+//!    prompto cannot take yet) — only when policy is on, i.e.
+//!    `PROMPTO_AUTH` is `optional` or `required` (see `crate::policy`);
 //! 5. *(E6)* a valid ticket accompanies the call where policy demands one.
 //!
-//! Steps 4 and 5 do not exist yet; the comments in [`authorize`] and
-//! [`authorize_tool`] mark where they go. They come *after* step 3 on
-//! purpose: the self-target guard is not a policy dimension, so nothing
-//! a policy says can reach the code that would skip it.
+//! Step 5 does not exist yet; the comment in [`authorize`] marks where it
+//! goes. Policy comes *after* step 3 on purpose: the self-target guard is
+//! not a policy dimension, so nothing a policy says can reach the code
+//! that would skip it.
+//!
+//! Root-capable calls ([`is_root_capable`]) are a separate policy grant
+//! from ordinary ones: a rule must say `sudo = true` to grant them. That
+//! covers prompto's own root paths only — an exec grant
+//! ([`ARBITRARY_EXEC_TOOLS`]) is a shell as `ssh_user`, which is root
+//! wherever that user is root or has passwordless sudo.
+//!
+//! Steps 1–3 answer before policy does, so an agent with no grant at all
+//! can still tell `unknown_host` from `refused_capability` from
+//! `refused_self_target` — i.e. probe which names exist and what they
+//! carry, though `inventory_list` hides hosts it has no grant on. That is
+//! a known, accepted property: the self-target guard must stay
+//! unconditional, which means it cannot wait for policy.
 //!
 //! The only way to resolve a host without the guard is [`lookup`], for
 //! tools that read the inventory and never contact the host
@@ -29,6 +45,101 @@
 use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::inventory::{Capability, HostConfig, Inventory};
+use crate::policy::Enforcer;
+
+/// Tools that target no host. Policy matches them on agent and tool only.
+pub const HOSTLESS_TOOLS: &[&str] = &["inventory_list", "prompto_gain", "mcp_reconnect_hint"];
+
+/// Tools that are root-capable whatever their arguments, besides those
+/// gated on `sudo_exec` (which run as root by definition). `vm_stop` can
+/// destroy a domain, so it is held to the same separate grant.
+pub const ROOT_TOOLS: &[&str] = &[
+    "ssh_sudo_exec",
+    "host_sleep",
+    "service_control",
+    "service_logs",
+    "mcp_logs",
+    "vm_stop",
+];
+
+/// Tools that are root-capable only with an argument (`sudo = true`).
+pub const SUDO_FLAG_TOOLS: &[&str] = &["file_write"];
+
+/// Tools that run whatever the caller sends on the host, with the
+/// capability each needs there. They are ordinary calls (a `sudo = false`
+/// rule grants them), but the code runs as the host's `ssh_user` — so on
+/// a host where that user is root, or can `sudo` without a password, an
+/// exec grant is a root grant in all but name. `sudo = true` gates only
+/// prompto's own root paths; `policy::lint` warns about the rest.
+pub const ARBITRARY_EXEC_TOOLS: &[(&str, Capability)] = &[
+    ("ssh_exec", Capability::Exec),
+    ("ssh_batch", Capability::Exec),
+    ("bash_exec", Capability::Exec),
+    ("python_exec", Capability::Exec),
+    ("node_exec", Capability::Exec),
+    ("ruby_exec", Capability::Exec),
+    ("perl_exec", Capability::Exec),
+    ("deno_exec", Capability::Exec),
+    ("claude_exec", Capability::ClaudeExec),
+    // A stdio server's command runs on the client whenever claude starts.
+    ("mcp_add", Capability::ClaudeAdmin),
+];
+
+/// Every other tool: neither root-capable nor arbitrary exec. Each tool
+/// is in exactly one of [`ROOT_TOOLS`] ∪ [`SUDO_FLAG_TOOLS`],
+/// [`ARBITRARY_EXEC_TOOLS`] and this list — a test fails on a tool that
+/// isn't, so a new tool can't fall under `tools = ["*"]` unclassified.
+pub const ORDINARY_TOOLS: &[&str] = &[
+    "host_wake",
+    "host_status",
+    "host_diagnose",
+    "vm_list",
+    "vm_state",
+    "vm_start",
+    "vm_ensure_up",
+    "file_read",
+    "file_list",
+    "file_stat",
+    "rsync_sync",
+    "port_scan",
+    "inventory_list",
+    "inventory_get_host",
+    "mcp_list",
+    "mcp_get",
+    "mcp_remove",
+    "mcp_restart_claudecli",
+    "mcp_status",
+    "mcp_reconnect_hint",
+    "prompto_gain",
+];
+
+/// Whether `tool` runs arbitrary caller-supplied code
+/// ([`ARBITRARY_EXEC_TOOLS`]).
+pub fn is_arbitrary_exec(tool: &str) -> bool {
+    ARBITRARY_EXEC_TOOLS.iter().any(|(t, _)| *t == tool)
+}
+
+/// Whether a call is root-capable, i.e. needs a `sudo = true` policy
+/// rule. Everything gated on the `sudo_exec` capability runs something
+/// as root on the host, so `need` alone covers `ssh_sudo_exec`,
+/// `file_write` with `sudo = true`, `service_control`, `host_sleep` and
+/// the journal readers; [`ROOT_TOOLS`] adds the ones that aren't gated
+/// on it (`vm_stop`).
+pub fn is_root_capable(tool: &str, need: Need) -> bool {
+    need == Need::Cap(Capability::SudoExec) || ROOT_TOOLS.contains(&tool)
+}
+
+/// The root-capability values a call to `tool` can have — for
+/// enumerating calls (`policy::lint`, `prompto policy check`).
+pub fn root_variants(tool: &str) -> &'static [bool] {
+    if ROOT_TOOLS.contains(&tool) {
+        &[true]
+    } else if SUDO_FLAG_TOOLS.contains(&tool) {
+        &[false, true]
+    } else {
+        &[false]
+    }
+}
 
 /// What a tool needs from its target host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +158,8 @@ pub struct Authorized {
     /// Inventory name, with any alias resolved.
     pub canonical: String,
     pub host: HostConfig,
+    /// The policy rule that allowed the call; `None` when policy is off.
+    pub rule: Option<String>,
 }
 
 /// Resolve `host_name` and check `need`, classifying the refusal.
@@ -66,6 +179,7 @@ fn resolve(inv: &Inventory, host_name: &str, need: Need) -> Result<Authorized, C
     Ok(Authorized {
         canonical: inv.canonical(host_name).unwrap_or(host_name).to_string(),
         host: host.clone(),
+        rule: None,
     })
 }
 
@@ -77,14 +191,17 @@ fn resolve(inv: &Inventory, host_name: &str, need: Need) -> Result<Authorized, C
 /// callers don't hold the inventory borrow). On failure returns a
 /// [`ClassifiedError`] ("unknown host", "lacks capability", or the
 /// self-target refusal, which tells the agent to use its local shell).
+///
+/// `policy` is `None` with `PROMPTO_AUTH=off`, which skips step 4.
 pub fn authorize(
     inv: &Inventory,
+    policy: Option<&Enforcer>,
     ctx: &CallCtx,
-    _tool: &str,
+    tool: &str,
     host_name: &str,
     need: Need,
 ) -> Result<Authorized, ClassifiedError> {
-    let target = resolve(inv, host_name, need)?;
+    let mut target = resolve(inv, host_name, need)?;
 
     // `caller_ip` is None only on transports without addresses (stdio,
     // tests); that is the one way to skip the comparison. `ip` is an
@@ -107,10 +224,12 @@ pub fn authorize(
         ));
     }
 
-    // E3 seam: policy check (ctx.agent × tool × canonical host) goes
-    // here, refusing with `refused_policy` and naming the rule. Policy
-    // can only narrow: it runs after the self-target guard and has no
-    // way to undo it.
+    // Policy can only narrow: it runs after the self-target guard and
+    // has no way to undo it.
+    if let Some(p) = policy {
+        let root = is_root_capable(tool, need);
+        target.rule = Some(p.check(ctx, tool, Some((&target.canonical, &target.host)), root)?);
+    }
     // E6 seam: ticket verification goes here, after policy has said
     // whether one is required.
 
@@ -121,22 +240,30 @@ pub fn authorize(
 /// never contacts it (`inventory_get_host`). No self-target guard,
 /// because nothing reaches the machine. Do not use this for anything
 /// that opens a connection to the host — use [`authorize`].
+/// Policy still applies, against the looked-up host.
 pub fn lookup(
     inv: &Inventory,
-    _ctx: &CallCtx,
-    _tool: &str,
+    policy: Option<&Enforcer>,
+    ctx: &CallCtx,
+    tool: &str,
     host_name: &str,
 ) -> Result<Authorized, ClassifiedError> {
-    // E3 seam: tool-level policy for inventory reads goes here.
-    resolve(inv, host_name, Need::Exists)
+    let mut target = resolve(inv, host_name, Need::Exists)?;
+    if let Some(p) = policy {
+        target.rule = Some(p.check(ctx, tool, Some((&target.canonical, &target.host)), false)?);
+    }
+    Ok(target)
 }
 
 /// Authorize a tool that targets no host (`inventory_list`,
-/// `prompto_gain`, `mcp_reconnect_hint`). Nothing to check today; it is
-/// called anyway so that every tool passes through this module.
-pub fn authorize_tool(_ctx: &CallCtx, _tool: &str) -> Result<(), ClassifiedError> {
-    // E3 seam: tool-level policy (agent × tool, no host) goes here.
-    Ok(())
+/// `prompto_gain`, `mcp_reconnect_hint`): policy on agent × tool. Returns
+/// the allowing rule (`None` with policy off).
+pub fn authorize_tool(
+    policy: Option<&Enforcer>,
+    ctx: &CallCtx,
+    tool: &str,
+) -> Result<Option<String>, ClassifiedError> {
+    policy.map(|p| p.check(ctx, tool, None, false)).transpose()
 }
 #[cfg(test)]
 mod tests {
@@ -173,6 +300,7 @@ capabilities = []
     fn allows_and_resolves_alias_to_canonical() {
         let a = authorize(
             &inv(),
+            None,
             &ctx(Some("10.0.0.1")),
             "ssh_exec",
             "a",
@@ -184,7 +312,7 @@ capabilities = []
 
     #[test]
     fn unknown_host_is_classified() {
-        let r = authorize(&inv(), &ctx(None), "ssh_exec", "nope", Need::Exists);
+        let r = authorize(&inv(), None, &ctx(None), "ssh_exec", "nope", Need::Exists);
         assert_eq!(class(r), ErrorClass::UnknownHost);
     }
 
@@ -192,6 +320,7 @@ capabilities = []
     fn missing_capability_is_classified() {
         let r = authorize(
             &inv(),
+            None,
             &ctx(None),
             "ssh_exec",
             "bravo",
@@ -206,6 +335,7 @@ capabilities = []
     fn self_target_is_refused_with_an_actionable_message() {
         let r = authorize(
             &inv(),
+            None,
             &ctx(Some("192.0.2.12")),
             "bash_exec",
             "a",
@@ -233,6 +363,7 @@ capabilities = []
         ] {
             let r = authorize(
                 &inv(),
+                None,
                 &ctx(Some("192.0.2.12")),
                 tool,
                 "alpha",
@@ -248,6 +379,7 @@ capabilities = []
     fn ipv4_mapped_caller_is_the_same_machine() {
         let r = authorize(
             &inv(),
+            None,
             &ctx(Some("::ffff:192.0.2.12")),
             "ssh_exec",
             "alpha",
@@ -273,6 +405,7 @@ capabilities = ["exec"]
         .unwrap();
         let r = authorize(
             &inv,
+            None,
             &ctx(Some("192.0.2.12")),
             "ssh_exec",
             "mapped",
@@ -304,6 +437,7 @@ capabilities = ["exec"]
         ] {
             let e = authorize(
                 &inv,
+                None,
                 &ctx(Some(caller)),
                 "ssh_exec",
                 "laptop",
@@ -314,6 +448,7 @@ capabilities = ["exec"]
         }
         authorize(
             &inv,
+            None,
             &ctx(Some("198.51.100.5")),
             "ssh_exec",
             "laptop",
@@ -327,6 +462,7 @@ capabilities = ["exec"]
         for caller in ["192.0.2.13", "::ffff:192.0.2.13", "2001:db8::12"] {
             authorize(
                 &inv(),
+                None,
                 &ctx(Some(caller)),
                 "ssh_exec",
                 "alpha",
@@ -340,9 +476,16 @@ capabilities = ["exec"]
     /// inventory entry; existence is still checked.
     #[test]
     fn lookup_skips_the_guard_but_not_existence() {
-        let a = lookup(&inv(), &ctx(Some("192.0.2.12")), "inventory_get_host", "a").unwrap();
+        let a = lookup(
+            &inv(),
+            None,
+            &ctx(Some("192.0.2.12")),
+            "inventory_get_host",
+            "a",
+        )
+        .unwrap();
         assert_eq!(a.canonical, "alpha");
-        let r = lookup(&inv(), &ctx(None), "inventory_get_host", "nope");
+        let r = lookup(&inv(), None, &ctx(None), "inventory_get_host", "nope");
         assert_eq!(class(r), ErrorClass::UnknownHost);
     }
 
@@ -350,6 +493,7 @@ capabilities = ["exec"]
     fn capability_is_checked_before_self_target() {
         let r = authorize(
             &inv(),
+            None,
             &ctx(Some("192.0.2.13")),
             "ssh_exec",
             "bravo",
@@ -362,11 +506,170 @@ capabilities = ["exec"]
     fn no_caller_ip_skips_only_the_self_target_check() {
         authorize(
             &inv(),
+            None,
             &ctx(None),
             "ssh_exec",
             "alpha",
             Need::Cap(Capability::Exec),
         )
         .unwrap();
+    }
+
+    // ----- policy (E3) -----
+
+    use crate::policy::{Enforcer, Policy, PolicyStore};
+
+    const ALLOW_ALL: &str = "[[rule]]\nagents = [\"anonymous\"]\nhosts = [\"*\"]\ntools = [\"*\"]\n\
+                             [[rule]]\nagents = [\"anonymous\"]\nhosts = [\"*\"]\ntools = [\"*\"]\nsudo = true\n";
+    const NO_ROOT: &str = "[[rule]]\nagents = [\"anonymous\"]\nhosts = [\"*\"]\ntools = [\"*\"]\n";
+
+    fn enforcer(policy: &str) -> Enforcer {
+        Enforcer {
+            policy: PolicyStore::new(Policy::from_toml_str(policy, "policy.toml").unwrap(), None),
+            agents: Default::default(),
+        }
+    }
+
+    fn anon(ip: Option<&str>) -> CallCtx {
+        ctx(ip).with_identity(crate::agent::Identity::anonymous(None))
+    }
+
+    fn sudo_inv() -> Inventory {
+        Inventory::from_toml_str(
+            "[host.alpha]\nip = \"192.0.2.12\"\nssh_user = \"u\"\nssh_key = \"/k\"\n\
+             capabilities = [\"exec\", \"sudo_exec\", \"virt\"]\n",
+        )
+        .unwrap()
+    }
+
+    /// S3.3b: no rule can grant the caller's own machine. The guard runs
+    /// before policy, so even allow-everything refuses it.
+    #[test]
+    fn policy_cannot_grant_self_target() {
+        let p = enforcer(ALLOW_ALL);
+        let r = authorize(
+            &sudo_inv(),
+            Some(&p),
+            &anon(Some("192.0.2.12")),
+            "ssh_sudo_exec",
+            "alpha",
+            Need::Cap(Capability::SudoExec),
+        );
+        assert_eq!(class(r), ErrorClass::RefusedSelfTarget);
+    }
+
+    /// Effective permission = policy ∩ capability: allow-everything does
+    /// not lend a host a capability it lacks.
+    #[test]
+    fn policy_cannot_grant_a_missing_capability() {
+        let r = authorize(
+            &inv(),
+            Some(&enforcer(ALLOW_ALL)),
+            &anon(None),
+            "ssh_exec",
+            "bravo",
+            Need::Cap(Capability::Exec),
+        );
+        assert_eq!(class(r), ErrorClass::RefusedCapability);
+    }
+
+    #[test]
+    fn policy_decides_after_the_other_checks_and_names_its_rule() {
+        let a = authorize(
+            &inv(),
+            Some(&enforcer(ALLOW_ALL)),
+            &anon(Some("10.0.0.1")),
+            "ssh_exec",
+            "a",
+            Need::Cap(Capability::Exec),
+        )
+        .unwrap();
+        assert_eq!(a.rule.as_deref(), Some("policy.toml:1"));
+        let e = authorize(
+            &inv(),
+            Some(&enforcer("")),
+            &anon(Some("10.0.0.1")),
+            "ssh_exec",
+            "a",
+            Need::Cap(Capability::Exec),
+        )
+        .unwrap_err();
+        assert_eq!(e.class, ErrorClass::RefusedPolicy);
+        assert_eq!(e.rule.as_deref(), Some(crate::policy::DEFAULT_DENY));
+        assert!(
+            e.message
+                .contains("agent anonymous has no grant for ssh_exec on alpha"),
+            "{}",
+            e.message
+        );
+        // Policy off: no rule, no refusal.
+        let a = authorize(
+            &inv(),
+            None,
+            &anon(None),
+            "ssh_exec",
+            "a",
+            Need::Cap(Capability::Exec),
+        )
+        .unwrap();
+        assert_eq!(a.rule, None);
+    }
+
+    #[test]
+    fn root_capable_calls_are_derived_from_need_and_tool() {
+        assert!(is_root_capable(
+            "file_write",
+            Need::Cap(Capability::SudoExec)
+        ));
+        assert!(!is_root_capable("file_write", Need::Cap(Capability::Exec)));
+        assert!(is_root_capable("vm_stop", Need::Cap(Capability::Virt)));
+        assert!(is_root_capable(
+            "some_future_tool",
+            Need::Cap(Capability::SudoExec)
+        ));
+        assert!(!is_root_capable("ssh_exec", Need::Cap(Capability::Exec)));
+        assert!(!is_root_capable("host_status", Need::Exists));
+    }
+
+    /// The separate sudo grant, through `authorize`: a rule granting
+    /// every tool without `sudo = true` grants no root-capable call.
+    #[test]
+    fn a_grant_without_sudo_grants_no_root_capable_call() {
+        let p = enforcer(NO_ROOT);
+        let (inv, ctx) = (sudo_inv(), anon(None));
+        let go = |tool: &str, need| authorize(&inv, Some(&p), &ctx, tool, "alpha", need);
+        go("ssh_exec", Need::Cap(Capability::Exec)).unwrap();
+        go("file_write", Need::Cap(Capability::Exec)).unwrap();
+        go("vm_list", Need::Cap(Capability::Virt)).unwrap();
+        for (tool, need) in [
+            ("ssh_sudo_exec", Need::Cap(Capability::SudoExec)),
+            ("file_write", Need::Cap(Capability::SudoExec)),
+            ("service_control", Need::Cap(Capability::SudoExec)),
+            ("host_sleep", Need::Cap(Capability::SudoExec)),
+            ("vm_stop", Need::Cap(Capability::Virt)),
+        ] {
+            let e = go(tool, need).unwrap_err();
+            assert_eq!(e.class, ErrorClass::RefusedPolicy, "{tool}");
+            assert!(e.message.contains("root-capable"), "{tool}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn hostless_and_lookup_tools_pass_policy() {
+        let deny = enforcer("");
+        let e = authorize_tool(Some(&deny), &anon(None), "prompto_gain").unwrap_err();
+        assert_eq!(e.class, ErrorClass::RefusedPolicy);
+        let e = lookup(&inv(), Some(&deny), &anon(None), "inventory_get_host", "a").unwrap_err();
+        assert_eq!(e.class, ErrorClass::RefusedPolicy);
+        let allow = enforcer(NO_ROOT);
+        assert_eq!(
+            authorize_tool(Some(&allow), &anon(None), "prompto_gain").unwrap(),
+            Some("policy.toml:1".into())
+        );
+        assert_eq!(
+            authorize_tool(None, &anon(None), "prompto_gain").unwrap(),
+            None
+        );
+        lookup(&inv(), Some(&allow), &anon(None), "inventory_get_host", "a").unwrap();
     }
 }

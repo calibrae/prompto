@@ -245,6 +245,18 @@ pub struct HostConfig {
     /// (`::ffff:a.b.c.d` → `a.b.c.d`).
     #[serde(default)]
     pub extra_ips: Vec<IpAddr>,
+    /// Policy host groups (`group:<g>` in `policy.toml`), e.g.
+    /// `["build", "web"]`. Names follow the agent-group rules
+    /// (`[a-z0-9_-]`); they mean nothing outside policy.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Whether `ssh_user` can `sudo` without a password here; unset means
+    /// unknown. Informational: prompto's own sudo paths don't read it.
+    /// `policy lint` uses it to warn when a rule without `sudo = true`
+    /// grants an exec tool on a host where that shell can become root
+    /// anyway (`true` or unset, or `ssh_user = "root"`).
+    #[serde(default)]
+    pub nopasswd_sudo: Option<bool>,
 }
 
 impl HostConfig {
@@ -312,6 +324,17 @@ impl HostConfig {
         }
         if let Some(mac) = &self.mac {
             crate::wol::parse_mac(mac).with_context(|| format!("host {name}: invalid mac"))?;
+        }
+        for g in &self.groups {
+            crate::agent::validate_name("group", g).with_context(|| format!("host {name}"))?;
+        }
+        if let Some(dup) = self
+            .groups
+            .iter()
+            .enumerate()
+            .find(|(i, g)| self.groups[..*i].contains(g))
+        {
+            bail!("host {name}: group {:?} listed twice", dup.1);
         }
         let mut seen = vec![self.ip.to_canonical()];
         for e in &self.extra_ips {
@@ -604,6 +627,24 @@ ssh_key = "/k"
     /// the self-target guard failed, the `if let` chain fell through, the call
     /// was allowed). Rejecting at load time is what makes that impossible.
     #[test]
+    fn groups_are_validated() {
+        let inv = |groups: &str| {
+            Inventory::from_toml_str(&format!(
+                "[host.a]\nip = \"192.0.2.1\"\nssh_user = \"u\"\nssh_key = \"/k\"\ngroups = {groups}\n"
+            ))
+        };
+        assert_eq!(
+            inv(r#"["build", "web-1"]"#).unwrap().hosts["a"].groups,
+            ["build", "web-1"]
+        );
+        assert!(inv("[]").unwrap().hosts["a"].groups.is_empty());
+        for bad in [r#"["Build"]"#, r#"["a b"]"#, r#"[""]"#, r#"["x", "x"]"#] {
+            let e = inv(bad).expect_err(bad);
+            assert!(format!("{e:#}").contains("host a"), "{bad}: {e:#}");
+        }
+    }
+
+    #[test]
     fn rejects_hostname_in_ip_field() {
         let bad = r#"
 [host.x]
@@ -647,9 +688,15 @@ capabilities = ["exec"]
         let inv = Inventory::from_toml_str(sample()).unwrap();
         for (name, host) in &inv.hosts {
             let ctx = crate::ctx::CallCtx::new(Some(host.ip));
-            let err =
-                crate::authz::authorize(&inv, &ctx, "ssh_exec", name, crate::authz::Need::Exists)
-                    .unwrap_err();
+            let err = crate::authz::authorize(
+                &inv,
+                None,
+                &ctx,
+                "ssh_exec",
+                name,
+                crate::authz::Need::Exists,
+            )
+            .unwrap_err();
             assert_eq!(
                 err.class,
                 crate::error_class::ErrorClass::RefusedSelfTarget,

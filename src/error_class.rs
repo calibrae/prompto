@@ -8,9 +8,10 @@
 //!
 //! `rsync_sync` classifies its own failures, and `authz::authorize`
 //! classifies every refusal (`unknown_host`, `refused_capability`,
-//! `refused_self_target`). The enum is meant to grow into
-//! the audit log's `error_class` (roadmap S4.4: `refused_policy`,
-//! `refused_self_target`, `sudo_guard`, …), so names are stable
+//! `refused_self_target`, and with a policy `refused_policy` /
+//! `approval_required`). The enum is meant to grow into
+//! the audit log's `error_class` (roadmap S4.4: `refused_ticket`,
+//! `sudo_guard`, …), so names are stable
 //! `snake_case` strings and nothing here is rsync-specific except the
 //! `rsync_*` variants themselves.
 
@@ -27,6 +28,11 @@ pub enum ErrorClass {
     /// The target is the calling agent's own machine. Unconditional: no
     /// tool is exempt and no policy can grant it (see `authz`).
     RefusedSelfTarget,
+    /// `policy.toml` grants this agent no such call (`crate::policy`).
+    RefusedPolicy,
+    /// A policy rule matched but demands an approval (ticket or human)
+    /// that this prompto cannot take yet, so the call fails closed.
+    ApprovalRequired,
     /// An argument failed validation; nothing was run.
     InvalidArgs,
     /// prompto could not reach the target host over SSH.
@@ -67,6 +73,8 @@ impl ErrorClass {
             Self::UnknownHost => "unknown_host",
             Self::RefusedCapability => "refused_capability",
             Self::RefusedSelfTarget => "refused_self_target",
+            Self::RefusedPolicy => "refused_policy",
+            Self::ApprovalRequired => "approval_required",
             Self::InvalidArgs => "invalid_args",
             Self::SshConnect => "ssh_connect",
             Self::SshAuth => "ssh_auth",
@@ -101,6 +109,9 @@ pub struct ClassifiedError {
     /// Last lines of the remote stderr, see [`stderr_tail`].
     pub stderr_tail: Option<String>,
     pub message: String,
+    /// The policy rule that decided a policy refusal (`policy.toml:12`,
+    /// or `default-deny`).
+    pub rule: Option<String>,
 }
 
 impl ClassifiedError {
@@ -111,16 +122,28 @@ impl ClassifiedError {
             exit_code: None,
             stderr_tail: None,
             message: err.to_string(),
+            rule: None,
         }
     }
 
-    /// Structured form for the MCP error's `data`.
+    /// Name the policy rule behind this refusal.
+    pub fn with_rule(mut self, rule: impl Into<String>) -> Self {
+        self.rule = Some(rule.into());
+        self
+    }
+
+    /// Structured form for the MCP error's `data`. `rule` is present
+    /// only on policy decisions.
     pub fn data(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut d = serde_json::json!({
             "error_class": self.class,
             "exit_code": self.exit_code,
             "stderr_tail": self.stderr_tail,
-        })
+        });
+        if let Some(r) = &self.rule {
+            d["rule"] = r.as_str().into();
+        }
+        d
     }
 }
 
@@ -210,6 +233,7 @@ mod tests {
             exit_code: Some(23),
             stderr_tail: Some("rsync error: some files".into()),
             message: "rsync failed".into(),
+            rule: None,
         };
         assert_eq!(
             e.to_string(),
@@ -230,6 +254,7 @@ mod tests {
             exit_code: Some(255),
             stderr_tail: Some("Connection refused".into()),
             message: String::new(),
+            rule: None,
         };
         assert_eq!(
             e.data(),

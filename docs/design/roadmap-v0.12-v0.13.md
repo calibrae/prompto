@@ -86,6 +86,18 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S3.3b No self-target grant.** Policy can only narrow. It has no rule, glob or approval mode that lets an agent target its own machine: the self-target guard (S1.2) runs before policy and is not configurable.
 - **S3.4 Decisions name their rule.** Allow and deny both carry `rule = "<file>:<line>"`. Deny messages are actionable ("agent X has no grant for ssh_sudo_exec on mista").
 - **S3.5 Dry-run:** `prompto policy check --agent X --host Y --tool Z`.
+- **Done (task 007).** Decisions:
+  - `policy.toml` is an ordered list of `[[rule]]` tables (`id`, `agents`, `hosts`, `tools`, `sudo`, `approval`). **The first matching rule decides; no match is a deny.** Rules only grant, so order only picks which rule's `approval` applies. An array keeps file order, which `[agent.<name>]` tables would not.
+  - `agents` take names or `group:<g>`, never globs. `anonymous` and `local` match only by name. Groups come from the live `AgentStore` at each decision, so a SIGHUP group change or revocation reaches open (legacy) sessions.
+  - `hosts` match the inventory name or any alias, with `*`/`?` globs, or `group:<g>` from the new inventory `groups`. Hostless tools skip the host dimension.
+  - Root-capable is a **flag on the rule** (`sudo = true`), not a pseudo-tool name. A call is root-capable when it needs `sudo_exec`, or it is `vm_stop`. Rules match only calls of their own kind, so `tools = ["*"]` can't leak root, and a glob can't be written that does.
+  - `approval = "ticket" | "human"` refuses with the new class `approval_required` until E6. Lint warns about it.
+  - Errors carry `rule` in `error.data`. The journald `tool call failed` line has it too, and allows log `policy allow … rule=…`. The rule is `policy.toml:<line>`, with ` (<id>)` when set, or `default-deny`.
+  - Policy is loaded only in optional/required. With `off` it is never read, as with `agents.toml`. A missing file is deny-all with a loud warning; a malformed one is fatal at startup and, on SIGHUP, **fails closed**: deny-all, with `policy file invalid since <time>: <error>` in refusals, until a valid file is loaded (task 008; it used to keep the previous policy).
+  - `sudo = true` gates prompto's own root paths only. An exec grant is a shell as `ssh_user`, which is root where that user is root or has passwordless sudo. Inventory `nopasswd_sudo` (optional) feeds a lint warning, and every tool is classified root-capable / arbitrary exec / ordinary, enforced by a test (task 008).
+  - With policy on, `inventory_list` lists only hosts the agent has a grant on, and `sudo_password_vault_path` appears only with a `sudo = true` grant on that host (also in `inventory_get_host`). `off` output is unchanged. `tools/list` is not filtered (owner decision, task 008).
+  - Lint: an agent group nobody is in is a warning, not an error (owner decision, task 008).
+  - `prompto policy lint` (also run at startup and on reload, log only) enumerates every agent × host × tool × root call to find shadowed and dead rules exactly.
 
 ### E4 — Audit log (v0.12.0)
 - **S4.1 Writer.** Append-only `audit.jsonl` (`0640 prompto:prompto-audit`), plus a `tracing` event with the same fields so journald gets structured fields.
