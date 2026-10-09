@@ -21,7 +21,7 @@
 //! holding a role token can claim any session.
 
 use crate::ctx::Agent;
-use crate::stamp::{Seen, Stamp};
+use crate::stamp::{Seen, Stamp, read_settled};
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -288,8 +288,8 @@ impl AgentStore {
 
     pub fn load_from(path: PathBuf) -> Result<Self> {
         // Stamped before reading: a change during the read is seen next.
-        let stamp = Stamp::of(&path);
-        let agents = Agents::from_path(&path)?;
+        let (stamp, agents) = read_settled(&path, Agents::from_path);
+        let agents = agents?;
         let store = Self::new(agents, Some(path));
         store
             .seen
@@ -339,8 +339,9 @@ impl AgentStore {
     }
 
     fn read_locked(&self, path: &Path, seen: &mut Seen) -> Result<usize> {
-        seen.record(Stamp::of(path));
-        match Agents::from_path(path) {
+        let (stamp, read) = read_settled(path, Agents::from_path);
+        seen.record(stamp);
+        match read {
             Ok(new) => {
                 let n = new.agents.len();
                 self.inner.store(Arc::new(new));
