@@ -13,7 +13,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::ctx::CallCtx;
-use crate::inventory::{HostConfig, Platform};
+use crate::inventory::{HostConfig, RequestIdEnv};
 use crate::vault::VaultClient;
 use std::sync::Arc;
 
@@ -86,11 +86,14 @@ pub fn sudo_guarded(cmd: &str) -> String {
 pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
 
 /// Shell text exporting [`REQUEST_ID_ENV`], put in front of every remote
-/// command on hosts whose login shell is known to be POSIX-ish (sh, bash,
-/// zsh: Linux and macOS). `None` elsewhere: on FreeBSD/OPNsense the login
-/// shell may be csh, which has no `export`, and Windows has no POSIX
-/// shell at all. Those hosts get the ID only through `-o SetEnv`
-/// (needs `AcceptEnv PROMPTO_*`) or the vault sudo path.
+/// command on hosts whose [`RequestIdEnv`] is `export`. That is the
+/// default where the login shell is known to be POSIX-ish (sh, bash, zsh:
+/// Linux and macOS). Elsewhere the default is `setenv`: on
+/// FreeBSD/OPNsense the login shell may be csh, which has no `export`,
+/// and Windows has no POSIX shell at all. Those hosts get the ID only
+/// through `-o SetEnv` (needs `AcceptEnv PROMPTO_*`) or the vault sudo
+/// path. `off` hosts get nothing: a key restricted by `command=`, rrsync
+/// or git-shell sees the whole command line and rejects the prefix.
 ///
 /// `sudo -n` resets the environment, so a passwordless-sudo command sees
 /// the variable only if the host's sudoers has
@@ -101,19 +104,25 @@ pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
 /// itself (see [`with_request_id`]).
 ///
 /// `rid` must be a ULID (Crockford base32): it is spliced in unquoted.
-pub fn request_id_export(platform: Platform, rid: &str) -> Option<String> {
-    match platform {
-        Platform::Linux | Platform::Macos => Some(format!("export {REQUEST_ID_ENV}={rid}; ")),
-        Platform::Freebsd | Platform::Windows => None,
+pub fn request_id_export(mode: RequestIdEnv, rid: &str) -> Option<String> {
+    match mode {
+        RequestIdEnv::Export => Some(format!("export {REQUEST_ID_ENV}={rid}; ")),
+        RequestIdEnv::Setenv | RequestIdEnv::Off => None,
     }
 }
 
 /// `cmd` run under `env PROMPTO_REQUEST_ID=<id>`, for the slot after the
 /// sudo guard's `exec "$@"` — the root side of the vault sudo path, where
 /// sudo has already reset the environment. Plain words, so the login
-/// shell (even csh) passes them through untouched.
-pub fn with_request_id(ctx: &CallCtx, cmd: &str) -> String {
-    format!("env {REQUEST_ID_ENV}={} {cmd}", ctx.request_id())
+/// shell (even csh) passes them through untouched. `cmd` unchanged on
+/// `off` hosts.
+pub fn with_request_id(ctx: &CallCtx, host: &HostConfig, cmd: &str) -> String {
+    match host.request_id_env() {
+        RequestIdEnv::Off => cmd.to_string(),
+        RequestIdEnv::Export | RequestIdEnv::Setenv => {
+            format!("env {REQUEST_ID_ENV}={} {cmd}", ctx.request_id())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +173,7 @@ impl SshClient {
         if sudo {
             if let Some(pw) = self.sudo_password(host).await? {
                 let input = sudo_stdin_payload(&pw, cmd.as_bytes());
-                let remote = sudo_guarded(&with_request_id(ctx, "sh -s"));
+                let remote = sudo_guarded(&with_request_id(ctx, host, "sh -s"));
                 return self
                     .run(ctx, host, &remote, Some(&input), cmd_timeout)
                     .await;
@@ -202,7 +211,7 @@ impl SshClient {
             if let Some(pw) = self.sudo_password(host).await? {
                 let mut input = sudo_preamble(&pw);
                 input.extend_from_slice(stdin_bytes);
-                let remote = sudo_guarded(&with_request_id(ctx, cmd));
+                let remote = sudo_guarded(&with_request_id(ctx, host, cmd));
                 return self
                     .run(ctx, host, &remote, Some(&input), cmd_timeout)
                     .await;
@@ -305,23 +314,27 @@ impl SshClient {
     /// with the request ID exported in front of it.
     fn ssh_args(&self, ctx: &CallCtx, host: &HostConfig, remote: &str) -> Vec<OsString> {
         let rid = ctx.request_id();
-        let remote = match request_id_export(host.platform, &rid) {
+        let mode = host.request_id_env();
+        let remote = match request_id_export(mode, &rid) {
             Some(export) => format!("{export}{remote}"),
             None => remote.to_string(),
         };
-        vec![
+        let mut args = vec![
             OsString::from("-o"),
             "BatchMode=yes".into(),
             "-o".into(),
             format!("ConnectTimeout={}", self.connect_timeout.as_secs().max(1)).into(),
             "-o".into(),
             "StrictHostKeyChecking=accept-new".into(),
+        ];
+        if mode != RequestIdEnv::Off {
             // Delivered only where the host's sshd has `AcceptEnv
             // PROMPTO_*`, silently dropped elsewhere. It is the only
-            // route on hosts whose login shell may be csh, where the
-            // export prefix is skipped.
-            "-o".into(),
-            format!("SetEnv={REQUEST_ID_ENV}={rid}").into(),
+            // route on `setenv` hosts, where the export prefix is skipped.
+            args.push("-o".into());
+            args.push(format!("SetEnv={REQUEST_ID_ENV}={rid}").into());
+        }
+        args.extend([
             "-i".into(),
             host.ssh_key.clone().into_os_string(),
             "-p".into(),
@@ -329,7 +342,8 @@ impl SshClient {
             format!("{}@{}", host.ssh_user, host.ip).into(),
             "--".into(),
             remote.into(),
-        ]
+        ]);
+        args
     }
 }
 
@@ -453,18 +467,96 @@ mod tests {
 
     /// csh has no `export`: prefixing it there would turn every command
     /// on an OPNsense box into a "Command not found" plus whatever the
-    /// rest does. Only platforms with a known POSIX login shell get it.
+    /// rest does. Only `export` mode gets it, and that is the default only
+    /// on platforms with a known POSIX login shell (see below).
     #[test]
-    fn request_id_export_only_where_the_shell_is_posix() {
-        for p in [Platform::Linux, Platform::Macos] {
-            assert_eq!(
-                request_id_export(p, "01ABC").as_deref(),
-                Some("export PROMPTO_REQUEST_ID=01ABC; ")
+    fn request_id_export_only_in_export_mode() {
+        assert_eq!(
+            request_id_export(RequestIdEnv::Export, "01ABC").as_deref(),
+            Some("export PROMPTO_REQUEST_ID=01ABC; ")
+        );
+        for m in [RequestIdEnv::Setenv, RequestIdEnv::Off] {
+            assert_eq!(request_id_export(m, "01ABC"), None);
+        }
+    }
+
+    fn host(extra: &str) -> HostConfig {
+        let toml = format!(
+            "[host.h]\nip = \"192.0.2.5\"\nssh_user = \"u\"\nssh_key = \"/dev/null\"\n{extra}\n"
+        );
+        crate::inventory::Inventory::from_toml_str(&toml)
+            .unwrap()
+            .get("h")
+            .unwrap()
+            .clone()
+    }
+
+    /// ssh's argv for `remote` on a host configured with `extra`.
+    fn argv(extra: &str) -> (Vec<String>, String) {
+        let ctx = CallCtx::new(None);
+        let client = SshClient::new("ssh".into(), Duration::from_secs(5));
+        let args = client
+            .ssh_args(&ctx, &host(extra), "uptime")
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        (args, ctx.request_id())
+    }
+
+    /// Unset `request_id_env` keeps today's behaviour: export + SetEnv on
+    /// POSIX platforms, SetEnv alone on the others.
+    #[test]
+    fn request_id_env_defaults_follow_the_platform() {
+        for (extra, export) in [
+            ("", true),
+            ("platform = \"macos\"", true),
+            ("platform = \"freebsd\"", false),
+            ("platform = \"windows\"", false),
+        ] {
+            let (args, rid) = argv(extra);
+            assert!(
+                args.contains(&format!("SetEnv=PROMPTO_REQUEST_ID={rid}")),
+                "{extra}: {args:?}"
             );
+            let want = if export {
+                format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+            } else {
+                "uptime".to_string()
+            };
+            assert_eq!(args.last().unwrap(), &want, "{extra}");
         }
-        for p in [Platform::Freebsd, Platform::Windows] {
-            assert_eq!(request_id_export(p, "01ABC"), None);
-        }
+    }
+
+    /// `setenv` on a Linux host drops the prefix; `export` on FreeBSD
+    /// (bash as login shell) adds it.
+    #[test]
+    fn request_id_env_overrides_the_platform_default() {
+        let (args, rid) = argv("request_id_env = \"setenv\"");
+        assert_eq!(args.last().unwrap(), "uptime");
+        assert!(args.contains(&format!("SetEnv=PROMPTO_REQUEST_ID={rid}")));
+
+        let (args, rid) = argv("platform = \"freebsd\"\nrequest_id_env = \"export\"");
+        assert_eq!(
+            args.last().unwrap(),
+            &format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+        );
+    }
+
+    /// `off`: the command line is exactly the caller's, and no SetEnv —
+    /// a `command=`/rrsync key must see nothing prompto added.
+    #[test]
+    fn request_id_env_off_adds_nothing() {
+        let (args, _) = argv("request_id_env = \"off\"");
+        assert_eq!(args.last().unwrap(), "uptime");
+        assert!(
+            !args.iter().any(|a| a.contains("PROMPTO_REQUEST_ID")),
+            "{args:?}"
+        );
+        let ctx = CallCtx::new(None);
+        assert_eq!(
+            with_request_id(&ctx, &host("request_id_env = \"off\""), "sh -s"),
+            "sh -s"
+        );
     }
 
     /// The root shell on the vault path sees the ID even though sudo
@@ -474,7 +566,7 @@ mod tests {
     fn guard_passes_the_request_id_to_the_root_shell() {
         use std::io::Write;
         let ctx = CallCtx::new(None);
-        let guarded = with_request_id(&ctx, "sh -s");
+        let guarded = with_request_id(&ctx, &host(""), "sh -s");
         let mut child = std::process::Command::new("/bin/sh")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")

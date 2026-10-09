@@ -9,13 +9,22 @@
 //!
 //! 1. the host exists (`unknown_host`);
 //! 2. it carries the capability the tool needs (`refused_capability`);
-//! 3. it is not the caller's own machine, unless the tool is listed in
-//!    [`self_target_exemption`] (`refused_self_target`);
+//! 3. it is not the caller's own machine (`refused_self_target`) —
+//!    **unconditionally**: no tool is exempt, and no policy (E3) or
+//!    ticket (E6) can grant it;
 //! 4. *(E3)* the agent's policy grants this tool on this host;
 //! 5. *(E6)* a valid ticket accompanies the call where policy demands one.
 //!
 //! Steps 4 and 5 do not exist yet; the comments in [`authorize`] and
-//! [`authorize_tool`] mark where they go.
+//! [`authorize_tool`] mark where they go. They come *after* step 3 on
+//! purpose: the self-target guard is not a policy dimension, so nothing
+//! a policy says can reach the code that would skip it.
+//!
+//! The only way to resolve a host without the guard is [`lookup`], for
+//! tools that read the inventory and never contact the host
+//! (`inventory_get_host`). There is no tool-name table: a new tool that
+//! contacts a host calls [`authorize`] like every other one, and is
+//! guarded without anyone having to remember it.
 
 use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass};
@@ -24,9 +33,10 @@ use crate::inventory::{Capability, HostConfig, Inventory};
 /// What a tool needs from its target host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// The host must exist; no capability. For tools that only read the
-    /// inventory or probe from the outside (`host_status`, `port_scan`).
-    Lookup,
+    /// The host must exist; no capability. For tools that contact the
+    /// host without logging in (`host_status`, `port_scan`). Still
+    /// self-target guarded.
+    Exists,
     /// The host must grant this capability.
     Cap(Capability),
 }
@@ -39,62 +49,10 @@ pub struct Authorized {
     pub host: HostConfig,
 }
 
-/// Tools allowed to target the caller's own machine, and why. Every
-/// other tool — including any tool added later and not listed here — is
-/// refused when the target's IP is the caller's IP.
-///
-/// The guard exists because an agent asking prompto to reach its own box
-/// is either wasting a round trip (it has a local shell) or escaping its
-/// local sandbox: prompto's session runs as the inventory's `ssh_user`,
-/// with sudo where granted, sidestepping whatever confines the agent
-/// (and, on prompto's own host, prompto's systemd hardening). The tools
-/// below either never log into the host, or are a documented
-/// self-management path with no caller-supplied command.
-pub fn self_target_exemption(tool: &str) -> Option<&'static str> {
-    Some(match tool {
-        // No login on the host: a WOL packet, TCP connects, or the
-        // inventory. Waking a running box is a no-op; probing your own
-        // ports *from prompto* is a legitimate reachability check that
-        // a local shell cannot do.
-        "host_wake" => "sends a WOL packet; never logs into the host",
-        "host_status" => "TCP connect to the SSH port; never logs in",
-        "port_scan" => "TCP connects from prompto's vantage point; never logs in",
-        "inventory_get_host" => "reads the inventory only",
-        // A claude_admin client managing its own Claude Code is what the
-        // mcp_* family is for: mcp_reconnect_hint tells an agent behind
-        // claudecli to call mcp_restart_claudecli on its own client, and
-        // to run mcp_status on it first. These run fixed, prompto-built
-        // commands with no caller-supplied shell text.
-        //
-        // mcp_add / mcp_remove are deliberately NOT here: registering a
-        // stdio MCP server is registering a command that the next Claude
-        // session runs, i.e. persistence on the caller's own box outside
-        // its sandbox.
-        "mcp_list" | "mcp_get" | "mcp_status" => {
-            "read-only view of the client's own Claude Code MCP config"
-        }
-        "mcp_restart_claudecli" => {
-            "documented self-restart path for claudecli (see mcp_reconnect_hint)"
-        }
-        _ => return None,
-    })
-}
-
-/// Authorize `tool` against `host_name` for the call described by `ctx`.
-///
-/// On success returns the resolved host (cloned out of the snapshot, so
-/// callers don't hold the inventory borrow). On failure returns a
-/// [`ClassifiedError`] whose message keeps the wording the inline checks
-/// used ("unknown host", "lacks capability", "calling agent's own host").
-pub fn authorize(
-    inv: &Inventory,
-    ctx: &CallCtx,
-    tool: &str,
-    host_name: &str,
-    need: Need,
-) -> Result<Authorized, ClassifiedError> {
+/// Resolve `host_name` and check `need`, classifying the refusal.
+fn resolve(inv: &Inventory, host_name: &str, need: Need) -> Result<Authorized, ClassifiedError> {
     let host = match need {
-        Need::Lookup => inv.get(host_name),
+        Need::Exists => inv.get(host_name),
         Need::Cap(cap) => inv.require(host_name, cap),
     }
     .map_err(|e| {
@@ -105,33 +63,71 @@ pub fn authorize(
         };
         ClassifiedError::refused(class, e)
     })?;
+    Ok(Authorized {
+        canonical: inv.canonical(host_name).unwrap_or(host_name).to_string(),
+        host: host.clone(),
+    })
+}
+
+/// Authorize `tool` against `host_name` for the call described by `ctx`.
+/// Every tool that contacts a host — logs in, execs, copies files, sends
+/// a packet or opens a TCP connection to it — goes through here.
+///
+/// On success returns the resolved host (cloned out of the snapshot, so
+/// callers don't hold the inventory borrow). On failure returns a
+/// [`ClassifiedError`] ("unknown host", "lacks capability", or the
+/// self-target refusal, which tells the agent to use its local shell).
+pub fn authorize(
+    inv: &Inventory,
+    ctx: &CallCtx,
+    _tool: &str,
+    host_name: &str,
+    need: Need,
+) -> Result<Authorized, ClassifiedError> {
+    let target = resolve(inv, host_name, need)?;
 
     // `caller_ip` is None only on transports without addresses (stdio,
     // tests); that is the one way to skip the comparison. `ip` is an
     // `IpAddr`, so inventory content can never make it incomparable.
+    // Both sides are canonicalized: an IPv4 client seen through a
+    // dual-stack socket (or a proxy) as `::ffff:a.b.c.d` is the same
+    // machine as `a.b.c.d`, and a plain `==` says it is not.
     if let Some(caller) = ctx.caller_ip
-        && caller == host.ip
-        && self_target_exemption(tool).is_none()
+        && caller.to_canonical() == target.host.ip.to_canonical()
     {
         return Err(ClassifiedError::refused(
             ErrorClass::RefusedSelfTarget,
             format!(
-                "refused: target {host_name:?} is the calling agent's own host (source IP {caller}). \
-                 Use your local shell tool instead — routing a same-host call through prompto \
-                 wastes a round trip and bypasses any local sandboxing."
+                "refused_self_target: you are calling from {} ({}) — prompto never acts on \
+                 the caller's own machine; run this in your local shell instead.",
+                target.canonical,
+                caller.to_canonical()
             ),
         ));
     }
 
     // E3 seam: policy check (ctx.agent × tool × canonical host) goes
-    // here, refusing with `refused_policy` and naming the rule.
+    // here, refusing with `refused_policy` and naming the rule. Policy
+    // can only narrow: it runs after the self-target guard and has no
+    // way to undo it.
     // E6 seam: ticket verification goes here, after policy has said
     // whether one is required.
 
-    Ok(Authorized {
-        canonical: inv.canonical(host_name).unwrap_or(host_name).to_string(),
-        host: host.clone(),
-    })
+    Ok(target)
+}
+
+/// Resolve a host for a tool that only reads its inventory entry and
+/// never contacts it (`inventory_get_host`). No self-target guard,
+/// because nothing reaches the machine. Do not use this for anything
+/// that opens a connection to the host — use [`authorize`].
+pub fn lookup(
+    inv: &Inventory,
+    _ctx: &CallCtx,
+    _tool: &str,
+    host_name: &str,
+) -> Result<Authorized, ClassifiedError> {
+    // E3 seam: tool-level policy for inventory reads goes here.
+    resolve(inv, host_name, Need::Exists)
 }
 
 /// Authorize a tool that targets no host (`inventory_list`,
@@ -141,7 +137,6 @@ pub fn authorize_tool(_ctx: &CallCtx, _tool: &str) -> Result<(), ClassifiedError
     // E3 seam: tool-level policy (agent × tool, no host) goes here.
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,7 +183,7 @@ capabilities = []
 
     #[test]
     fn unknown_host_is_classified() {
-        let r = authorize(&inv(), &ctx(None), "ssh_exec", "nope", Need::Lookup);
+        let r = authorize(&inv(), &ctx(None), "ssh_exec", "nope", Need::Exists);
         assert_eq!(class(r), ErrorClass::UnknownHost);
     }
 
@@ -207,43 +202,106 @@ capabilities = []
     }
 
     #[test]
-    fn self_target_is_refused_for_an_unlisted_tool() {
+    fn self_target_is_refused_with_an_actionable_message() {
         let r = authorize(
             &inv(),
             &ctx(Some("192.0.2.12")),
             "bash_exec",
+            "a",
+            Need::Cap(Capability::Exec),
+        );
+        let e = r.unwrap_err();
+        assert_eq!(e.class, ErrorClass::RefusedSelfTarget);
+        assert_eq!(
+            e.message,
+            "refused_self_target: you are calling from alpha (192.0.2.12) — prompto never \
+             acts on the caller's own machine; run this in your local shell instead."
+        );
+    }
+
+    /// No exemptions: tools that only probe from the outside are refused
+    /// too, and so is a tool nobody has thought about yet.
+    #[test]
+    fn self_target_is_refused_for_every_tool() {
+        for tool in [
+            "host_status",
+            "port_scan",
+            "host_wake",
+            "mcp_restart_claudecli",
+            "some_future_tool",
+        ] {
+            let r = authorize(
+                &inv(),
+                &ctx(Some("192.0.2.12")),
+                tool,
+                "alpha",
+                Need::Exists,
+            );
+            assert_eq!(class(r), ErrorClass::RefusedSelfTarget, "{tool}");
+        }
+    }
+
+    /// `::ffff:a.b.c.d` is the IPv4 client `a.b.c.d` as a dual-stack
+    /// socket or a proxy reports it; a plain `==` would let it through.
+    #[test]
+    fn ipv4_mapped_caller_is_the_same_machine() {
+        let r = authorize(
+            &inv(),
+            &ctx(Some("::ffff:192.0.2.12")),
+            "ssh_exec",
             "alpha",
             Need::Cap(Capability::Exec),
         );
         let e = r.unwrap_err();
         assert_eq!(e.class, ErrorClass::RefusedSelfTarget);
-        assert!(e.message.contains("calling agent's own host"));
+        assert!(e.message.contains("(192.0.2.12)"), "{}", e.message);
     }
 
-    /// Fail closed: a tool nobody thought about is guarded.
+    /// The other side: an inventory that spells the host's IP mapped.
     #[test]
-    fn unknown_tool_names_are_not_exempt() {
-        assert!(self_target_exemption("some_future_tool").is_none());
+    fn ipv4_mapped_inventory_ip_is_the_same_machine() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.mapped]
+ip = "::ffff:192.0.2.12"
+ssh_user = "u"
+ssh_key = "/dev/null"
+capabilities = ["exec"]
+"#,
+        )
+        .unwrap();
         let r = authorize(
-            &inv(),
+            &inv,
             &ctx(Some("192.0.2.12")),
-            "some_future_tool",
-            "alpha",
-            Need::Lookup,
+            "ssh_exec",
+            "mapped",
+            Need::Cap(Capability::Exec),
         );
         assert_eq!(class(r), ErrorClass::RefusedSelfTarget);
     }
 
     #[test]
-    fn exempt_tools_may_target_the_caller() {
-        authorize(
-            &inv(),
-            &ctx(Some("192.0.2.12")),
-            "host_status",
-            "alpha",
-            Need::Lookup,
-        )
-        .unwrap();
+    fn a_different_caller_is_not_self_targeting() {
+        for caller in ["192.0.2.13", "::ffff:192.0.2.13", "2001:db8::12"] {
+            authorize(
+                &inv(),
+                &ctx(Some(caller)),
+                "ssh_exec",
+                "alpha",
+                Need::Cap(Capability::Exec),
+            )
+            .unwrap_or_else(|e| panic!("{caller}: {}", e.message));
+        }
+    }
+
+    /// `lookup` never contacts the host, so the caller may read its own
+    /// inventory entry; existence is still checked.
+    #[test]
+    fn lookup_skips_the_guard_but_not_existence() {
+        let a = lookup(&inv(), &ctx(Some("192.0.2.12")), "inventory_get_host", "a").unwrap();
+        assert_eq!(a.canonical, "alpha");
+        let r = lookup(&inv(), &ctx(None), "inventory_get_host", "nope");
+        assert_eq!(class(r), ErrorClass::UnknownHost);
     }
 
     #[test]

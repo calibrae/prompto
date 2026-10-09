@@ -136,6 +136,43 @@ impl Chassis {
     }
 }
 
+/// How the call's request ID (`PROMPTO_REQUEST_ID`) reaches the remote
+/// command. See `ssh::request_id_export` for the mechanics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestIdEnv {
+    /// `export PROMPTO_REQUEST_ID=…; ` in front of the remote command,
+    /// plus `-o SetEnv`. Needs a POSIX login shell that runs the command
+    /// line as given. Default on `linux` and `macos`.
+    Export,
+    /// `-o SetEnv` only; the command line is left untouched. Arrives only
+    /// where sshd has `AcceptEnv PROMPTO_*`. Default on `freebsd` and
+    /// `windows`, where the login shell may not be POSIX.
+    Setenv,
+    /// Nothing: no prefix, no `SetEnv`, no `env` on the vault sudo path.
+    /// For keys restricted by `command=`, rrsync or git-shell, which see
+    /// (and reject) anything prompto adds to the command line.
+    Off,
+}
+
+impl RequestIdEnv {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestIdEnv::Export => "export",
+            RequestIdEnv::Setenv => "setenv",
+            RequestIdEnv::Off => "off",
+        }
+    }
+
+    /// The behaviour a host gets when it does not set `request_id_env`.
+    pub fn default_for(platform: Platform) -> Self {
+        match platform {
+            Platform::Linux | Platform::Macos => RequestIdEnv::Export,
+            Platform::Freebsd | Platform::Windows => RequestIdEnv::Setenv,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
     /// Literal IPv4/IPv6 address — NOT a hostname. Typed as [`IpAddr`] on
@@ -195,11 +232,24 @@ pub struct HostConfig {
     pub sudo_password_vault_field: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// How the request ID is passed to remote commands: `export`,
+    /// `setenv` or `off`. Unset means the platform default (see
+    /// [`RequestIdEnv::default_for`]); read it via
+    /// [`HostConfig::request_id_env`].
+    #[serde(default, rename = "request_id_env")]
+    pub request_id_env_override: Option<RequestIdEnv>,
 }
 
 impl HostConfig {
     pub fn has(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
+    }
+
+    /// The effective [`RequestIdEnv`]: the inventory's setting, else the
+    /// platform default.
+    pub fn request_id_env(&self) -> RequestIdEnv {
+        self.request_id_env_override
+            .unwrap_or_else(|| RequestIdEnv::default_for(self.platform))
     }
 
     /// Validate self-consistency (called once per load).
@@ -472,6 +522,25 @@ capabilities = ["exec"]
         );
     }
 
+    /// A typo in `request_id_env` must fail the load (and so a SIGHUP
+    /// reload keeps the old inventory), not silently fall back.
+    #[test]
+    fn request_id_env_is_validated_at_load() {
+        let base = "[host.h]\nip = \"192.0.2.5\"\nssh_user = \"u\"\nssh_key = \"/dev/null\"\n";
+        for (v, want) in [
+            ("export", RequestIdEnv::Export),
+            ("setenv", RequestIdEnv::Setenv),
+            ("off", RequestIdEnv::Off),
+        ] {
+            let inv =
+                Inventory::from_toml_str(&format!("{base}request_id_env = \"{v}\"\n")).unwrap();
+            assert_eq!(inv.get("h").unwrap().request_id_env(), want);
+        }
+        let err =
+            Inventory::from_toml_str(&format!("{base}request_id_env = \"Export\"\n")).unwrap_err();
+        assert!(format!("{err:#}").contains("request_id_env"), "{err:#}");
+    }
+
     /// The whole point of the type change: every host in a loadable
     /// inventory is comparable against a caller IP, so a self-targeting
     /// call cannot slip through on any of them.
@@ -481,10 +550,11 @@ capabilities = ["exec"]
         for (name, host) in &inv.hosts {
             let ctx = crate::ctx::CallCtx::new(Some(host.ip));
             let err =
-                crate::authz::authorize(&inv, &ctx, "ssh_exec", name, crate::authz::Need::Lookup)
+                crate::authz::authorize(&inv, &ctx, "ssh_exec", name, crate::authz::Need::Exists)
                     .unwrap_err();
-            assert!(
-                err.message.contains("calling agent's own host"),
+            assert_eq!(
+                err.class,
+                crate::error_class::ErrorClass::RefusedSelfTarget,
                 "host {name} was not self-guarded"
             );
         }

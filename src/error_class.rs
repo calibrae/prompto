@@ -24,8 +24,8 @@ pub enum ErrorClass {
     UnknownHost,
     /// The host exists but lacks the capability the tool needs.
     RefusedCapability,
-    /// The target is the calling agent's own machine and the tool is not
-    /// exempt (see `authz::self_target_exemption`).
+    /// The target is the calling agent's own machine. Unconditional: no
+    /// tool is exempt and no policy can grant it (see `authz`).
     RefusedSelfTarget,
     /// An argument failed validation; nothing was run.
     InvalidArgs,

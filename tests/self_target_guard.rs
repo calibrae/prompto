@@ -60,6 +60,17 @@ async fn spawn_server() -> Server {
 
 /// Boot the real router with an explicit `legacy_session_mode`.
 async fn spawn_server_with(legacy_session_mode: bool) -> Server {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    serve(listener, addr, legacy_session_mode).await
+}
+
+/// Serve on `listener`; clients connect to `addr`.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    addr: SocketAddr,
+    legacy_session_mode: bool,
+) -> Server {
     let inv = Inventory::from_toml_str(INVENTORY).unwrap();
     let store = InventoryStore::new(inv, None);
     let cancel = CancellationToken::new();
@@ -78,8 +89,6 @@ async fn spawn_server_with(legacy_session_mode: bool) -> Server {
         cancel: cancel.clone(),
     });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let shutdown = cancel.clone();
     tokio::spawn(async move {
         axum::serve(
@@ -224,7 +233,7 @@ async fn self_targeted_call_is_refused() {
     let body = call_tool(&server, "loopback", &[]).await;
 
     assert!(
-        body.contains("calling agent's own host"),
+        body.contains("prompto never acts on the caller's own machine"),
         "self-targeted call was NOT refused — the guard is failing open.\nresponse: {body}"
     );
     // And make sure it didn't "refuse" merely by failing to reach the tool.
@@ -250,8 +259,42 @@ async fn trusted_proxy_header_moves_the_guard_target() {
     let body = call_tool(&server, "elsewhere", &[("x-real-ip", "192.0.2.77")]).await;
 
     assert!(
-        body.contains("calling agent's own host"),
+        body.contains("prompto never acts on the caller's own machine"),
         "guard did not follow the trusted proxy's X-Real-IP.\nresponse: {body}"
+    );
+}
+
+/// A proxy that writes the client as IPv4-mapped IPv6 (`::ffff:a.b.c.d`)
+/// must not walk past the guard: it is the same machine as `a.b.c.d`.
+#[tokio::test]
+async fn ipv4_mapped_x_real_ip_is_still_self_targeting() {
+    let server = spawn_server().await;
+    let body = call_tool(&server, "elsewhere", &[("x-real-ip", "::ffff:192.0.2.77")]).await;
+
+    assert!(
+        body.contains("you are calling from elsewhere (192.0.2.77)"),
+        "guard missed an IPv4-mapped caller.\nresponse: {body}"
+    );
+}
+
+/// A dual-stack listener (`[::]`) reports an IPv4 client's peer address
+/// as `::ffff:127.0.0.1`. That raw mapped peer is still `loopback`.
+#[tokio::test]
+async fn raw_ipv4_mapped_peer_is_still_self_targeting() {
+    let listener = match tokio::net::TcpListener::bind("[::]:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("skipping: no IPv6 listener here ({e})");
+            return;
+        }
+    };
+    let port = listener.local_addr().unwrap().port();
+    let server = serve(listener, SocketAddr::from(([127, 0, 0, 1], port)), false).await;
+    let body = call_tool(&server, "loopback", &[]).await;
+
+    assert!(
+        body.contains("you are calling from loopback (127.0.0.1)"),
+        "guard missed a raw IPv4-mapped peer.\nresponse: {body}"
     );
 }
 
@@ -266,7 +309,7 @@ async fn guard_does_not_refuse_a_genuinely_remote_target() {
     let body = call_tool(&server, "loopback", &[("x-real-ip", "192.0.2.77")]).await;
 
     assert!(
-        !body.contains("calling agent's own host"),
+        !body.contains("prompto never acts on the caller's own machine"),
         "guard refused a call whose caller differs from the target: {body}"
     );
 }
@@ -281,7 +324,7 @@ async fn self_targeted_call_is_refused_on_legacy_path_too() {
     let body = call_tool_legacy(&server, "loopback").await;
 
     assert!(
-        body.contains("calling agent's own host"),
+        body.contains("prompto never acts on the caller's own machine"),
         "self-targeted call was NOT refused over the legacy session path.\nresponse: {body}"
     );
 }
@@ -322,7 +365,7 @@ async fn legacy_dialect_self_target_refused_when_sessionless() {
     let body = call_tool_legacy_inner(&server, "loopback", false).await;
 
     assert!(
-        body.contains("calling agent's own host"),
+        body.contains("prompto never acts on the caller's own machine"),
         "sessionless legacy path failed to refuse self-targeting: {body}"
     );
 }

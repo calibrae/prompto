@@ -2,9 +2,9 @@
 //!
 //! - every result carries a `request_id`, on success and on error (in
 //!   `error.data` and the message prefix);
-//! - the self-targeting guard covers every tool that reaches the caller's
-//!   own machine, except the exempt ones — enumerated from `tools/list`,
-//!   so a new tool is covered the day it appears;
+//! - the self-targeting guard covers every tool that reaches a host, with
+//!   no exemptions — enumerated from `tools/list`, so a new tool is
+//!   covered the day it appears;
 //! - `PROMPTO_REQUEST_ID` reaches the remote command, including the root
 //!   side of the vault sudo path, without the password reaching argv.
 //!
@@ -66,20 +66,31 @@ exec env -i PATH=/usr/bin:/bin "$@"
 
 const INVENTORY: &str = r#"
 # The test client connects from 127.0.0.1: targeting `loopback` is
-# self-targeting. It carries every capability but `wake` (a real WOL
-# broadcast is not something a test should send).
+# self-targeting. It carries every capability, so each tool gets past the
+# capability check and reaches the guard. (`wake` uses a locally
+# administered MAC; the guard refuses before any packet would be sent.)
 [host.loopback]
 ip = "127.0.0.1"
+mac = "02:00:00:00:00:01"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 apytti_url = "http://127.0.0.1:9"
-capabilities = ["exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["wake", "exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
 
 [host.runner]
 ip = "127.0.0.20"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 capabilities = ["exec", "sudo_exec"]
+
+# Its key is restricted (`command=`, rrsync…): nothing may be added to
+# the command line.
+[host.restricted]
+ip = "127.0.0.22"
+ssh_user = "admin"
+ssh_key = "/dev/null"
+request_id_env = "off"
+capabilities = ["exec"]
 
 [host.vaulted]
 ip = "127.0.0.21"
@@ -257,8 +268,19 @@ async fn classified_error_merges_request_id_with_the_class() {
     );
 }
 
-/// Tools that target no host at all.
-const HOSTLESS: &[&str] = &["inventory_list", "mcp_reconnect_hint", "prompto_gain"];
+/// Tools that never contact a host: the hostless ones, and
+/// `inventory_get_host`, which only reads the inventory. Everything else
+/// must refuse the caller's own machine.
+const NEVER_CONTACTS_A_HOST: &[&str] = &[
+    "inventory_list",
+    "mcp_reconnect_hint",
+    "prompto_gain",
+    "inventory_get_host",
+];
+
+/// The refusal an agent sees for its own host (`loopback`, 127.0.0.1).
+const SELF_TARGET_MSG: &str = "refused_self_target: you are calling from loopback (127.0.0.1) \
+     — prompto never acts on the caller's own machine; run this in your local shell instead.";
 
 /// Arguments that pass every tool's own validation, aimed at `loopback`.
 fn self_targeting_args(tool: &str) -> Value {
@@ -283,11 +305,12 @@ fn self_targeting_args(tool: &str) -> Value {
 }
 
 /// THE test for the universal guard. Every tool `tools/list` advertises
-/// is called against the caller's own host: non-exempt tools must be
-/// refused as `refused_self_target`, exempt ones must get past the guard.
+/// is called against the caller's own host and must be refused as
+/// `refused_self_target`, unless it never contacts a host. There is no
+/// exemption list to consult: a new tool is expected to refuse.
 /// Removing the guard, or a handler skipping `authorize`, fails here.
 #[tokio::test]
-async fn every_tool_refuses_self_targeting_unless_exempt() {
+async fn every_host_contacting_tool_refuses_self_targeting() {
     let s = spawn_server().await;
     let list = rpc(&s, "tools/list", None, json!({})).await;
     let tools: Vec<String> = list["result"]["tools"]
@@ -302,18 +325,27 @@ async fn every_tool_refuses_self_targeting_unless_exempt() {
     for tool in &tools {
         let resp = call(&s, tool, self_targeting_args(tool)).await;
         let class = resp["error"]["data"]["error_class"].as_str();
-        let exempt = HOSTLESS.contains(&tool.as_str())
-            || prompto::authz::self_target_exemption(tool).is_some();
+        let exempt = NEVER_CONTACTS_A_HOST.contains(&tool.as_str());
         let refused = class == Some("refused_self_target");
         if refused == exempt {
-            wrong.push(format!("{tool} (exempt={exempt}): {resp}"));
+            wrong.push(format!("{tool} (never contacts a host={exempt}): {resp}"));
         }
         if refused {
             let msg = resp["error"]["message"].as_str().unwrap();
-            assert!(msg.contains("calling agent's own host"), "{tool}: {msg}");
+            assert!(msg.ends_with(SELF_TARGET_MSG), "{tool}: {msg}");
         }
     }
     assert!(wrong.is_empty(), "guard wrong for:\n{}", wrong.join("\n"));
+}
+
+/// The one host-addressed tool that may name the caller's own machine:
+/// it reads the inventory and never contacts the host.
+#[tokio::test]
+async fn inventory_get_host_may_name_the_callers_own_host() {
+    let s = spawn_server().await;
+    let out = ok_payload(&call(&s, "inventory_get_host", json!({ "name": "loopback" })).await);
+    assert_eq!(out["name"], "loopback");
+    assert_eq!(out["request_id_env"], "export");
 }
 
 /// rsync_sync guards its dest too: files written onto the caller's own
@@ -353,6 +385,23 @@ async fn request_id_reaches_the_remote_command() {
         "SetEnv missing from ssh argv: {}",
         s.argv_log()
     );
+}
+
+/// `request_id_env = "off"`: ssh gets the caller's command verbatim and
+/// no SetEnv, so a forced-command key sees nothing prompto added.
+#[tokio::test]
+async fn request_id_env_off_leaves_the_command_line_alone() {
+    let s = spawn_server().await;
+    let resp = call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "restricted", "cmd": "uptime" }),
+    )
+    .await;
+    ok_payload(&resp);
+    let argv = s.argv_log();
+    assert!(argv.lines().any(|l| l == "uptime"), "{argv}");
+    assert!(!argv.contains("PROMPTO_REQUEST_ID"), "{argv}");
 }
 
 /// The vault sudo path: sudo wipes the environment, so the ID reaches the
@@ -403,5 +452,5 @@ async fn log_endpoint_refuses_self_target_and_returns_request_id() {
         .to_string();
     assert_ulid(&rid);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("calling agent's own host"), "{body}");
+    assert!(body.contains(SELF_TARGET_MSG), "{body}");
 }

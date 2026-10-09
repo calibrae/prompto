@@ -1,6 +1,7 @@
 //! rmcp tool router for prompto. Every tool builds a [`CallCtx`], passes
 //! [`Prompto::authorize`] (or `authz::authorize_tool` when it targets no
-//! host) before touching anything, returns `anyhow::Result<impl
+//! host, `authz::lookup` when it only reads the inventory) before
+//! touching anything, returns `anyhow::Result<impl
 //! Serialize>`, and routes through `finish_tool`, which records one event
 //! per call and stamps the request ID on the result.
 
@@ -586,7 +587,7 @@ impl Prompto {
         let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let target = self.authorize(&ctx, "host_status", &args.host, Need::Lookup)?;
+            let target = self.authorize(&ctx, "host_status", &args.host, Need::Exists)?;
             let host = &target.host;
             host::status(host, Duration::from_secs(2)).await
         }
@@ -712,16 +713,22 @@ impl Prompto {
                 Need::Cap(Capability::Virt),
             )?;
             let host = &target.host;
+            // Every authorization runs before the first probe. Wake is only
+            // needed if the host turns out to be down, so its verdict is
+            // held and enforced then: a host without `wake` that is already
+            // up keeps working, but nothing touches the network until all
+            // the checks have run.
+            let wake_auth = self.authorize(
+                &ctx,
+                "vm_ensure_up",
+                &args.host,
+                Need::Cap(Capability::Wake),
+            );
 
             let initial = host::status(host, Duration::from_secs(2)).await?;
             let mut woke = false;
             if initial.state != "up" {
-                self.authorize(
-                    &ctx,
-                    "vm_ensure_up",
-                    &args.host,
-                    Need::Cap(Capability::Wake),
-                )?;
+                wake_auth?;
                 host::wake(host).await?;
                 woke = true;
                 host::wait_until_up(host, total).await?;
@@ -1078,23 +1085,12 @@ impl Prompto {
                         "mac": h.mac,
                         "ssh_user": h.ssh_user,
                         "ssh_port": h.ssh_port,
-                "platform": h.platform.as_str(),
-                "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
-                "hypervisor": h.hypervisor,
                         "platform": h.platform.as_str(),
-                "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
-                "hypervisor": h.hypervisor,
                         "chassis": h.chassis.as_str(),
-                "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
                         "aliases": h.aliases,
-                "sudo_password_vault_path": h.sudo_password_vault_path,
                         "sudo_password_vault_path": h.sudo_password_vault_path,
                         "hypervisor": h.hypervisor,
+                        "request_id_env": h.request_id_env().as_str(),
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     })
                 })
@@ -1116,7 +1112,8 @@ impl Prompto {
         let ctx = self.new_ctx();
         let host_name = args.name.clone();
         let res: anyhow::Result<_> = async {
-            let target = self.authorize(&ctx, "inventory_get_host", &args.name, Need::Lookup)?;
+            let target =
+                authz::lookup(&self.inv.snapshot(), &ctx, "inventory_get_host", &args.name)?;
             let h = &target.host;
             // Report the canonical name, not whatever the caller typed —
             // asking for an alias and being told it IS that host hides
@@ -1135,6 +1132,7 @@ impl Prompto {
                 "aliases": h.aliases,
                 "sudo_password_vault_path": h.sudo_password_vault_path,
                 "hypervisor": h.hypervisor,
+                "request_id_env": h.request_id_env().as_str(),
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             }))
         }
@@ -1209,7 +1207,7 @@ impl Prompto {
         let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
-            let target = self.authorize(&ctx, "port_scan", &args.host, Need::Lookup)?;
+            let target = self.authorize(&ctx, "port_scan", &args.host, Need::Exists)?;
             let host = &target.host;
             let probe = Duration::from_millis(args.probe_ms.unwrap_or(500).clamp(50, 5000));
             let mut results = Vec::with_capacity(args.ports.len());
@@ -1716,8 +1714,10 @@ impl Prompto {
             2. Daemon down: check `mcp_logs <host> <unit>`; if needed, restart via `ssh_sudo_exec`.\n\
             3. Session stale (probe says reachable, but your tool calls still fail):\n\
                • Interactive Claude Code session: type `/mcp` and reconnect the server.\n\
-               • Telegram via claudecli: ask me to call `mcp_restart_claudecli <client>` — claudecli\n\
-                 runs `claude -p` per message, so the next message handshakes fresh.\n\
+               • Telegram via claudecli: `mcp_restart_claudecli <client>` — claudecli runs\n\
+                 `claude -p` per message, so the next message handshakes fresh.\n\
+            prompto refuses every one of these against the caller's own machine: on the client\n\
+            itself, run the equivalent (`claude mcp list`, `systemctl restart …`) in your local shell.\n\
                • There is no in-session re-handshake hook today; this hint is the honest answer.";
         let res = authz::authorize_tool(&ctx, "mcp_reconnect_hint")
             .map(|()| serde_json::json!({ "hint": hint }))
