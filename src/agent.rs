@@ -299,11 +299,25 @@ impl AgentStore {
     }
 }
 
-/// HTTP auth configuration: mode plus the token store.
+/// HTTP auth configuration: mode, the token store and the policy.
 #[derive(Clone, Default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
     pub store: AgentStore,
+    /// `policy.toml`. Ignored with `off`; otherwise enforced, and the
+    /// default (no rules) denies every call.
+    pub policy: crate::policy::PolicyStore,
+}
+
+impl AuthConfig {
+    /// The policy to enforce on calls: `None` with `PROMPTO_AUTH=off`
+    /// (pre-E3 behaviour), the rules plus the live agent store otherwise.
+    pub fn enforcer(&self) -> Option<crate::policy::Enforcer> {
+        (self.mode != AuthMode::Off).then(|| crate::policy::Enforcer {
+            policy: self.policy.clone(),
+            agents: self.store.clone(),
+        })
+    }
 }
 
 /// Who is calling, as far as the transport knows. Snapshotted onto each
@@ -580,6 +594,7 @@ mod tests {
         AuthConfig {
             mode,
             store: AgentStore::new(a, None),
+            policy: Default::default(),
         }
     }
 

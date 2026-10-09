@@ -78,6 +78,8 @@ pub struct Prompto {
     /// Agent and session, snapshotted the same way from the auth
     /// middleware's task-local (`agent::current`). `local` on stdio.
     identity: crate::agent::Identity,
+    /// Policy (`crate::policy`); `None` with `PROMPTO_AUTH=off`.
+    policy: Option<crate::policy::Enforcer>,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -433,6 +435,7 @@ impl Prompto {
             advisor,
             caller_ip,
             identity: Default::default(),
+            policy: None,
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
@@ -443,6 +446,22 @@ impl Prompto {
     pub fn with_identity(mut self, identity: crate::agent::Identity) -> Self {
         self.identity = identity;
         self
+    }
+
+    /// Enforce `policy` on every call made through this instance (`None`:
+    /// policy off).
+    pub fn with_policy(mut self, policy: Option<crate::policy::Enforcer>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Names of every tool this server exposes.
+    pub fn tool_names() -> Vec<String> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
     }
 
     /// Shared body for the trivial interpreter wrappers (ruby/perl/deno
@@ -508,7 +527,7 @@ impl Prompto {
     }
 
     /// The single authorization gate for a tool call that targets a host:
-    /// existence, capability, self-target guard, and (later) policy and
+    /// existence, capability, self-target guard, policy, and (later)
     /// ticket. See [`authz::authorize`].
     pub fn authorize(
         &self,
@@ -517,7 +536,20 @@ impl Prompto {
         host: &str,
         need: Need,
     ) -> Result<Authorized, ClassifiedError> {
-        authz::authorize(&self.inv.snapshot(), ctx, tool, host, need)
+        authz::authorize(
+            &self.inv.snapshot(),
+            self.policy.as_ref(),
+            ctx,
+            tool,
+            host,
+            need,
+        )
+    }
+
+    /// The gate for a tool that targets no host. See
+    /// [`authz::authorize_tool`].
+    fn authorize_tool(&self, ctx: &CallCtx, tool: &str) -> Result<(), ClassifiedError> {
+        authz::authorize_tool(self.policy.as_ref(), ctx, tool).map(|_| ())
     }
 
     /// Finalise a tool call. The single emission point for every call's
@@ -563,6 +595,7 @@ impl Prompto {
                         host,
                         error_class = c.class.as_str(),
                         exit_code = c.exit_code,
+                        rule = c.rule.as_deref(),
                         "tool call failed"
                     );
                 }
@@ -1086,13 +1119,13 @@ impl Prompto {
     async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
         let ctx = self.new_ctx();
         let res: anyhow::Result<_> = async {
-            authz::authorize_tool(&ctx, "inventory_list")?;
+            self.authorize_tool(&ctx, "inventory_list")?;
             let inv = self.inv.snapshot();
             let hosts: Vec<serde_json::Value> = inv
                 .hosts
                 .iter()
                 .map(|(name, h)| {
-                    serde_json::json!({
+                    let mut v = serde_json::json!({
                         "name": name,
                         "ip": h.ip,
                         "mac": h.mac,
@@ -1106,7 +1139,9 @@ impl Prompto {
                         "request_id_env": h.request_id_env().as_str(),
                         "extra_ips": h.extra_ips,
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-                    })
+                    });
+                    with_groups(&mut v, &h.groups);
+                    v
                 })
                 .collect();
             Ok(serde_json::json!({
@@ -1126,15 +1161,20 @@ impl Prompto {
         let ctx = self.new_ctx();
         let host_name = args.name.clone();
         let res: anyhow::Result<_> = async {
-            let target =
-                authz::lookup(&self.inv.snapshot(), &ctx, "inventory_get_host", &args.name)?;
+            let target = authz::lookup(
+                &self.inv.snapshot(),
+                self.policy.as_ref(),
+                &ctx,
+                "inventory_get_host",
+                &args.name,
+            )?;
             let h = &target.host;
             // Report the canonical name, not whatever the caller typed —
             // asking for an alias and being told it IS that host hides
             // the indirection. `queried_as` shows up only when they differ.
             let canon = target.canonical.clone();
             let queried_as = (canon != args.name).then(|| args.name.clone());
-            Ok(serde_json::json!({
+            let mut v = serde_json::json!({
                 "name": canon,
                 "queried_as": queried_as,
                 "ip": h.ip,
@@ -1149,7 +1189,9 @@ impl Prompto {
                 "request_id_env": h.request_id_env().as_str(),
                 "extra_ips": h.extra_ips,
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            }))
+            });
+            with_groups(&mut v, &h.groups);
+            Ok(v)
         }
         .await;
         self.finish_tool(&ctx, "inventory_get_host", Some(&host_name), res)
@@ -1734,7 +1776,8 @@ impl Prompto {
             prompto refuses every one of these against the caller's own machine: on the client\n\
             itself, run the equivalent (`claude mcp list`, `systemctl restart …`) in your local shell.\n\
                • There is no in-session re-handshake hook today; this hint is the honest answer.";
-        let res = authz::authorize_tool(&ctx, "mcp_reconnect_hint")
+        let res = self
+            .authorize_tool(&ctx, "mcp_reconnect_hint")
             .map(|()| serde_json::json!({ "hint": hint }))
             .map_err(anyhow::Error::from);
         self.finish_tool(&ctx, "mcp_reconnect_hint", None, res)
@@ -1751,7 +1794,8 @@ impl Prompto {
         let cutoff = args
             .since_secs
             .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s as i64));
-        let res = authz::authorize_tool(&ctx, "prompto_gain")
+        let res = self
+            .authorize_tool(&ctx, "prompto_gain")
             .map_err(anyhow::Error::from)
             .and_then(|()| self.tracker.summary(cutoff));
         self.finish_tool(&ctx, "prompto_gain", None, res)
@@ -1764,6 +1808,14 @@ impl Prompto {
 /// field, appended so existing keys keep their order. Anything else — an
 /// array, whose shape clients may depend on — is left untouched and the
 /// ID follows in its own `[request_id=…]` block, like the advisor's.
+/// Add a host's policy `groups` to its inventory view — only when it has
+/// some, so an inventory without groups reads exactly as before E3.
+fn with_groups(v: &mut serde_json::Value, groups: &[String]) {
+    if !groups.is_empty() {
+        v["groups"] = groups.into();
+    }
+}
+
 fn success_blocks(payload: serde_json::Value, request_id: &str) -> Vec<String> {
     match payload {
         serde_json::Value::Object(mut map) => {

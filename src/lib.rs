@@ -20,6 +20,7 @@ pub mod host;
 pub mod inventory;
 pub mod mcp;
 pub mod mcpprobe;
+pub mod policy;
 pub mod portscan;
 pub mod router;
 pub mod rsync;

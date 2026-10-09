@@ -1,5 +1,6 @@
-//! prompto — bootstrap, transport selection, SIGHUP-driven inventory and
-//! agents reload, and the `gain` / `agent` CLI subcommands.
+//! prompto — bootstrap, transport selection, SIGHUP-driven inventory,
+//! agents and policy reload, and the `gain` / `agent` / `policy` CLI
+//! subcommands.
 
 use anyhow::{Context, Result};
 use mcp_gain::Tracker;
@@ -8,6 +9,7 @@ use prompto::baselines::BASELINES;
 use prompto::caller;
 use prompto::inventory::InventoryStore;
 use prompto::mcp::Prompto;
+use prompto::policy::{Policy, PolicyStore};
 use prompto::server::{AllowedHosts, HttpParams, build_router};
 use prompto::ssh::SshClient;
 use prompto::vault::VaultClient;
@@ -50,6 +52,7 @@ pub struct Config {
     pub usage_log: PathBuf,
     pub gain_enabled: bool,
     pub agents_path: PathBuf,
+    pub policy_path: PathBuf,
 }
 
 impl Config {
@@ -63,6 +66,7 @@ impl Config {
             usage_log: env_or("PROMPTO_USAGE_LOG", "/var/lib/prompto/usage.jsonl").into(),
             gain_enabled: env_bool("PROMPTO_GAIN_ENABLED", true),
             agents_path: env_or("PROMPTO_AGENTS", "/etc/prompto/agents.toml").into(),
+            policy_path: env_or("PROMPTO_POLICY", "/etc/prompto/policy.toml").into(),
         }
     }
 }
@@ -77,12 +81,56 @@ fn init_tracing() {
         .init();
 }
 
-/// SIGHUP re-reads the inventory and `agents.toml` (the latter only when
-/// auth is on — `agents` is `None` with `PROMPTO_AUTH=off`),
+/// Policy and the files it is checked against, for the SIGHUP lint.
+/// Present only when auth is on.
+#[derive(Clone)]
+struct PolicyReload {
+    policy: PolicyStore,
+    agents: AgentStore,
+}
+
+/// Log `policy lint` findings against the live inventory and agents. A
+/// finding never stops the server: the policy still loads, and whatever
+/// it references that doesn't exist simply grants nothing.
+fn log_policy_lint(policy: &Policy, inv: &prompto::inventory::Inventory, agents: &Agents) {
+    let tools = Prompto::tool_names();
+    let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+    for f in prompto::policy::lint(policy, inv, agents, &tools) {
+        match f.level {
+            prompto::policy::Level::Error => {
+                tracing::error!(rule = %f.rule, "policy lint: {}", f.message)
+            }
+            prompto::policy::Level::Warning => {
+                tracing::warn!(rule = %f.rule, "policy lint: {}", f.message)
+            }
+        }
+    }
+}
+
+/// Startup/reload warnings that make a deny-all policy loud.
+fn warn_if_deny_all(policy: &Policy, mode: AuthMode) {
+    if let Some(path) = &policy.missing {
+        tracing::warn!(
+            path = %path.display(),
+            auth = mode.as_str(),
+            "POLICY FILE MISSING — every tool call is DENIED (refused_policy) until it \
+             exists and the server is reloaded"
+        );
+    } else if policy.rules.is_empty() {
+        tracing::warn!(
+            auth = mode.as_str(),
+            "policy has no rules — every tool call is DENIED (refused_policy)"
+        );
+    }
+}
+
+/// SIGHUP re-reads the inventory, and — only when auth is on (`policy`
+/// is `None` with `PROMPTO_AUTH=off`) — `agents.toml` and `policy.toml`,
 /// independently: a bad file keeps its previous version live and logs
-/// why, without blocking the other.
+/// why, without blocking the others. The policy is then linted against
+/// whatever is now live.
 #[cfg(unix)]
-fn spawn_sighup_reloader(store: InventoryStore, agents: Option<AgentStore>) {
+fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mode: AuthMode) {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
         let mut sig = match signal(SignalKind::hangup()) {
@@ -97,13 +145,22 @@ fn spawn_sighup_reloader(store: InventoryStore, agents: Option<AgentStore>) {
                 Ok(n) => tracing::info!(host_count = n, "inventory reloaded on SIGHUP"),
                 Err(e) => tracing::error!(?e, "inventory reload failed — keeping previous"),
             }
-            let Some(agents) = &agents else { continue };
-            match agents.reload() {
+            let Some(p) = &policy else { continue };
+            match p.agents.reload() {
                 Ok(n) => tracing::info!(agent_count = n, "agents reloaded on SIGHUP"),
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), "agents reload failed — keeping previous")
                 }
             }
+            match p.policy.reload() {
+                Ok(n) => tracing::info!(rule_count = n, "policy reloaded on SIGHUP"),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "policy reload failed — keeping previous")
+                }
+            }
+            let live = p.policy.snapshot();
+            warn_if_deny_all(&live, mode);
+            log_policy_lint(&live, &store.snapshot(), &p.agents.snapshot());
         }
     });
 }
@@ -130,7 +187,7 @@ fn spawn_vault_renewal(vault: Arc<VaultClient>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reloader(_store: InventoryStore, _agents: Option<AgentStore>) {}
+fn spawn_sighup_reloader(_store: InventoryStore, _policy: Option<PolicyReload>, _mode: AuthMode) {}
 
 const AGENT_USAGE: &str = "\
 Usage: prompto agent add <name> [--groups a,b]   mint a token (printed once)
@@ -228,6 +285,152 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const POLICY_USAGE: &str = "\
+Usage: prompto policy check --agent <name> [--host <host>] --tool <tool> [--sudo]
+                                         dry-run one call: decision + deciding rule
+       prompto policy lint               check policy.toml against the inventory,
+                                         agents.toml and the tool list
+
+Reads $PROMPTO_POLICY (default /etc/prompto/policy.toml), $PROMPTO_INVENTORY
+and $PROMPTO_AGENTS. `check` exits 0 when the call would be allowed, 1 when
+refused; `lint` exits 1 when it finds errors.";
+
+/// `prompto policy …`: offline view of what the server would decide.
+/// Returns the process exit code.
+fn run_policy_cli(cfg: &Config, args: &[String]) -> Result<i32> {
+    use prompto::authz;
+    use prompto::policy::{self, Outcome, Request, Subject, Target};
+
+    let load = || -> Result<(Policy, prompto::inventory::Inventory, Agents)> {
+        let p = Policy::from_path(&cfg.policy_path)?;
+        let inv = prompto::inventory::Inventory::from_path(&cfg.inventory_path)?;
+        let agents = Agents::from_path(&cfg.agents_path)?;
+        Ok((p, inv, agents))
+    };
+    let tools = Prompto::tool_names();
+    if AuthMode::parse(&env_or("PROMPTO_AUTH", "off")).ok() == Some(AuthMode::Off) {
+        eprintln!(
+            "note: PROMPTO_AUTH is off here — a server with this environment does not \
+             load or enforce policy."
+        );
+    }
+    match args.first().map(String::as_str) {
+        Some("check") => {
+            let (mut agent, mut host, mut tool, mut sudo) = (None, None, None, false);
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                let mut val = |flag: &str| -> Result<String> {
+                    Ok(it
+                        .next()
+                        .with_context(|| format!("{flag} requires a value"))?
+                        .clone())
+                };
+                match a.as_str() {
+                    "--agent" => agent = Some(val("--agent")?),
+                    "--host" => host = Some(val("--host")?),
+                    "--tool" => tool = Some(val("--tool")?),
+                    "--sudo" => sudo = true,
+                    other => anyhow::bail!("unexpected argument {other:?}\n{POLICY_USAGE}"),
+                }
+            }
+            let agent = agent.with_context(|| format!("--agent is required\n{POLICY_USAGE}"))?;
+            let tool = tool.with_context(|| format!("--tool is required\n{POLICY_USAGE}"))?;
+            if !tools.contains(&tool) {
+                anyhow::bail!("unknown tool {tool:?}");
+            }
+            let root = if authz::ROOT_TOOLS.contains(&tool.as_str()) {
+                true
+            } else if sudo && !authz::SUDO_FLAG_TOOLS.contains(&tool.as_str()) {
+                anyhow::bail!(
+                    "{tool} has no sudo variant (--sudo applies to: {})",
+                    authz::SUDO_FLAG_TOOLS.join(", ")
+                );
+            } else {
+                sudo
+            };
+            let (p, inv, agents) = load()?;
+            let hostless = authz::HOSTLESS_TOOLS.contains(&tool.as_str());
+            let target = match (&host, hostless) {
+                (Some(h), false) => {
+                    let canon = inv
+                        .canonical(h)
+                        .with_context(|| format!("unknown host {h:?}"))?;
+                    Some(Target::of(canon, inv.get(canon)?))
+                }
+                (None, false) => anyhow::bail!("{tool} targets a host: --host is required"),
+                (Some(_), true) => anyhow::bail!("{tool} targets no host: drop --host"),
+                (None, true) => None,
+            };
+            if !matches!(
+                agent.as_str(),
+                prompto::agent::ANONYMOUS | prompto::agent::LOCAL
+            ) && !agents.agents.contains_key(&agent)
+            {
+                anyhow::bail!(
+                    "unknown agent {agent:?} (not in {})",
+                    cfg.agents_path.display()
+                );
+            }
+            let groups = match policy::agent_groups(&agents, &agent) {
+                Ok(g) => g,
+                Err(msg) => {
+                    println!("DENY  rule={}\n{msg}", policy::DEFAULT_DENY);
+                    return Ok(1);
+                }
+            };
+            let d = p.decide(&Request {
+                agent: Subject {
+                    name: &agent,
+                    groups: &groups,
+                },
+                host: target,
+                tool: &tool,
+                root,
+            });
+            let verdict = match d.outcome {
+                Outcome::Allow => "ALLOW",
+                Outcome::ApprovalRequired(_) => "APPROVAL_REQUIRED (refused until tickets ship)",
+                Outcome::Deny => "DENY",
+            };
+            println!("{verdict}  rule={}\n{}", d.rule, d.message);
+            eprintln!(
+                "(policy only: host capability and the self-target guard are checked too \
+                 at call time, before policy)"
+            );
+            Ok(if d.outcome == Outcome::Allow { 0 } else { 1 })
+        }
+        Some("lint") if args.len() == 1 => {
+            let (p, inv, agents) = load()?;
+            let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+            let findings = policy::lint(&p, &inv, &agents, &tools);
+            if let Some(path) = &p.missing {
+                println!(
+                    "warning: {} does not exist — every call is denied",
+                    path.display()
+                );
+            }
+            for f in &findings {
+                println!("{f}");
+            }
+            let errors = findings
+                .iter()
+                .filter(|f| f.level == policy::Level::Error)
+                .count();
+            eprintln!(
+                "{} rules, {errors} errors, {} warnings",
+                p.rules.len(),
+                findings.len() - errors
+            );
+            Ok(if errors > 0 { 1 } else { 0 })
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("{POLICY_USAGE}");
+            Ok(0)
+        }
+        _ => anyhow::bail!("{POLICY_USAGE}"),
+    }
+}
+
 fn run_gain_cli(cfg: &Config, args: &[String]) -> Result<()> {
     let mut json = false;
     let mut since_secs: Option<u64> = None;
@@ -284,6 +487,10 @@ async fn main() -> Result<()> {
     if raw_args.len() >= 2 && raw_args[1] == "agent" {
         return run_agent_cli(&cfg, &raw_args[2..]);
     }
+    if raw_args.len() >= 2 && raw_args[1] == "policy" {
+        let code = run_policy_cli(&cfg, &raw_args[2..])?;
+        std::process::exit(code);
+    }
 
     init_tracing();
     tracing::info!(?cfg, "prompto starting");
@@ -327,7 +534,39 @@ async fn main() -> Result<()> {
         }
         Some(agents)
     };
-    spawn_sighup_reloader(store.clone(), agents.clone());
+    // Policy follows agents.toml: not read at all with off (prod stays
+    // exactly as before E3), enforced otherwise. A missing file means deny
+    // everything — loudly; a malformed one stops the server.
+    let policy = if auth_mode == AuthMode::Off {
+        if cfg.policy_path.exists() {
+            tracing::info!(
+                path = %cfg.policy_path.display(),
+                "PROMPTO_AUTH=off — policy file ignored"
+            );
+        }
+        None
+    } else {
+        let policy = PolicyStore::load_from(cfg.policy_path.clone())
+            .with_context(|| format!("loading policy from {}", cfg.policy_path.display()))?;
+        let live = policy.snapshot();
+        tracing::info!(
+            rule_count = live.rules.len(),
+            path = %cfg.policy_path.display(),
+            "policy loaded"
+        );
+        warn_if_deny_all(&live, auth_mode);
+        let agents = agents.clone().unwrap_or_default();
+        log_policy_lint(&live, &store.snapshot(), &agents.snapshot());
+        Some(policy)
+    };
+    let reload = match (&agents, &policy) {
+        (Some(a), Some(p)) => Some(PolicyReload {
+            policy: p.clone(),
+            agents: a.clone(),
+        }),
+        _ => None,
+    };
+    spawn_sighup_reloader(store.clone(), reload, auth_mode);
 
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
     let needs_vault: Vec<String> = store
@@ -369,12 +608,19 @@ async fn main() -> Result<()> {
     );
 
     let stdio_mode = raw_args.iter().any(|a| a == "--stdio");
+    let auth = AuthConfig {
+        mode: auth_mode,
+        store: agents.unwrap_or_default(),
+        policy: policy.unwrap_or_default(),
+    };
 
     if stdio_mode {
         tracing::info!("transport: stdio");
         // Whoever can talk to our stdin launched us: agent `local`.
+        // Policy applies to `local` like to any agent when auth is on.
         let service = prompto
             .with_identity(Identity::local())
+            .with_policy(auth.enforcer())
             .serve(stdio())
             .await
             .context("stdio serve")?;
@@ -456,10 +702,7 @@ async fn main() -> Result<()> {
             trusted_proxies,
             allowed_hosts,
             legacy_session_mode,
-            auth: AuthConfig {
-                mode: auth_mode,
-                store: agents.unwrap_or_default(),
-            },
+            auth,
             cancel: cancel.clone(),
         });
 

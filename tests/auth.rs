@@ -13,6 +13,7 @@
 use mcp_gain::Tracker;
 use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode};
 use prompto::inventory::{Inventory, InventoryStore};
+use prompto::policy::{Policy, PolicyStore};
 use prompto::server::{AllowedHosts, HttpParams, build_router};
 use prompto::ssh::SshClient;
 use serde_json::{Value, json};
@@ -157,10 +158,25 @@ fn store() -> AgentStore {
     )
 }
 
+/// Grants every agent in [`store`] (and `anonymous`) everything, root
+/// included, so these tests see authentication and nothing else.
+/// Policy itself is tested in `tests/policy.rs`.
+fn allow_all() -> PolicyStore {
+    let rule = |sudo: bool| {
+        format!(
+            "[[rule]]\nagents = [\"alpha\", \"beta\", \"retired\", \"anonymous\"]\n\
+             hosts = [\"*\"]\ntools = [\"*\"]\nsudo = {sudo}\n"
+        )
+    };
+    let toml = format!("{}{}", rule(false), rule(true));
+    PolicyStore::new(Policy::from_toml_str(&toml, "policy.toml").unwrap(), None)
+}
+
 async fn server(mode: AuthMode) -> Server {
     spawn_server_with(AuthConfig {
         mode,
         store: store(),
+        policy: allow_all(),
     })
     .await
 }
@@ -553,6 +569,7 @@ async fn legacy_session_is_bound_to_its_creator() {
             AuthConfig {
                 mode,
                 store: store(),
+                policy: allow_all(),
             },
             true,
         )
@@ -598,6 +615,7 @@ async fn legacy_anonymous_session_refuses_an_agent() {
         AuthConfig {
             mode: AuthMode::Optional,
             store: store(),
+            policy: allow_all(),
         },
         true,
     )
@@ -705,6 +723,8 @@ fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
         .env("PROMPTO_INVENTORY", write_inventory(dir))
         .env("PROMPTO_AGENTS", agents)
         .env("PROMPTO_AUTH", mode)
+        // Absent: deny-all, and never whatever /etc holds on the test box.
+        .env("PROMPTO_POLICY", dir.join("policy.toml"))
         .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")

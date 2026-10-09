@@ -10,6 +10,7 @@ use crate::advisor::Advisor;
 use crate::agent::{self, AuthConfig, Decision};
 use crate::authz::Need;
 use crate::caller;
+use crate::error_class::ErrorClass;
 use crate::filters::FilterChain;
 use crate::inventory::InventoryStore;
 use crate::mcp::Prompto;
@@ -203,6 +204,7 @@ fn unauthorized(path: &str, reason: &str) -> Response {
 struct LogState {
     store: InventoryStore,
     ssh: Arc<SshClient>,
+    policy: Option<crate::policy::Enforcer>,
 }
 
 #[derive(serde::Deserialize)]
@@ -226,7 +228,7 @@ struct LogQuery {
 /// `sudo_exec`; `required` makes it a 401 without a valid agent token.
 ///
 /// It is held to *exactly* the same limits as the `service_logs` MCP tool
-/// and given no capability the tool lacks: same `sudo_exec` gate and self-target guard (via `authz`), same
+/// and given no capability the tool lacks: same `sudo_exec` gate, self-target guard and policy (via `authz`), same
 /// `validate_unit_name` on the unit (so it cannot be turned into a shell),
 /// same 1..=1000 line clamp, same 15 s timeout. So it widens *reach*, not
 /// *power* — it shares `/mcp`'s listener and its authentication.
@@ -256,15 +258,22 @@ async fn log_tail(
     // exactly the tool's limits — the self-target guard included.
     let target = match crate::authz::authorize(
         &state.store.snapshot(),
+        state.policy.as_ref(),
         ctx,
         "service_logs",
         &q.host,
         Need::Cap(crate::inventory::Capability::SudoExec),
     ) {
         Ok(t) => t,
-        // Unknown host, missing capability or self-target are all
-        // caller errors.
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")),
+        // Unknown host, missing capability or self-target are caller
+        // errors; a policy refusal is a 403.
+        Err(e) => {
+            let status = match e.class {
+                ErrorClass::RefusedPolicy | ErrorClass::ApprovalRequired => StatusCode::FORBIDDEN,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            return (status, format!("{e}\n"));
+        }
     };
     let lines = q.lines.unwrap_or(50);
     match crate::claudemgr::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines).await {
@@ -318,6 +327,9 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     let owners = SessionOwners::default();
     let owners_for_auth = owners.clone();
     let ssh_for_log = ssh.clone();
+    // Policy is enforced on /mcp and /log alike, `None` with auth off.
+    let policy = auth.enforcer();
+    let policy_for_log = policy.clone();
 
     let service = StreamableHttpService::new(
         move || {
@@ -336,7 +348,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
                 stop_vm_step,
                 caller::current(),
             )
-            .with_identity(agent::current()))
+            .with_identity(agent::current())
+            .with_policy(policy.clone()))
         },
         BoundSessionManager::new(LocalSessionManager::default(), owners).into(),
         http_config,
@@ -345,6 +358,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     let log_state = LogState {
         store: store_for_log,
         ssh: ssh_for_log,
+        policy: policy_for_log,
     };
 
     axum::Router::new()

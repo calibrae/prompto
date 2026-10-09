@@ -1,0 +1,70 @@
+# /etc/prompto/policy.toml — who may use which tool on which host
+# (PROMPTO_POLICY). Enforced only with PROMPTO_AUTH=optional|required; with
+# off it is not read. Missing file under optional/required = deny everything.
+# Reload with SIGHUP (`systemctl reload prompto`); check with
+# `prompto policy lint` and `prompto policy check --agent A --host H --tool T`.
+#
+# Rules are read top to bottom; the FIRST rule that matches a call decides
+# (allow, with that rule's approval). No match = deny. Rules only grant.
+#
+#   agents   agent names or group:<g> (groups from agents.toml). No globs.
+#            "anonymous" (no token, optional mode) and "local" (stdio) only
+#            match by name.
+#   hosts    inventory names or aliases, * ? globs, group:<g> (inventory
+#            `groups`). Ignored for inventory_list, prompto_gain,
+#            mcp_reconnect_hint, which target no host.
+#   tools    tool names, * ? globs.
+#   sudo     false (default): grants ordinary calls only.
+#            true: grants root-capable calls only — ssh_sudo_exec,
+#            file_write with sudo=true, service_control, host_sleep,
+#            service_logs, mcp_logs (and GET /log), vm_stop.
+#   approval "none" (default) | "ticket" | "human". Not implemented yet:
+#            a ticket/human rule REFUSES what it matches (approval_required).
+#
+# Policy only narrows: host capabilities still apply, and no rule can let an
+# agent act on its own machine (the self-targeting guard runs first).
+
+# Stricter rules first: sudo on the edge router needs a human.
+[[rule]]
+id = "infra-router-sudo"
+agents = ["infra"]
+hosts = ["router"]
+tools = ["*"]
+sudo = true
+approval = "human"
+
+# infra: everything, root included, everywhere else.
+[[rule]]
+id = "infra-all"
+agents = ["infra"]
+hosts = ["*"]
+tools = ["*"]
+
+[[rule]]
+id = "infra-root"
+agents = ["infra"]
+hosts = ["*"]
+tools = ["*"]
+sudo = true
+
+# Builders: shell and files on the build hosts, no root.
+[[rule]]
+id = "build-exec"
+agents = ["group:build"]
+hosts = ["group:build"]
+tools = ["ssh_exec", "ssh_batch", "rsync_sync", "file_*", "host_status", "host_diagnose", "inventory_*"]
+
+# Web ops: drive and read services on the web hosts (root-capable tools).
+[[rule]]
+id = "web-services"
+agents = ["web-ops"]
+hosts = ["group:web"]
+tools = ["service_control", "service_logs"]
+sudo = true
+
+# Unauthenticated callers (PROMPTO_AUTH=optional) may only look.
+[[rule]]
+id = "anonymous-read"
+agents = ["anonymous"]
+hosts = ["*"]
+tools = ["inventory_list", "inventory_get_host", "host_status"]
