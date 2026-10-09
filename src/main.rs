@@ -586,8 +586,10 @@ fn run_audit_cli(cfg: &Config, args: &[String]) -> Result<()> {
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
-                bad += 1;
+            // A fragment left by a cut-short write costs only itself.
+            let (found, fragments) = audit::parse_line(line);
+            bad += fragments;
+            let Some((rec, text)) = found else {
                 continue;
             };
             seen += 1;
@@ -595,7 +597,7 @@ fn run_audit_cli(cfg: &Config, args: &[String]) -> Result<()> {
                 continue;
             }
             if json {
-                println!("{line}");
+                println!("{}", audit::json_for_terminal(text));
             } else {
                 rows.push(audit::table_row(&rec));
             }
@@ -630,7 +632,7 @@ fn run_audit_cli(cfg: &Config, args: &[String]) -> Result<()> {
         eprintln!("{} of {seen} records", rows.len());
     }
     if bad > 0 {
-        eprintln!("warning: {bad} lines were not valid JSON");
+        eprintln!("warning: skipped {bad} unreadable fragments (not valid JSON)");
     }
     Ok(())
 }

@@ -17,6 +17,8 @@
 //! and `dest_*` classes. An error that reaches `finish_tool` without a
 //! class is a bug: it is reported as `internal`, logged, and counted in
 //! [`unclassified_count`], which a test sweeping every tool holds at zero.
+//! `aborted` exists only in the audit log: a call cut off before it
+//! finished (shutdown, panic), recorded by a drop guard.
 //! Names are stable `snake_case` strings.
 
 use crate::ssh::{ExecOutput, SUDO_GUARD_EXIT};
@@ -85,6 +87,10 @@ pub enum ErrorClass {
     RemoteNonzero,
     /// prompto itself failed (spawning ssh, a signal, …).
     Internal,
+    /// The call never finished: the client went away or cancelled, the
+    /// handler panicked, or prompto shut down while it ran. Whether the
+    /// action took effect is unknown.
+    Aborted,
 }
 
 impl ErrorClass {
@@ -114,6 +120,7 @@ impl ErrorClass {
             Self::RefusedTicket => "refused_ticket",
             Self::RemoteNonzero => "remote_nonzero",
             Self::Internal => "internal",
+            Self::Aborted => "aborted",
         }
     }
 }
@@ -145,6 +152,7 @@ impl ErrorClass {
         Self::RefusedTicket,
         Self::RemoteNonzero,
         Self::Internal,
+        Self::Aborted,
     ];
 
     /// A refusal: the call was stopped before anything ran, by
@@ -440,9 +448,10 @@ mod tests {
             | ErrorClass::Killed
             | ErrorClass::RefusedTicket
             | ErrorClass::RemoteNonzero
-            | ErrorClass::Internal => 1,
+            | ErrorClass::Internal
+            | ErrorClass::Aborted => 1,
         };
-        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 24);
+        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 25);
     }
 
     fn out(code: Option<i32>, stderr: &str, timed_out: bool) -> ExecOutput {

@@ -131,11 +131,12 @@ async fn authenticate(
     next: Next,
 ) -> Response {
     // Every 401 is an audit record (`type = auth`, rate-limited).
-    let refuse = |path: &str, reason: &str, session: Option<String>| {
+    let refuse = |path: &str, reason: &str, session: Option<String>, mcp: Option<String>| {
         audit.write_auth(
             caller::current(),
             caller::user_agent(),
             session,
+            mcp,
             path,
             reason,
         );
@@ -175,10 +176,13 @@ async fn authenticate(
                     mode = auth.mode.as_str(),
                     "refused: Mcp-Session-Id belongs to another agent"
                 );
+                // Both IDs shortened as in the journal line above: the
+                // record must not hand out a replayable session handle.
                 return refuse(
                     req.uri().path(),
                     "session belongs to another agent",
-                    id.session_id.clone(),
+                    id.session_id.as_deref().map(sessions::redact),
+                    Some(sessions::redact(mcp_session)),
                 );
             }
             agent::scoped(id, next.run(req)).await
@@ -189,7 +193,7 @@ async fn authenticate(
                 .get(agent::SESSION_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(agent::parse_session);
-            refuse(req.uri().path(), reason, session)
+            refuse(req.uri().path(), reason, session, None)
         }
     }
 }
@@ -298,7 +302,7 @@ fn audit_log_call(
     (rec.host, rec.queried_as) = audit::resolve_host(&state.store.snapshot(), Some(&q.host));
     rec.path = Some("/log".into());
     rec.bytes = bytes;
-    state.audit.write(&rec);
+    state.audit.write(rec);
 }
 
 async fn log_tail(

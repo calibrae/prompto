@@ -19,6 +19,7 @@ use prompto::server::{AllowedHosts, HttpParams, build_router};
 use prompto::ssh::SshClient;
 use prompto::vault::VaultClient;
 use serde_json::{Value, json};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -126,12 +127,15 @@ approval = "human"
 "#;
 
 const DEV_TOKEN: &str = "pto_dev_test_token";
+/// The token of `retired`, a revoked agent.
+const RETIRED_TOKEN: &str = "pto_retired_test_token";
 
 struct Server {
     addr: SocketAddr,
     cancel: CancellationToken,
     dir: tempfile::TempDir,
     audit_path: PathBuf,
+    audit: Audit,
 }
 
 impl Drop for Server {
@@ -212,8 +216,10 @@ async fn spawn_opts(o: Opts) -> Server {
 
     let h = |t: &str| prompto::agent::hex(&prompto::agent::sha256(t.as_bytes()));
     let agents = format!(
-        "[agent.dev]\ngroups = [\"devs\"]\ntoken_sha256 = \"{}\"\n",
-        h(DEV_TOKEN)
+        "[agent.dev]\ngroups = [\"devs\"]\ntoken_sha256 = \"{}\"\n\n\
+         [agent.retired]\ntoken_sha256 = \"{}\"\ndisabled = true\n",
+        h(DEV_TOKEN),
+        h(RETIRED_TOKEN)
     );
     let auth = AuthConfig {
         mode: o.mode,
@@ -234,7 +240,7 @@ async fn spawn_opts(o: Opts) -> Server {
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode: false,
         auth,
-        audit,
+        audit: audit.clone(),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -255,6 +261,7 @@ async fn spawn_opts(o: Opts) -> Server {
         cancel,
         dir,
         audit_path,
+        audit,
     }
 }
 
@@ -484,10 +491,10 @@ async fn rsync_records_both_hosts() {
     assert_eq!(r["args"]["dest_path"], "/tmp/b/");
 }
 
-/// File contents and interpreter code become digests; commands, paths
-/// and bash scripts stay whole.
+/// File contents become digests; commands, paths and every
+/// interpreter's script stay whole (scrubbed), up to the size cap.
 #[tokio::test]
-async fn contents_and_code_are_digests_in_the_record() {
+async fn contents_are_digests_and_scripts_stay_whole_in_the_record() {
     let s = spawn(AuthMode::Required).await;
     let secret_body = "API_SECRET=do-not-log-me-91c2\n";
     let resp = call(
@@ -504,24 +511,55 @@ async fn contents_and_code_are_digests_in_the_record() {
         prompto::agent::hex(&prompto::agent::sha256(secret_body.as_bytes()))
     );
 
-    let code = "import os\nprint(os.environ.get('X', 'code-body-marker-55'))\n";
-    let resp = call(&s, "python_exec", json!({ "host": "noop", "script": code })).await;
+    let code = "import os\ntoken = \"tok-in-code-55\"\nprint('code-body-kept')\n";
+    let resp = call(
+        &s,
+        "python_exec",
+        json!({ "host": "noop", "script": code, "args": ["--password", "argv-pw-66"] }),
+    )
+    .await;
     let r = s.record(&rid(&resp));
-    assert_eq!(r["args"]["script"]["len"], code.len());
+    assert_eq!(
+        r["args"]["script"],
+        "import os\ntoken = \"***\"\nprint('code-body-kept')\n"
+    );
+    assert_eq!(r["args"]["args"], json!(["--password", "***"]));
 
     let bash = "echo bash-body-kept-whole";
     let resp = call(&s, "bash_exec", json!({ "host": "noop", "script": bash })).await;
     assert_eq!(s.record(&rid(&resp))["args"]["script"], bash);
 
+    let big = format!(
+        "# {}\nprint(1)\n",
+        "x".repeat(prompto::audit::MAX_ARG_STRING)
+    );
+    let resp = call(&s, "node_exec", json!({ "host": "noop", "script": big })).await;
+    let r = s.record(&rid(&resp));
+    assert_eq!(r["args"]["script"]["len"], big.len());
+    assert_eq!(r["args"]["script"]["truncated"], true);
+
+    let resp = call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "noop", "cmd": "curl -H 'Authorization: Bearer hdr-tok-77' https://u:url-pw-88@h/x?api_key=q-99" }),
+    )
+    .await;
+    assert_eq!(
+        s.record(&rid(&resp))["args"]["cmd"],
+        "curl -H 'Authorization: ***' https://***@h/x?api_key=***"
+    );
+
     let text = s.audit_text();
-    assert!(
-        !text.contains("do-not-log-me-91c2"),
-        "file content leaked: {text}"
-    );
-    assert!(
-        !text.contains("code-body-marker-55"),
-        "code body leaked: {text}"
-    );
+    for leaked in [
+        "do-not-log-me-91c2",
+        "tok-in-code-55",
+        "argv-pw-66",
+        "hdr-tok-77",
+        "url-pw-88",
+        "q-99",
+    ] {
+        assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+    }
 }
 
 /// The vault sudo password is fetched inside the SSH layer and never
@@ -697,6 +735,119 @@ async fn unauthorized_requests_are_audited_as_auth_records() {
     );
 }
 
+/// A 401 from a client behind the trusted (loopback) proxy, as `ip`.
+async fn unauthorized_from(s: &Server, ip: &str, token: Option<&str>, path: &str) -> u16 {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{}{path}", s.addr))
+        .header("x-real-ip", ip)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    req.body("{}").send().await.unwrap().status().as_u16()
+}
+
+/// One flooding client can't hide another client's revoked-token 401,
+/// and a huge request path is stored cut.
+#[tokio::test]
+async fn a_401_flood_from_one_client_does_not_hide_another() {
+    let s = spawn(AuthMode::Required).await;
+    for _ in 0..200 {
+        assert_eq!(unauthorized_from(&s, "192.0.2.66", None, "/mcp").await, 401);
+    }
+    assert_eq!(
+        unauthorized_from(&s, "198.51.100.5", Some(RETIRED_TOKEN), "/mcp").await,
+        401
+    );
+    let recs = s.records();
+    let flood = recs
+        .iter()
+        .filter(|r| r["client_ip"] == "192.0.2.66")
+        .count();
+    assert!(flood <= prompto::audit::AUTH_IP_BURST as usize, "{flood}");
+    let other: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["client_ip"] == "198.51.100.5")
+        .collect();
+    assert_eq!(other.len(), 1, "{recs:?}");
+    assert_eq!(other[0]["reason"], "revoked token");
+    assert!(other[0]["suppressed"].as_u64().unwrap() > 0);
+
+    let long = format!("/mcp/{}", "a".repeat(50_000));
+    assert_eq!(unauthorized_from(&s, "203.0.113.9", None, &long).await, 401);
+    let r = s
+        .records()
+        .into_iter()
+        .find(|r| r["client_ip"] == "203.0.113.9")
+        .unwrap();
+    let path = r["path"].as_str().unwrap();
+    assert!(
+        path.chars().count() <= prompto::audit::MAX_PATH + 1,
+        "{}",
+        path.len()
+    );
+    assert!(s.audit_text().len() < 64 * 1024);
+}
+
+/// Optional mode: a revoked or invalid token runs as `anonymous`, and the
+/// record says why, so it can be queried.
+#[tokio::test]
+async fn optional_mode_notes_a_revoked_or_invalid_token() {
+    let s = spawn(AuthMode::Optional).await;
+    let args = json!({ "host": "runner", "cmd": "true" });
+    let revoked = call_as(&s, Some(RETIRED_TOKEN), "ssh_exec", args.clone()).await;
+    let invalid = call_as(&s, Some("pto_nonsense"), "ssh_exec", args.clone()).await;
+    let none = call_as(&s, None, "ssh_exec", args).await;
+    let r = s.record(&rid(&revoked));
+    assert_eq!(r["agent"], "anonymous");
+    assert_eq!(r["auth_note"], "revoked token for retired");
+    assert_eq!(s.record(&rid(&invalid))["auth_note"], "invalid token");
+    assert!(s.record(&rid(&none)).get("auth_note").is_none());
+    assert!(!s.audit_text().contains("pto_nonsense"));
+}
+
+/// A call cut off mid-run — here prompto's runtime shuts down under it,
+/// as on a stop or a crash-restart; a handler panic unwinds the same way
+/// — still leaves a record: `aborted`, with the request's agent and the
+/// rule that let it run.
+#[test]
+fn a_call_cut_off_mid_run_is_recorded_as_aborted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let s = rt.block_on(spawn(AuthMode::Required));
+    let addr = s.addr;
+    rt.spawn(async move {
+        rpc_with(
+            addr,
+            Some(DEV_TOKEN),
+            "tools/call",
+            json!({ "name": "ssh_exec", "arguments": { "host": "runner", "cmd": "sleep 5" } }),
+        )
+        .await
+    });
+    rt.block_on(async {
+        for _ in 0..50 {
+            if s.argv_log().contains("sleep 5") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    assert!(s.argv_log().contains("sleep 5"), "the call never started");
+    assert!(s.records().is_empty(), "recorded before the end");
+    rt.shutdown_timeout(Duration::from_secs(2));
+    let recs = s.records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["error_class"], "aborted");
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["tool"], "ssh_exec");
+    assert_eq!(r["agent"], "dev");
+    assert_eq!(r["decision"], "allow");
+    assert_eq!(r["rule"], "policy.toml:2 (dev-exec)");
+    assert_eq!(r["args"]["cmd"], "sleep 5");
+}
+
 /// `GET /log` is the `service_logs` tool over plain HTTP, and audited as
 /// such, with the request ID it returned.
 #[tokio::test]
@@ -790,18 +941,15 @@ async fn unwritable_audit_refuses_in_required_and_warns_in_off() {
 
 /// The disk fills mid-call: the call that was running finishes (it can't
 /// be undone; its record is in the journal), and every later call is
-/// refused until a write succeeds. `/dev/full` opens fine and fails every
-/// write with ENOSPC.
+/// refused, naming the full disk, until a write succeeds. The failure is
+/// injected (`/dev/full` is Linux-only).
 #[tokio::test]
 async fn a_failed_write_refuses_later_calls_in_required_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    let link = dir.path().join("audit.jsonl");
-    std::os::unix::fs::symlink("/dev/full", &link).unwrap();
-    let s = spawn_opts(Opts {
-        mode: AuthMode::Required,
-        audit_path: Some(link),
-    })
-    .await;
+    let s = spawn(AuthMode::Required).await;
+    s.audit
+        .log()
+        .unwrap()
+        .inject_fault(Some(prompto::audit::Fault::DiskFull));
     assert_ok(
         &call(
             &s,
@@ -817,10 +965,29 @@ async fn a_failed_write_refuses_later_calls_in_required_mode() {
     )
     .await;
     assert_eq!(resp["error"]["data"]["error_class"], "internal", "{resp}");
+    let msg = resp["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("the audit disk is full"), "{msg}");
     let argv = s.argv_log();
     assert!(
         argv.contains("echo first") && !argv.contains("echo second"),
         "{argv}"
+    );
+    // Room again: the refusal's own record is the probe that heals, so
+    // the next call runs.
+    s.audit.log().unwrap().inject_fault(None);
+    call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "runner", "cmd": "echo probe" }),
+    )
+    .await;
+    assert_ok(
+        &call(
+            &s,
+            "ssh_exec",
+            json!({ "host": "runner", "cmd": "echo third" }),
+        )
+        .await,
     );
 }
 
@@ -888,7 +1055,7 @@ fn separate_writers_on_one_file_never_interleave() {
                 for i in 0..200 {
                     let args = json!({ "cmd": format!("{w}-{i}-{}", "y".repeat(3000)) });
                     let rec = prompto::audit::tool_record(&ctx, "ssh_exec", args);
-                    assert!(audit.write(&rec));
+                    assert!(audit.write(rec));
                 }
             })
         })
@@ -1007,7 +1174,43 @@ fn cli_filters_records() {
         assert!(rows[1].contains(want), "{want} missing: {out}");
     }
     assert!(err.contains("1 of 4 records"), "{err}");
-    assert!(err.contains("1 lines were not valid JSON"), "{err}");
+    assert!(err.contains("skipped 1 unreadable fragments"), "{err}");
+
+    // A fragment glued to the next record (an older build after a short
+    // write) costs only the fragment; a hostile tool name can't drive the
+    // terminal, in the table or with --json.
+    let evil = json!({
+        "ts": ts(0), "type": "tool", "request_id": "R4", "agent": "dev\u{7}",
+        "tool": "\u{1b}]0;owned\u{7}\u{1b}[2Jssh_exec\r", "host": "h\u{202e}x",
+        "args": { "cmd": "echo \u{1b}[31mred\u{9b}" }, "decision": "allow", "ok": true,
+        "duration_ms": 1,
+    });
+    let glued = format!(
+        "{}{}\n",
+        &rec(ts(0), "RX", "dev", "x", "y", "allow")[..40],
+        evil
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(glued.as_bytes())
+        .unwrap();
+    assert_eq!(ids(&["--request-id", "R4"]), ["R4"]);
+    let (ok, out, err) = audit_cli(&path, &["--request-id", "R4"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("skipped 2 unreadable fragments"), "{err}");
+    let hazard = |c: char| c.is_control() && c != '\n' || ('\u{202a}'..='\u{202e}').contains(&c);
+    assert!(!out.chars().any(hazard), "{out:?}");
+    assert!(
+        out.contains("\\x1b]0;owned\\x07\\x1b[2Jssh_exec\\x0d"),
+        "{out}"
+    );
+    let (ok, out, _) = audit_cli(&path, &["--request-id", "R4", "--json"]);
+    assert!(ok);
+    assert!(!out.chars().any(hazard), "{out:?}");
+    let back: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(back["tool"], evil["tool"]);
 
     let (ok, _, err) = audit_cli(&path, &["--decision", "maybe"]);
     assert!(!ok && err.contains("allow or deny"), "{err}");

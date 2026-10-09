@@ -598,7 +598,17 @@ async fn legacy_session_is_bound_to_its_creator() {
         );
         assert!(
             !String::from_utf8_lossy(&LOGS.lock().unwrap()).contains(&sid),
-            "full Mcp-Session-Id logged"
+            "full Mcp-Session-Id logged (journal line or audit record)"
+        );
+        // The audit record names the session, shortened like the journal.
+        let short = sessions_redacted(&sid);
+        assert!(
+            String::from_utf8_lossy(&LOGS.lock().unwrap())
+                .lines()
+                .any(|l| l.contains(" prompto::audit: ")
+                    && l.contains("session belongs to another agent")
+                    && l.contains(&format!("mcp_session=\"{short}\""))),
+            "no audit record with mcp_session={short}"
         );
 
         // The creator is unaffected and still attributed.

@@ -550,6 +550,9 @@ impl Prompto {
         let mut ctx = CallCtx::new(self.caller_ip).with_identity(self.identity.clone());
         ctx.user_agent = self.user_agent.clone();
         ctx.call = audit::current_call();
+        if let Some(c) = &ctx.call {
+            c.set_ctx(&ctx);
+        }
         ctx
     }
 
@@ -708,34 +711,54 @@ impl Prompto {
             (rec.dest_host, rec.dest_queried_as) = audit::resolve_host(&inv, dest);
         }
         rec.bytes = bytes;
-        self.audit.write(&rec);
+        self.audit.write(rec);
         if let Some(c) = &ctx.call {
             c.mark_recorded();
         }
     }
 
-    /// Record a call no handler recorded: its arguments did not parse, or
-    /// it named no tool. One record per call, always.
-    fn audit_unrouted(&self, call: &audit::CallScope, res: &Result<CallToolResponse, McpError>) {
-        let mut ctx = self.new_ctx();
+    /// Record a call no handler recorded: its arguments did not parse, it
+    /// named no tool, or (`res` is `None`) it never finished — dropped
+    /// mid-way by a client that went away, a panic or a shutdown
+    /// (`aborted`). One record per call, always.
+    fn audit_unrouted(
+        &self,
+        call: &audit::CallScope,
+        res: Option<&Result<CallToolResponse, McpError>>,
+    ) {
+        let mut ctx = call.handler_ctx().unwrap_or_else(|| self.new_ctx());
         ctx.call = Some(call.clone());
         // rmcp answers bad arguments with an error *result*, and an
         // unknown tool with an error.
         let rejected = match res {
-            Err(e) => Some(e.message.to_string()),
-            Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => Some(
+            None => None,
+            Some(Err(e)) => Some(e.message.to_string()),
+            Some(Ok(CallToolResponse::Complete(r))) if r.is_error == Some(true) => Some(
                 r.content
                     .first()
                     .and_then(|c| c.as_text())
                     .map(|t| t.text.clone())
                     .unwrap_or_default(),
             ),
-            Ok(_) => None,
+            Some(Ok(_)) => None,
         };
-        let (class, msg) = match rejected {
-            Some(m) => (ErrorClass::InvalidArgs, m),
+        let (class, msg) = match (res, rejected) {
+            (None, _) => {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    agent = ctx.agent_name(),
+                    tool = %call.tool,
+                    "tool call aborted before it finished (client gone, cancelled, panic or \
+                     shutdown); recorded as aborted"
+                );
+                (
+                    ErrorClass::Aborted,
+                    String::from("the call was aborted before it finished"),
+                )
+            }
+            (_, Some(m)) => (ErrorClass::InvalidArgs, m),
             // A handler that returned without `finish_tool` is a bug.
-            None => {
+            (_, None) => {
                 error_class::note_unclassified();
                 tracing::error!(tool = %call.tool, "BUG: tool returned without an audit record");
                 (
@@ -758,9 +781,9 @@ impl Prompto {
             .or_else(|| call.args.get("source_host"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        // The name is the client's; keep the record bounded.
-        let tool: String = call.tool.chars().take(128).collect();
-        self.audit_record(&ctx, &tool, host.as_deref(), verdict, msg.len() as u64);
+        let bytes = if res.is_some() { msg.len() as u64 } else { 0 };
+        // The record clamps the name (`Record::clamp_strings`).
+        self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, bytes);
     }
 
     #[tool(description = "Wake a host via WOL magic packet.")]
@@ -2053,6 +2076,21 @@ fn error_parts(
     (msg, data)
 }
 
+/// Writes the `aborted` record of a call whose future is dropped before
+/// it recorded anything (see `Prompto::audit_unrouted`).
+struct AbortGuard<'a> {
+    prompto: &'a Prompto,
+    call: audit::CallScope,
+}
+
+impl Drop for AbortGuard<'_> {
+    fn drop(&mut self) {
+        if !self.call.recorded() {
+            self.prompto.audit_unrouted(&self.call, None);
+        }
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for Prompto {
     /// rmcp's generated dispatch, inside an audit scope holding the raw
@@ -2065,10 +2103,16 @@ impl ServerHandler for Prompto {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let call = audit::CallScope::new(&request.name, request.arguments.clone());
+        // Dropped before the end (cancelled, panicked, shut down): the
+        // guard writes an `aborted` record.
+        let _guard = AbortGuard {
+            prompto: self,
+            call: call.clone(),
+        };
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let res = audit::scoped(call.clone(), self.tool_router.call(tcc)).await;
         if !call.recorded() {
-            self.audit_unrouted(&call, &res);
+            self.audit_unrouted(&call, Some(&res));
         }
         res
     }

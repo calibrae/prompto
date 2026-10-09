@@ -38,6 +38,9 @@ pub struct CallCtx {
     /// Claude session ID sent as context by the client in the
     /// `X-Prompto-Session` header. Context only, never proof of identity.
     pub session_id: Option<String>,
+    /// `optional` mode: why a caller that presented a credential is
+    /// `anonymous` (see `agent::Identity::auth_note`).
+    pub auth_note: Option<String>,
     /// When the call started, for `duration_ms`.
     pub started: Instant,
     /// The client's `User-Agent` (HTTP only), for the audit record.
@@ -59,6 +62,7 @@ impl CallCtx {
             caller_ip,
             agent: None,
             session_id: None,
+            auth_note: None,
             started: Instant::now(),
             user_agent: None,
             call: None,
@@ -83,6 +87,7 @@ impl CallCtx {
     pub fn with_identity(mut self, id: crate::agent::Identity) -> Self {
         self.agent = id.agent;
         self.session_id = id.session_id;
+        self.auth_note = id.auth_note;
         self
     }
 
