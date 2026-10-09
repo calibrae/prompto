@@ -107,6 +107,7 @@ capabilities = []
 | `sudo_password_vault_path` / `sudo_password_vault_field` | Vault-held sudo password (field defaults to `password`). Requires `sudo_exec`. |
 | `extra_ips` | Other addresses the machine may call prompto from (second NIC, Wi-Fi, VPN, IPv6). Used only by the self-targeting guard, never to reach the host. Literal IPs, canonicalized at load (`::ffff:a.b.c.d` → `a.b.c.d`). Load errors: unspecified or multicast addresses, repeats, and an address claimed by two hosts. |
 | `groups` | Policy host groups, matched by `group:<g>` in [`policy.toml`](#policy-policytoml). Names use `[a-z0-9_-]`; repeats are load errors. They mean nothing outside policy. |
+| `nopasswd_sudo` | `true` / `false`: whether `ssh_user` can `sudo` without a password. Unset means unknown. Informational: prompto's sudo paths don't read it. `policy lint` warns when a rule without `sudo = true` grants an exec tool on a host where this is `true` or unset, or where `ssh_user` is `root` (see [*`sudo = false` is not "no root"*](#policy-policytoml)). |
 | `request_id_env` | How `PROMPTO_REQUEST_ID` reaches remote commands. `export` adds an `export …;` prefix plus `ssh -o SetEnv`; it is the default on `linux` and `macos`. `setenv` uses `SetEnv` only, leaving the command line untouched; it is the default on `freebsd` and `windows`. `off` sends nothing: no prefix, no `SetEnv`, no `env` on the vault sudo path. Use `off` for keys restricted by `command=`, rrsync or git-shell. Use `setenv` for a non-POSIX login shell on Linux or macOS. Any other value is a load error. |
 
 The whole file is validated at load (unknown hypervisors, alias collisions, `wake` on a VM, malformed vault paths, …). `SIGHUP` reloads it without dropping the listener; a file that fails validation is rejected and the previous inventory stays live.
@@ -225,13 +226,17 @@ approval = "human"                 # none (default) | ticket | human
 **Matching.** Rules are read top to bottom; **the first rule that matches decides**, and no match is a deny. Rules only grant (there are no deny rules), so order matters only for which rule's `approval` applies: put the narrow, stricter rule first. A rule matches when:
 
 - **agents**: the agent's name is listed, or `group:<g>` names one of its groups. Groups are read from the *live* `agents.toml` at every call, so a reload that changes them applies to open sessions too. No globs, so a rule never grants an agent nobody named. `anonymous` (no valid token under `optional`) and `local` (stdio) match only by name.
-- **hosts**: an entry matches the host's inventory name or any of its aliases (`*` and `?` are wildcards), or is `group:<g>` with `<g>` in the host's inventory `groups`. Tools that target no host (`inventory_list`, `prompto_gain`, `mcp_reconnect_hint`) skip this check.
+- **hosts**: an entry matches the host's inventory name or any of its aliases (`*` and `?` are wildcards), or is `group:<g>` with `<g>` in the host's inventory `groups`. Tools that target no host (`inventory_list`, `prompto_gain`, `mcp_reconnect_hint`) skip this check: they still need a `tools` match, but a rule grants them whatever its `hosts` say.
 - **tools**: an entry matches the tool name (`*`, `?`).
 - **sudo**: root-capable calls are a **separate grant**. They match only rules with `sudo = true`, and those rules match only them. So `tools = ["*"]` grants every ordinary tool and nothing that runs as root. Root-capable: `ssh_sudo_exec`, `file_write` with `sudo = true`, `service_control`, `host_sleep`, `service_logs` / `mcp_logs` / `GET /log` (journal via sudo), and `vm_stop`.
 
+**`sudo = false` is not "no root".** `sudo = true` gates prompto's *own* root paths, nothing more. The exec tools (`ssh_exec`, `ssh_batch`, `bash_exec`, `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `claude_exec`, and `mcp_add`, whose stdio command runs on the client) run whatever the agent sends, as the host's `ssh_user`. So an exec grant on a host is a shell as that user, and that is root wherever the user is `root` or can `sudo` without a password: `ssh_exec "sudo -n …"` needs no `sudo = true` rule there. prompto does not try to police command strings (`sh -c`, quoting and aliases make that unreliable). Grant exec tools only where that shell is acceptable, and mark each host's `nopasswd_sudo` in the inventory so `policy lint` can tell you where it isn't. The list of exec tools lives in one place in the code (`authz::ARBITRARY_EXEC_TOOLS`); every tool is classified as root-capable, exec or ordinary, and a test fails on one that isn't.
+
 **Approval.** A rule with `approval = "ticket"` or `"human"` refuses what it matches with `approval_required`: tickets and human approval are not implemented yet, so such a rule fails closed rather than allowing anything.
 
-**What policy cannot do.** It only narrows: effective permission = policy ∩ host capability, minus the caller's own machine. The capability check and the self-targeting guard run first and no rule can undo them.
+**What policy cannot do.** It only narrows: effective permission = policy ∩ host capability, minus the caller's own machine. The capability check and the self-targeting guard run first and no rule can undo them. A consequence: an agent with no grant at all can still tell `unknown_host` from `refused_capability` from `refused_self_target`, so it can probe which host names exist and what they carry. That is a known, accepted property; the self-targeting guard must stay unconditional, so it can't wait for policy.
+
+**Inventory visibility.** With policy on, `inventory_list` shows an agent only the hosts some rule grants it a host-targeting tool on (any tool, with or without `sudo`, approval rules included; the hostless `inventory_list` grant itself doesn't count). `sudo_password_vault_path` is shown only on hosts where the agent has a `sudo = true` grant; elsewhere the key is left out (not set to `null`, which would claim there is none). `inventory_get_host` hides it the same way. With `off`, both are unchanged.
 
 **Refusals** are classified `refused_policy` (or `approval_required`), carry the deciding rule in `error.data.rule` (`policy.toml:<line>`, with ` (<id>)` when the rule has one, or `default-deny`), and say what is missing:
 
@@ -243,7 +248,7 @@ build-2 but without sudo). Ask the operator for a policy.toml rule if you need i
 
 Allowed calls log `policy allow request_id=… agent=… tool=… host=… root=… rule=…` at info level. `GET /log` answers a policy refusal with 403.
 
-**Loading.** Like `agents.toml`: reloaded on SIGHUP, each file independently, and a file that fails to parse keeps the previous policy live. A malformed file at startup stops the server. A **missing** file means *deny every call*, with a loud warning at startup and on each reload. The server lints the policy at startup and after every reload, and logs the findings. They never block loading: a rule naming something that doesn't exist simply grants nothing.
+**Loading.** Reloaded on SIGHUP, independently of the inventory and `agents.toml`. A malformed file at startup stops the server. On reload it **fails closed**: the previous policy is dropped (it may be broader than the one being written), every call is denied with `policy file invalid since <time>: <error>` in the refusal, and an error is logged (`POLICY FILE INVALID`), until a valid file is loaded with another SIGHUP. A **missing** file also means *deny every call*, with a loud warning at startup and on each reload. The server lints the policy at startup and after every reload, and logs the findings. They never block loading: a rule naming something that doesn't exist simply grants nothing.
 
 **Checking a policy:**
 
@@ -253,8 +258,8 @@ prompto policy check --agent builder --host build-2 --tool ssh_sudo_exec    # AL
 prompto policy check --agent builder --host build-2 --tool file_write --sudo
 ```
 
-- **Lint errors:** unknown agents, agent groups nobody is in, unknown hosts, host groups no host is in, unknown tools.
-- **Lint warnings:** globs that match nothing, revoked agents, `approval` rules (always refused for now), and rules that can never decide a call. Lint finds those by enumerating every agent × host × tool × root combination: a rule is either *shadowed* (an earlier rule always wins; the warning names it), or matches nothing at all (for example `sudo = true` on tools that are never root-capable).
+- **Lint errors:** unknown agents, unknown hosts, host groups no host is in, unknown tools.
+- **Lint warnings:** agent groups nobody is in yet, globs that match nothing, revoked agents, `approval` rules (always refused for now), exec grants without `sudo = true` on hosts where that shell can become root (one warning per rule, naming the tools and each host: `ssh_user is root`, `nopasswd_sudo = true`, or `nopasswd_sudo unset`; hosts lacking the tools' capability are skipped), and rules that can never decide a call. Lint finds those by enumerating every agent × host × tool × root combination: a rule is either *shadowed* (an earlier rule always wins; the warning names it), or matches nothing at all (for example `sudo = true` on tools that are never root-capable).
 - `policy check` evaluates policy only; capability and the self-targeting guard are checked at call time, before policy.
 - `cargo run --example inv_check -- prompto.toml policy.toml agents.toml` runs the same lint.
 

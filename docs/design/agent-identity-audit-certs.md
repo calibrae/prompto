@@ -68,6 +68,12 @@ Effective permission = agent policy ∩ host capabilities, minus the caller's ow
 
 **On `ssh_exec`:** a command string can't be policed reliably (`sh -c`, quoting, aliases), so policy treats `ssh_exec`/`bash_exec`/`ssh_sudo_exec` as what they are — a full shell on that host — and grants them per host, not per command. The pressure goes the other way: make typed tools good enough that agents choose them, and grant those widely. The audit log records the full command either way.
 
+**`sudo = true` gates prompto's own root paths, not root on the host** *(E3 follow-up)*. A rule without `sudo = true` never grants `ssh_sudo_exec`, `file_write` with `sudo`, `service_control` and the other root-capable calls. But an exec grant (`authz::ARBITRARY_EXEC_TOOLS`: `ssh_exec`, `ssh_batch`, `bash_exec`, the script runners, `claude_exec`, `mcp_add`) is a shell as `ssh_user`, and that is root wherever the user is `root` or has passwordless sudo: `ssh_exec "sudo -n …"` there is root with no `sudo = true` rule. We don't police command strings (see above). Instead the inventory may say `nopasswd_sudo = true | false` per host (unset = unknown), and `policy lint` warns, once per rule, about exec grants without `sudo = true` on hosts that are `ssh_user = "root"`, `nopasswd_sudo = true` or unset. Every tool is classified in exactly one of root-capable, arbitrary exec or ordinary, and a test enumerating `tools/list` fails on a tool that isn't.
+
+**Known property: pre-policy disclosure.** Existence, capability and self-target checks run before policy (the self-target guard must be unconditional). So an agent with no grant can tell `unknown_host` from `refused_capability` from `refused_self_target`, and probe which host names exist and what they carry. This is accepted and documented, not fixed. `inventory_list` itself shows an agent only the hosts it has a grant on, and `sudo_password_vault_path` only with a `sudo = true` grant there.
+
+**Malformed policy on reload fails closed.** A SIGHUP that finds `policy.toml` malformed replaces the live policy with deny-all (refusals say `policy file invalid since <time>: <error>`) until a valid file is loaded. Keeping the previous policy would keep whatever it granted, possibly more than the operator is trying to write. Startup with a malformed file stays fatal.
+
 ## 3. Audit log (v0.12)
 
 A new append-only `audit.jsonl` (and the same record to journald as structured fields), separate from the token-savings usage log:

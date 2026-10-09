@@ -93,7 +93,10 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   - Root-capable is a **flag on the rule** (`sudo = true`), not a pseudo-tool name. A call is root-capable when it needs `sudo_exec`, or it is `vm_stop`. Rules match only calls of their own kind, so `tools = ["*"]` can't leak root, and a glob can't be written that does.
   - `approval = "ticket" | "human"` refuses with the new class `approval_required` until E6. Lint warns about it.
   - Errors carry `rule` in `error.data`. The journald `tool call failed` line has it too, and allows log `policy allow … rule=…`. The rule is `policy.toml:<line>`, with ` (<id>)` when set, or `default-deny`.
-  - Policy is loaded only in optional/required. With `off` it is never read, as with `agents.toml`. A missing file is deny-all with a loud warning; a malformed one is fatal at startup and keeps the previous policy on SIGHUP.
+  - Policy is loaded only in optional/required. With `off` it is never read, as with `agents.toml`. A missing file is deny-all with a loud warning; a malformed one is fatal at startup and, on SIGHUP, **fails closed**: deny-all, with `policy file invalid since <time>: <error>` in refusals, until a valid file is loaded (task 008; it used to keep the previous policy).
+  - `sudo = true` gates prompto's own root paths only. An exec grant is a shell as `ssh_user`, which is root where that user is root or has passwordless sudo. Inventory `nopasswd_sudo` (optional) feeds a lint warning, and every tool is classified root-capable / arbitrary exec / ordinary, enforced by a test (task 008).
+  - With policy on, `inventory_list` lists only hosts the agent has a grant on, and `sudo_password_vault_path` appears only with a `sudo = true` grant on that host (also in `inventory_get_host`). `off` output is unchanged. `tools/list` is not filtered (owner decision, task 008).
+  - Lint: an agent group nobody is in is a warning, not an error (owner decision, task 008).
   - `prompto policy lint` (also run at startup and on reload, log only) enumerates every agent × host × tool × root call to find shadowed and dead rules exactly.
 
 ### E4 — Audit log (v0.12.0)

@@ -1,6 +1,7 @@
 # /etc/prompto/policy.toml — who may use which tool on which host
 # (PROMPTO_POLICY). Enforced only with PROMPTO_AUTH=optional|required; with
-# off it is not read. Missing file under optional/required = deny everything.
+# off it is not read. Missing file under optional/required = deny everything;
+# so is a file that fails to parse on reload, until a valid one is loaded.
 # Reload with SIGHUP (`systemctl reload prompto`); check with
 # `prompto policy lint` and `prompto policy check --agent A --host H --tool T`.
 #
@@ -12,12 +13,16 @@
 #            match by name.
 #   hosts    inventory names or aliases, * ? globs, group:<g> (inventory
 #            `groups`). Ignored for inventory_list, prompto_gain,
-#            mcp_reconnect_hint, which target no host.
+#            mcp_reconnect_hint, which target no host (they still need a
+#            tools match).
 #   tools    tool names, * ? globs.
 #   sudo     false (default): grants ordinary calls only.
 #            true: grants root-capable calls only — ssh_sudo_exec,
 #            file_write with sudo=true, service_control, host_sleep,
 #            service_logs, mcp_logs (and GET /log), vm_stop.
+#            This gates prompto's OWN root paths. An exec grant (ssh_exec,
+#            bash_exec, …) is a shell as ssh_user — root wherever that user
+#            is root or has passwordless sudo (inventory nopasswd_sudo).
 #   approval "none" (default) | "ticket" | "human". Not implemented yet:
 #            a ticket/human rule REFUSES what it matches (approval_required).
 #
