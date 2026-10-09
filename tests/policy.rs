@@ -157,6 +157,7 @@ async fn spawn(mode: AuthMode, agents: AgentStore, policy: PolicyStore) -> Serve
             policy,
         },
         audit: Default::default(),
+        kill: prompto::kill::KillSwitch::in_dir(dir.path()),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -868,6 +869,7 @@ fn command(dir: &Path, mode: &str) -> std::process::Command {
         .env("PROMPTO_GAIN_ENABLED", "false")
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
         .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
+        .env("PROMPTO_KILL_FILE", dir.join("kill"))
         .env("RUST_LOG", "prompto=info");
     c
 }

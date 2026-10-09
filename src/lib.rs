@@ -19,6 +19,7 @@ pub mod files;
 pub mod filters;
 pub mod host;
 pub mod inventory;
+pub mod kill;
 pub mod mcp;
 pub mod mcpprobe;
 pub mod policy;

@@ -88,6 +88,7 @@ async fn serve(
         legacy_session_mode,
         auth: Default::default(),
         audit: Default::default(),
+        kill: Default::default(),
         cancel: cancel.clone(),
     });
 

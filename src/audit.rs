@@ -109,6 +109,8 @@ pub struct Notes {
     pub approval: Option<&'static str>,
     /// Refused because the audit log could not be written (strict mode).
     pub audit_refused: bool,
+    /// Refused by this kill switch (`crate::kill`).
+    pub kill: Option<crate::kill::Kill>,
 }
 
 /// The raw call as the client sent it. Installed by `Prompto::call_tool`
@@ -489,6 +491,11 @@ pub struct Record {
     /// (`sessions::redact`) — the full ID is a handle to that session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_session: Option<String>,
+    /// `error_class = killed`: the kill switch that refused the call —
+    /// its `scope` (`global` | `agent` | `host` | `session`), `target`,
+    /// `since` and `reason` (see `crate::kill`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kill: Option<crate::kill::Kill>,
 }
 
 /// Caps, in chars, on the caller-controlled strings of a record (see
@@ -660,6 +667,7 @@ pub fn tool_record(ctx: &CallCtx, tool: &str, args: Value) -> Record {
         suppressed: None,
         auth_note: ctx.auth_note.clone(),
         mcp_session: None,
+        kill: ctx.notes().kill,
     }
 }
 
@@ -694,6 +702,10 @@ impl Record {
         opt(&mut self.path, MAX_PATH);
         opt(&mut self.auth_note, MAX_FIELD);
         opt(&mut self.mcp_session, MAX_FIELD);
+        if let Some(k) = self.kill.as_mut() {
+            opt(&mut k.target, MAX_FIELD);
+            opt(&mut k.reason, MAX_FIELD);
+        }
     }
 
     /// Fill in the outcome fields.
@@ -1269,6 +1281,7 @@ impl Audit {
             suppressed: (suppressed > 0).then_some(suppressed),
             auth_note: None,
             mcp_session,
+            kill: None,
         };
         self.write(rec);
     }
@@ -1308,6 +1321,9 @@ fn emit_event(r: &Record) {
         suppressed = r.suppressed,
         auth_note = r.auth_note.as_deref(),
         mcp_session = r.mcp_session.as_deref(),
+        kill_scope = r.kill.as_ref().map(|k| k.scope.as_str()),
+        kill_target = r.kill.as_ref().and_then(|k| k.target.as_deref()),
+        kill_reason = r.kill.as_ref().and_then(|k| k.reason.as_deref()),
         "audit"
     );
 }
@@ -1519,7 +1535,7 @@ pub fn json_for_terminal(line: &str) -> std::borrow::Cow<'_, str> {
 /// A character that changes what a terminal shows rather than showing
 /// itself: C0/C1 controls and DEL, and Unicode formatting that reorders
 /// or hides text (bidi overrides and isolates, zero-width characters).
-fn is_terminal_hazard(c: char) -> bool {
+pub(crate) fn is_terminal_hazard(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{200b}'..='\u{200f}'
@@ -1604,6 +1620,14 @@ pub fn table_row(r: &Value) -> [String; 8] {
         });
         if s("decision") == "deny" && !s("rule").is_empty() {
             d = format!("rule={} {d}", s("rule"));
+        }
+        if let Some(k) = r.get("kill") {
+            let ks = |f: &str| k.get(f).and_then(Value::as_str).unwrap_or("");
+            let target = match ks("target") {
+                "" => String::new(),
+                t => format!(" {t}"),
+            };
+            d = format!("kill={}{target} {d}", ks("scope"));
         }
         if !s("auth_note").is_empty() {
             d = format!("[{}] {d}", s("auth_note"));
@@ -2227,6 +2251,19 @@ mod tests {
         // Long cells are cut.
         let long = json!({ "type": "tool", "tool": "t".repeat(500) });
         assert_eq!(table_row(&long)[2].chars().count(), CELL_MAX);
+    }
+
+    #[test]
+    fn table_names_the_kill_switch() {
+        let r = json!({
+            "type": "tool", "tool": "ssh_exec", "decision": "deny", "ok": false,
+            "error_class": "killed", "args": { "cmd": "id" },
+            "kill": { "scope": "host", "target": "web1", "reason": "disk" },
+        });
+        assert_eq!(table_row(&r)[5], "killed");
+        assert_eq!(table_row(&r)[7], "kill=host web1 id");
+        let g = json!({ "type": "tool", "args": {}, "kill": { "scope": "global" } });
+        assert_eq!(table_row(&g)[7], "kill=global ");
     }
 
     #[test]

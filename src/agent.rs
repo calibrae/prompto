@@ -251,11 +251,56 @@ pub fn mint_token() -> Result<String> {
     ))
 }
 
-/// `agents.toml`, hot-swappable on SIGHUP like the inventory.
+/// `agents.toml`, hot-swappable. It is re-read on SIGHUP like the
+/// inventory, and also by itself: [`AgentStore::refresh`] runs on every
+/// authenticated request and re-reads the file when its metadata changed
+/// (one `stat`), so `prompto agent revoke` takes effect on the next call
+/// without anyone having to remember the signal.
+///
+/// A re-read fails closed, like `policy.toml`: a file that is malformed
+/// or unreadable replaces the live list with no agents (every token is
+/// refused: 401 under `required`, `anonymous` under `optional`) until a
+/// valid file is read. Keeping the previous list instead would keep a
+/// half-revoked agent alive behind a typo.
 #[derive(Clone)]
 pub struct AgentStore {
     inner: Arc<ArcSwap<Agents>>,
     path: Option<PathBuf>,
+    /// The file's metadata when it was last read.
+    seen: Arc<std::sync::Mutex<Option<Stamp>>>,
+}
+
+/// What a `stat` of `agents.toml` says: enough to notice any change
+/// (`write_atomic` replaces the inode; an in-place edit moves mtime,
+/// ctime or size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stamp {
+    Missing,
+    Unreadable(std::io::ErrorKind),
+    File {
+        dev: u64,
+        ino: u64,
+        size: u64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+    },
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(m) => Stamp::File {
+                dev: m.dev(),
+                ino: m.ino(),
+                size: m.size(),
+                mtime: (m.mtime(), m.mtime_nsec()),
+                ctime: (m.ctime(), m.ctime_nsec()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stamp::Missing,
+            Err(e) => Stamp::Unreadable(e.kind()),
+        }
+    }
 }
 
 impl Default for AgentStore {
@@ -269,29 +314,70 @@ impl AgentStore {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(agents)),
             path,
+            seen: Default::default(),
         }
     }
 
     pub fn load_from(path: PathBuf) -> Result<Self> {
+        // Stamped before reading: a change during the read is seen next.
+        let stamp = Stamp::of(&path);
         let agents = Agents::from_path(&path)?;
-        Ok(Self::new(agents, Some(path)))
+        let store = Self::new(agents, Some(path));
+        *store.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+        Ok(store)
     }
 
     pub fn snapshot(&self) -> Arc<Agents> {
         self.inner.load_full()
     }
 
-    /// Re-read the file. On error the live store is left unchanged.
-    /// Returns the number of agents (disabled included).
+    /// Re-read the file (SIGHUP). Returns the number of agents (disabled
+    /// included). Fails closed: on error the live list becomes empty and
+    /// the error is returned.
     pub fn reload(&self) -> Result<usize> {
         let path = self
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("no agents path configured — cannot reload"))?;
-        let new = Agents::from_path(path)?;
-        let n = new.agents.len();
-        self.inner.store(Arc::new(new));
-        Ok(n)
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        self.read_locked(path, &mut seen)
+    }
+
+    /// Re-read the file if it changed since it was last read. Cheap (one
+    /// `stat`); called on every authenticated request.
+    pub fn refresh(&self) {
+        let Some(path) = &self.path else { return };
+        let now = Stamp::of(path);
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if *seen == Some(now) {
+            return;
+        }
+        match self.read_locked(path, &mut seen) {
+            Ok(n) => tracing::info!(
+                agent_count = n,
+                path = %path.display(),
+                "agents file changed — reloaded"
+            ),
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                "AGENTS FILE INVALID — every agent token is REFUSED until a valid file is read"
+            ),
+        }
+    }
+
+    fn read_locked(&self, path: &Path, seen: &mut Option<Stamp>) -> Result<usize> {
+        *seen = Some(Stamp::of(path));
+        match Agents::from_path(path) {
+            Ok(new) => {
+                let n = new.agents.len();
+                self.inner.store(Arc::new(new));
+                Ok(n)
+            }
+            Err(e) => {
+                self.inner.store(Arc::new(Agents::default()));
+                Err(e)
+            }
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -427,6 +513,8 @@ pub fn authenticate_request(
             s
         }
     };
+    // A revoke or a new agent applies to this request, no SIGHUP needed.
+    cfg.store.refresh();
     let required = cfg.mode == AuthMode::Required;
     let Some(raw) = authorization else {
         if required {
@@ -711,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_no_agents_and_bad_reload_keeps_previous() {
+    fn missing_file_is_no_agents_and_bad_reload_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agents.toml");
         let store = AgentStore::load_from(path.clone()).unwrap();
@@ -729,9 +817,58 @@ mod tests {
         std::fs::write(&path, "this is = = not toml").unwrap();
         assert!(store.reload().is_err());
         assert!(
-            matches!(store.snapshot().authenticate(&tok), AuthResult::Valid(_)),
-            "a bad file must keep the previous store"
+            matches!(store.snapshot().authenticate(&tok), AuthResult::Unknown),
+            "a bad file must not keep the previous store"
         );
+        write_atomic(&path, &a.to_toml_string().unwrap()).unwrap();
+        assert_eq!(store.reload().unwrap(), 1);
+        assert!(matches!(
+            store.snapshot().authenticate(&tok),
+            AuthResult::Valid(_)
+        ));
+    }
+
+    /// `refresh` picks up a revoke, a hand edit, a broken file (fail
+    /// closed) and a deletion without SIGHUP, and leaves an unchanged file
+    /// alone.
+    #[test]
+    fn refresh_follows_the_file_without_sighup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.toml");
+        let mut a = Agents::default();
+        let tok = add_agent(&mut a, "builder", vec![]).unwrap();
+        write_atomic(&path, &a.to_toml_string().unwrap()).unwrap();
+        let store = AgentStore::load_from(path.clone()).unwrap();
+        let auth = |s: &AgentStore| {
+            s.refresh();
+            s.snapshot().authenticate(&tok)
+        };
+        assert!(matches!(auth(&store), AuthResult::Valid(_)));
+
+        // Unchanged file: the very same snapshot is kept.
+        let before = store.snapshot();
+        store.refresh();
+        assert!(Arc::ptr_eq(&before, &store.snapshot()));
+
+        // The CLI's revoke (atomic rename).
+        revoke_agent(&mut a, "builder").unwrap();
+        write_atomic(&path, &a.to_toml_string().unwrap()).unwrap();
+        assert!(matches!(auth(&store), AuthResult::Revoked(_)));
+
+        // A hand edit in place, same inode.
+        a.agents.get_mut("builder").unwrap().disabled = false;
+        std::fs::write(&path, a.to_toml_string().unwrap()).unwrap();
+        assert!(matches!(auth(&store), AuthResult::Valid(_)));
+
+        // A broken edit fails closed.
+        std::fs::write(&path, "[agent.builder\n").unwrap();
+        assert!(matches!(auth(&store), AuthResult::Unknown));
+        std::fs::write(&path, a.to_toml_string().unwrap()).unwrap();
+        assert!(matches!(auth(&store), AuthResult::Valid(_)));
+
+        // Deleted: no agents.
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(auth(&store), AuthResult::Unknown));
     }
 
     #[test]
