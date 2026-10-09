@@ -180,8 +180,7 @@ disabled = false
 ```bash
 sudo prompto agent add builder --groups build,ops   # prints the token ONCE on stdout
 sudo prompto agent list                             # name, status, groups, created, sha256 prefix
-sudo prompto agent revoke builder                   # sets disabled = true
-sudo systemctl reload prompto                       # SIGHUP: a running server re-reads agents.toml
+sudo prompto agent revoke builder                   # sets disabled = true; refused from the next request
 ```
 
 - **`add`** writes only the hash, atomically, keeping the file's mode and owner.
@@ -191,10 +190,10 @@ sudo systemctl reload prompto                       # SIGHUP: a running server r
   - The name stays taken.
   - A stale token is logged as *revoked*, naming the role, instead of just *invalid*.
   - To issue a new token for a role, revoke it and add a new name, or delete the entry by hand and `add` again.
-- **Nothing takes effect until SIGHUP.** The CLI says so after every change.
-  - A reload that fails (bad TOML, malformed hash, duplicate token) keeps the previous agents live and logs why.
+- **Changes apply to the next request, no SIGHUP needed.** With `optional` or `required`, every request `stat`s `agents.toml` and re-reads it when it changed (inode, size, mtime or ctime), whether the CLI or an editor changed it. SIGHUP re-reads it too.
+  - A re-read that fails (bad TOML, malformed hash, duplicate token, unreadable) **fails closed**, like the policy: no agent is valid (every token gets 401 under `required`, `anonymous` under `optional`) and `AGENTS FILE INVALID` is logged, until a valid file is read. The previous agents are not kept: a half-finished revoke must not leave the agent working. A malformed file at startup still stops the server.
   - A missing file means no agents.
-- **After the reload, a revoked token** is refused on the very next request with `PROMPTO_AUTH=required`. With `optional` it falls back to `anonymous`.
+- **A revoked token** is refused on the very next request with `PROMPTO_AUTH=required`: a 401, recorded as a `type: auth` record with `reason: revoked token`, not as `killed` (it is an authentication failure, and the 401 comes before any tool call). With `optional` it falls back to `anonymous`. Revoking is permanent for that token; to stop an agent for a while and let it resume with the same token, use [`prompto kill agent`](#kill-switches).
 
 **Rollout:**
 
@@ -264,7 +263,7 @@ prompto policy check --agent builder --host build-2 --tool file_write --sudo
 - `policy check` evaluates policy only; capability and the self-targeting guard are checked at call time, before policy.
 - `cargo run --example inv_check -- prompto.toml policy.toml agents.toml` runs the same lint.
 
-**Kill one agent on one host:** drop the host from its rules and reload.
+**Kill one agent on one host:** drop the host from its rules and reload (SIGHUP). The broader scopes need no policy edit: see [kill switches](#kill-switches).
 
 ## `GET /log`
 
@@ -279,7 +278,7 @@ Plain-text journal tail for scripts and dashboards. It has the same gate as `ser
 
 ## Audit log
 
-Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (default `/var/lib/prompto/audit.jsonl`), whatever `PROMPTO_AUTH` says. That includes refusals (`unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`), calls whose arguments don't parse, `GET /log` (recorded as `service_logs`), and every 401. It is separate from the token-savings usage log.
+Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (default `/var/lib/prompto/audit.jsonl`), whatever `PROMPTO_AUTH` says. That includes refusals (`killed`, `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`), calls whose arguments don't parse, `GET /log` (recorded as `service_logs`), and every 401. It is separate from the token-savings usage log.
 
 ```json
 {"ts":"2026-10-09T11:50:02.113Z","type":"tool","request_id":"01M4G…","agent":"builder","agent_groups":["ops"],
@@ -297,9 +296,10 @@ Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (
 - **401s** have no tool call; they are `"type":"auth"` records with `reason` (`missing bearer token`, `invalid bearer token`, `revoked token`, `session belongs to another agent`) and `path`. They come from unauthenticated peers, so they are rate-limited per client (an IP, or an IPv6 /64: a burst of 10, then one every 10 s; the 4096 most recent clients are tracked) under a global ceiling (a burst of 60, then one per second). One client flooding can't crowd out another's revoked-token 401. The next record written says how many were dropped (`suppressed`). A hijack attempt adds `mcp_session`, the other agent's session ID shortened as in the journal; `session_id` is shortened the same way there. The journal keeps its own warning line for each.
 - **`auth_note`:** with `PROMPTO_AUTH=optional`, a caller whose token is revoked or invalid runs as `anonymous`; its records say so (`"auth_note": "revoked token for builder"` / `"invalid token"`).
 - **Bounded:** every string a client chooses (a typed host name, an unknown tool name, `User-Agent`, the session header, `path`, `reason`) is scrubbed as above and cut to 256 chars (`path`: 512).
+- **`kill`:** a call refused by a [kill switch](#kill-switches) (`error_class: "killed"`, `decision: "deny"`) carries the switch: `"kill": {"scope": "host", "target": "build-1", "since": "2026-10-09T12:00:00Z", "reason": "disk failing"}` (`scope` is `global`, `agent`, `host` or `session`; `global` has no `target`). journald: `AUDIT_KILL_SCOPE`, `AUDIT_KILL_TARGET`, `AUDIT_KILL_REASON`. The `prompto audit` table shows `kill=<scope> <target>` in the detail column.
 - **`aborted`:** a call cut off before it finished (prompto shut down or the handler panicked mid-call) still gets its record, with `error_class: "aborted"`. Whether the action took effect is unknown.
 
-**`error_class`** is one enum for every failure of every tool, the same one MCP errors carry in `error.data.error_class`: `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`, `invalid_args`, `ssh_connect`, `ssh_auth`, `timeout`, `sudo_guard` (the vault sudo guard, exit 97: the host has a passwordless rule), `remote_nonzero`, `vault`, `upstream` (the apytti gateway behind `claude_exec`), `internal`, `aborted` (audit only, see above), rsync's `rsync_*` / `dest_ssh_*`, and the reserved `killed` and `refused_ticket`. An error that reaches the end of a tool without a class is a bug: it is reported as `internal` and logged as `BUG: tool error without an error_class`; a test drives every tool into every failure it can force and fails on one.
+**`error_class`** is one enum for every failure of every tool, the same one MCP errors carry in `error.data.error_class`: `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`, `invalid_args`, `ssh_connect`, `ssh_auth`, `timeout`, `sudo_guard` (the vault sudo guard, exit 97: the host has a passwordless rule), `remote_nonzero`, `vault`, `upstream` (the apytti gateway behind `claude_exec`), `internal`, `aborted` (audit only, see above), `killed` (a [kill switch](#kill-switches)), rsync's `rsync_*` / `dest_ssh_*`, and the reserved `refused_ticket`. An error that reaches the end of a tool without a class is a bug: it is reported as `internal` and logged as `BUG: tool error without an error_class`; a test drives every tool into every failure it can force and fails on one.
 
 **journald.** The same record is a `tracing` event at target `prompto::audit`. Under systemd it goes to the journal as structured fields prefixed `AUDIT_` (`journalctl -u prompto AUDIT_AGENT=builder AUDIT_DECISION=deny`, `-o verbose` to see them; the record's `type` is `AUDIT_RECORD_TYPE`). Outside systemd it is a log line on stderr. It is emitted before the file is written, so the journal has the record even if the write fails.
 
@@ -317,6 +317,51 @@ prompto audit --request-id 01M4G… --json        # the raw record
 The table shows every client-supplied string with control characters escaped (`\x1b`, `\u{202e}`), so a crafted tool name or command can't drive your terminal; `--json` prints the records as JSON with those characters `\u`-escaped too. Filters combine; `--host` matches `host`, `queried_as` or rsync's dest; `--since` takes `30s`/`10m`/`2h`/`7d`/`1w` or a time (RFC 3339, or `YYYY-MM-DD[THH:MM[:SS]]` in UTC). Rotated siblings (`audit.jsonl.1`, `audit.jsonl.2.gz`, …) are read too, oldest first, skipping those last written before `--since`.
 
 **Permissions and rotation.** prompto creates the file `0640`. The intended layout is `prompto:prompto-audit`, with readers in the `prompto-audit` group: `deploy/install.sh` creates the group and the file that way, and `deploy/logrotate.d/prompto-audit` keeps it so on rotation. Readers also need to traverse `/var/lib/prompto` (`0750 prompto:prompto`), e.g. `setfacl -m g:prompto-audit:x /var/lib/prompto`. If prompto has to create the file itself, `PROMPTO_AUDIT_GROUP` gives it that group (prompto must be a member). Rotation is rename-based and needs no signal: before each write prompto compares the path with the file it has open and reopens after a rename. Don't use `copytruncate`: lines written between its copy and its truncate are lost. The snippet uses `delaycompress`, so the file just rotated away is never compressed while a write may still land in it.
+
+## Kill switches
+
+Stop calls at any scope, effective from the **next call**: no restart, no SIGHUP, in every `PROMPTO_AUTH` mode.
+
+```bash
+sudo prompto kill on "incident 42: runaway agent"   # global: every tool call and GET /log
+sudo prompto kill off
+sudo prompto kill agent builder "looping on file_write"
+sudo prompto kill host build-1 "disk failing"       # every agent, on that host
+sudo prompto kill session 3f2c…                     # one X-Prompto-Session
+sudo prompto unkill agent|host|session <name>
+prompto kill status                                 # what is on, since when, why
+```
+
+| Scope | File | Refuses |
+|---|---|---|
+| global | `/etc/prompto/kill` (`PROMPTO_KILL_FILE`) | every tool call, and `GET /log` (503) |
+| agent | `kill.d/agent-<name>` | every call by that agent, everywhere |
+| host | `kill.d/host-<name>` | every call that targets the host (`host`, `client`, rsync's `source_host` and `dest_host`), by any agent; `GET /log` for it (403) |
+| session | `kill.d/session-<id>` | every call carrying that `X-Prompto-Session` |
+
+- **The file is the switch.** `kill.d` sits next to the global file (`/etc/prompto/kill.d`, or `PROMPTO_KILL_DIR`). A file's existence is what counts; its first line, if any, is the reason (shown with control characters removed, cut to 200 chars) and its mtime the time it was set. Writing the files by hand works exactly like the CLI: `sudo touch /etc/prompto/kill`, `echo "disk" | sudo tee /etc/prompto/kill.d/host-build-1`. The CLI writes them `0644` (`kill.d` `0755`) so the service can read them; it only ever reads them (`ProtectSystem=strict` makes `/etc` read-only to it anyway).
+- **Checked first, on every call.** Before argument parsing, the host lookup, the self-targeting guard, policy and the audit preflight. A killed call says it is killed, not why it would have failed otherwise, and a broken audit log can't stop a kill. Cost: a `stat` per applicable file per call; nothing is cached, so there is nothing to reload.
+- **The refusal** is `error_class: killed`, with a fixed message: what was stopped, since when, the reason, and the command that lifts it. It tells the agent this is deliberate and not to retry:
+  ```
+  [request_id=… error_class=killed] refused: the operator has stopped every call to host build-1 (host kill switch,
+  set 2026-10-09T12:00:00Z, reason: disk failing). Nothing was run. This is deliberate, not a fault: do not retry
+  or work around it; stop and tell the user. An operator lifts it with `prompto unkill host build-1`.
+  ```
+- **Audited** as `killed` with the scope in the record ([`kill`](#audit-log)), written when the log can take it, and always to the journal. The server also logs every switch that is on at startup (`KILL SWITCH ON`).
+- **Names:** agents as in `agents.toml`; hosts and sessions are 1–128 of `A-Za-z0-9._:-`, starting with a letter or digit. No `/`, no leading `.`: `kill host ../x` is refused, and a call naming such a host can't match a file. A host switch applies under any of the host's names: a switch set on an alias catches calls using the inventory name, and the other way round. `kill host` warns when the name isn't in the inventory.
+- **Agent and session switches need `PROMPTO_AUTH=optional` or `required`.** With `off`, calls carry no agent, and the session header isn't read. Global and host switches work in every mode. `kill agent anonymous` stops every caller without a valid token (`optional`); `kill agent local` stops the stdio transport.
+- **If the server can't check the files** (a directory it can't search), calls are **not** stopped: a mode on a directory must not take down a deployment that doesn't use kill switches. It logs `CANNOT CHECK KILL SWITCH` at startup and at most once a minute while it lasts, and `prompto kill status` warns. With the standard install (`/etc/prompto` `0750 root:prompto`) it can.
+
+**Which tool for which job:**
+
+| To stop… | Do | Effective |
+|---|---|---|
+| everything, now | `prompto kill on` | next call |
+| one agent, for a while | `prompto kill agent <name>` (token unchanged) | next call |
+| one agent, for good | `prompto agent revoke <name>` (the token is refused with 401 / runs as `anonymous`) | next request |
+| one host, every agent | `prompto kill host <name>`, or drop it from the inventory + SIGHUP | next call |
+| one agent on one host | drop the host from that agent's policy rules + SIGHUP | next call |
+| one runaway Claude session | `prompto kill session <id>` (the `session_id` in its audit records) | next call |
 
 ## Token-savings analytics
 
@@ -347,15 +392,17 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_VAULT_MOUNT` | `secret` | KV v2 mount holding the sudo secrets. |
 | `PROMPTO_VAULT_CACERT` | unset | PEM file (one or more certs) trusted as extra roots for the vault client, on top of the bundled webpki roots — for a vault behind a private CA. The system trust store is not consulted. Unreadable or certificate-less file = startup error. |
 | `PROMPTO_AUTH` | `off` | `off`, `optional` or `required`; see [Agent identity](#agent-identity-prompto_auth). Anything else is a startup error. |
-| `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents; unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto agent`. |
+| `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents; unreadable or malformed = startup error (later: every token refused until fixed). Re-read when it changes. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto agent`. |
 | `PROMPTO_POLICY` | `/etc/prompto/policy.toml` | Policy rules. Missing file = deny every call (loud warning); unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto policy`. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
 | `PROMPTO_AUDIT_LOG` | `/var/lib/prompto/audit.jsonl` | The [audit log](#audit-log). Always written; with `PROMPTO_AUTH` on, a log that can't be opened is a startup error. Also used by `prompto audit`. |
 | `PROMPTO_AUDIT_GROUP` | unset | Group (name or gid) for an audit file prompto creates itself. |
+| `PROMPTO_KILL_FILE` | `/etc/prompto/kill` | The global [kill switch](#kill-switches). Also used by `prompto kill`. |
+| `PROMPTO_KILL_DIR` | `<PROMPTO_KILL_FILE>.d` | Agent, host and session kill switches. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
-Env is read once at startup: changes need a restart. Only the inventory, `agents.toml` and `policy.toml` (the last two unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently.
+Env is read once at startup: changes need a restart. The inventory, `agents.toml` and `policy.toml` (the last two unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently; `agents.toml` is also re-read on the first request after it changes. Kill switches are read on every call.
 
 CLI:
 
@@ -364,6 +411,7 @@ CLI:
 - `agent add|list|revoke` manages agent tokens and exits.
 - `policy check|lint` dry-runs a call against the policy, or lints it, and exits.
 - `audit [filters]` queries the audit log and exits.
+- `kill on|off|status`, `kill agent|host|session <name> [reason]`, `unkill agent|host|session <name>` set and lift [kill switches](#kill-switches) and exit.
 
 ## Registering with Claude Code
 

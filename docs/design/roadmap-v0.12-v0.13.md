@@ -134,10 +134,10 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   - Tests are portable to macOS.
 
 ### E5 — Kill switches (v0.12.0)
-- **S5.1 Global kill file** `/etc/prompto/kill`, checked per call, no restart. Every call is refused with a fixed message and audited as `killed`.
-- **S5.2 Per-agent:** `agent revoke` or `disabled = true`, then SIGHUP → next call refused.
-- **S5.3 Per-host:** drop the host from policy or inventory (already works via SIGHUP); document it.
-- **S5.4 Per-session:** `prompto session kill <session_id>` adds to a deny set (in memory + file), so one runaway Claude session stops without revoking its role.
+- **S5.1 Global kill file** `/etc/prompto/kill`, checked per call, no restart. Every call is refused with a fixed message and audited as `killed`. *(Done, task 011: `prompto kill on|off|status`; checked before anything else, in every auth mode, also on `GET /log`.)*
+- **S5.2 Per-agent:** `agent revoke` or `disabled = true` → next call refused. *(Task 011: `agents.toml` is re-read when it changes, so no SIGHUP is needed, and a bad file fails closed. A revoked token stays an auth failure (401), not `killed`; `prompto kill agent <name>` is the reversible stop.)*
+- **S5.3 Per-host:** drop the host from policy or inventory (already works via SIGHUP); document it. *(Task 011: also `prompto kill host <name>`, every agent, next call.)*
+- **S5.4 Per-session:** `prompto kill session <session_id>` adds to a deny set (file), so one runaway Claude session stops without revoking its role. *(Done, task 011.)*
 
 ### E6 — Precheck API & signed tickets (v0.12.1)
 - **S6.1 Ticket format:** HMAC-SHA256 over `{agent, session_id, tool, host, sha256(canonical args), approval, approved_by, exp, nonce}`. The key comes from vault KV, with a file fallback. TTL 120 s.
