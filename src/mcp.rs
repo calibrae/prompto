@@ -1091,6 +1091,7 @@ impl Prompto {
                         "sudo_password_vault_path": h.sudo_password_vault_path,
                         "hypervisor": h.hypervisor,
                         "request_id_env": h.request_id_env().as_str(),
+                        "extra_ips": h.extra_ips,
                         "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                     })
                 })
@@ -1133,6 +1134,7 @@ impl Prompto {
                 "sudo_password_vault_path": h.sudo_password_vault_path,
                 "hypervisor": h.hypervisor,
                 "request_id_env": h.request_id_env().as_str(),
+                "extra_ips": h.extra_ips,
                 "capabilities": h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             }))
         }
