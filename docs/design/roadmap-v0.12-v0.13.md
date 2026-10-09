@@ -119,6 +119,19 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   - `ErrorClass` covers every error path (new `sudo_guard`, `vault`, `upstream`; reserved `killed`, `refused_ticket`); unclassified errors are counted and a sweep test over `tools/list` holds them at zero.
   - Rotation by rename detection (stat before each write), not SIGHUP and never `copytruncate`.
   - E3 leftovers: `file_write` (non-sudo) and `rsync_sync` are arbitrary exec for the lint; the invalid-policy refusal says only `policy file invalid since <time>`.
+- **Follow-up (task 010)**, after owner answers and a security review:
+  - Every interpreter's `script` is kept whole (and `ssh_batch`'s commands); any string over 16 KiB is hashed with `truncated: true`.
+  - Secret names match exactly or by suffix, so `dest_key` is kept.
+  - A value scrubber runs over every kept string, in the file and the journal: URL userinfo, query parameters, headers, `Bearer`, long flags, assignments and quoted literals.
+  - Client-chosen record strings are capped.
+  - 401s are rate-limited per client IP (an IPv6 /64), under a global ceiling.
+  - Optional mode records an `auth_note`.
+  - The hijack record shortens both session IDs.
+  - Below 64 MiB free the journal gets an error, and a full disk is named in the refusal.
+  - After a short write the next record starts on a fresh line, and the reader skips only the fragment.
+  - The `prompto audit` table escapes control and bidi characters.
+  - A drop guard writes an `aborted` record (new `ErrorClass::Aborted`).
+  - Tests are portable to macOS.
 
 ### E5 — Kill switches (v0.12.0)
 - **S5.1 Global kill file** `/etc/prompto/kill`, checked per call, no restart. Every call is refused with a fixed message and audited as `killed`.
