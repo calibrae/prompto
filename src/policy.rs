@@ -60,8 +60,9 @@
 //! SIGHUP re-reads the file. A missing file is deny-all. A malformed one
 //! is fatal at startup; on reload it **fails closed** — the live policy
 //! becomes deny-all and every refusal says `policy file invalid since
-//! <time>: <error>` until a valid file is loaded. The previous policy is
-//! not kept, because it may be broader than the one being written.
+//! <time>` until a valid file is loaded (the parser's error and the path
+//! go to the journal only). The previous policy is not kept, because it
+//! may be broader than the one being written.
 //!
 //! # Inventory visibility
 //!
@@ -559,11 +560,9 @@ impl Policy {
         }
         let mut why = String::from("no rule matched");
         if let Some(bad) = &self.invalid {
-            why = format!(
-                "policy file invalid since {}: {}; every call is denied until a valid file \
-                 is loaded",
-                bad.since, bad.error
-            );
+            // The parser's detail and the file's path stay in the
+            // journal (`POLICY FILE INVALID`); agents get the time only.
+            why = format!("policy file invalid since {}", bad.since);
         } else if let Some(path) = &self.missing {
             why = format!(
                 "no policy loaded: {} does not exist, so every call is denied",
@@ -688,6 +687,13 @@ impl Enforcer {
             root,
         };
         let d = self.policy.snapshot().decide(&req);
+        // For the audit record: the deciding rule's approval mode.
+        let approval = match &d.outcome {
+            Outcome::Allow => Some(Approval::None.as_str()),
+            Outcome::ApprovalRequired(a) => Some(a.as_str()),
+            Outcome::Deny => None,
+        };
+        ctx.note(|n| n.approval = approval);
         let class = match d.outcome {
             Outcome::Allow => {
                 tracing::info!(
@@ -1520,6 +1526,37 @@ capabilities = ["virt"]
         assert!(f[0].contains("(ssh_exec)") && f[0].contains("unknown (nopasswd_sudo unset)"));
     }
 
+    /// Writing ~/.bashrc is code execution: a plain `file_write` grant and
+    /// an `rsync_sync` grant warn like an exec grant does. `file_write`
+    /// with `sudo = true` is a root grant and doesn't.
+    #[test]
+    fn lint_counts_file_write_and_rsync_as_exec() {
+        let inv = Inventory::from_toml_str(
+            "[host.h]\nip = \"192.0.2.1\"\nssh_user = \"u\"\nssh_key = \"/k\"\ncapabilities = [\"exec\", \"sudo_exec\"]\n",
+        )
+        .unwrap();
+        let tools = ["file_write", "rsync_sync", "file_read"];
+        let lint_of = |policy: &str| -> Vec<String> {
+            let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
+            lint(&p, &inv, &agents(), &tools)
+                .iter()
+                .map(|f| f.to_string())
+                .collect()
+        };
+        let f = lint_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"h\"]\ntools = [\"file_write\", \"rsync_sync\"]\n",
+        );
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("arbitrary-exec tools (file_write, rsync_sync)"),
+            "{f:#?}"
+        );
+        let f = lint_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"h\"]\ntools = [\"file_write\"]\nsudo = true\n",
+        );
+        assert!(f.iter().all(|l| !l.contains("arbitrary-exec")), "{f:#?}");
+    }
+
     #[test]
     fn lint_is_clean_on_a_good_policy() {
         let f = lint_of(
@@ -1680,11 +1717,13 @@ capabilities = ["virt"]
             d.message,
             format!(
                 "refused_policy: agent dev has no grant for ssh_exec on alpha (policy file \
-                 invalid since {}: {}; every call is denied until a valid file is loaded). Ask \
-                 the operator for a policy.toml rule if you need it.",
-                bad.since, bad.error
+                 invalid since {}). Ask the operator for a policy.toml rule if you need it.",
+                bad.since
             )
         );
+        // Neither the parser's detail nor the path reaches the agent.
+        assert!(!d.message.contains(&bad.error), "{}", d.message);
+        assert!(!d.message.contains("policy.toml\""), "{}", d.message);
         assert!(bad.error.contains("invalid type"), "{}", bad.error);
         // A valid file lifts it.
         std::fs::write(&path, grant).unwrap();

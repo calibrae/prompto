@@ -75,7 +75,9 @@ fn init_logs() {
 fn log_lines(needle: &str) -> Vec<String> {
     String::from_utf8_lossy(&LOGS.lock().unwrap())
         .lines()
-        .filter(|l| l.contains(needle))
+        // Audit records repeat the call's fields; these tests are about
+        // the operational log lines.
+        .filter(|l| l.contains(needle) && !l.contains(" prompto::audit: "))
         .map(String::from)
         .collect()
 }
@@ -117,6 +119,7 @@ async fn spawn_server_full(auth: AuthConfig, legacy_session_mode: bool) -> Serve
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode,
         auth,
+        audit: Default::default(),
         cancel: cancel.clone(),
     });
     let shutdown = cancel.clone();
@@ -728,6 +731,7 @@ fn spawn_binary_mode(dir: &Path, agents: &Path, mode: &str) -> Proc {
         .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
         .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
         .env("PROMPTO_GAIN_ENABLED", "false")
+        .env("PROMPTO_AUDIT_LOG", dir.join("audit.jsonl"))
         .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
         .env("RUST_LOG", "prompto=info")
         .stderr(std::fs::File::create(dir.join("stderr.log")).unwrap())
@@ -867,6 +871,7 @@ async fn off_ignores_a_broken_agents_file() {
                 .env("PROMPTO_AUTH", mode)
                 .env("PROMPTO_BIND", "127.0.0.1:0")
                 .env("PROMPTO_GAIN_ENABLED", "false")
+                .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
                 .output()
                 .unwrap();
             assert!(!out.status.success(), "{broken}/{mode} started");
@@ -887,6 +892,7 @@ fn unknown_auth_mode_refuses_to_start() {
         .env("PROMPTO_AUTH", "requried")
         .env("PROMPTO_BIND", "127.0.0.1:0")
         .env("PROMPTO_GAIN_ENABLED", "false")
+        .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -903,6 +909,7 @@ fn stdio_is_agent_local() {
         .env("PROMPTO_AGENTS", dir.path().join("agents.toml"))
         .env("PROMPTO_AUTH", "required")
         .env("PROMPTO_GAIN_ENABLED", "false")
+        .env("PROMPTO_AUDIT_LOG", dir.path().join("audit.jsonl"))
         .env("RUST_LOG", "prompto=info")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

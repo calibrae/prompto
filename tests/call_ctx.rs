@@ -152,6 +152,7 @@ async fn spawn_server() -> Server {
         allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
         legacy_session_mode: false,
         auth: Default::default(),
+        audit: Default::default(),
         cancel: cancel.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -240,7 +241,7 @@ async fn success_results_carry_a_fresh_request_id() {
 }
 
 #[tokio::test]
-async fn unclassified_error_carries_request_id_in_data_and_message() {
+async fn invalid_args_error_carries_request_id_in_data_and_message() {
     let s = spawn_server().await;
     let resp = call(&s, "ssh_batch", json!({ "host": "runner", "commands": [] })).await;
     let err = &resp["error"];
@@ -248,9 +249,10 @@ async fn unclassified_error_carries_request_id_in_data_and_message() {
         .as_str()
         .unwrap_or_else(|| panic!("{resp}"));
     assert_ulid(rid);
+    assert_eq!(err["data"]["error_class"], "invalid_args", "{resp}");
     assert_eq!(
         err["message"],
-        format!("[request_id={rid}] commands list is empty")
+        format!("[request_id={rid} error_class=invalid_args] commands list is empty")
     );
 }
 

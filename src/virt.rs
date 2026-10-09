@@ -9,7 +9,7 @@
 //! state before falling through. Mirrors the canonical shape used by many
 //! homelab MQTT-driven VM lifecycle scripts.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
 use serde::Serialize;
 use std::time::Duration;
 
@@ -24,16 +24,19 @@ const VIRSH: &str = "virsh -c qemu:///system";
 /// shell, since the command is interpolated into a shell string.
 pub fn validate_vm_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        bail!("vm name is empty");
+        crate::fail!(InvalidArgs, "vm name is empty");
     }
     if name.len() > 64 {
-        bail!("vm name too long");
+        crate::fail!(InvalidArgs, "vm name too long");
     }
     let ok = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if !ok {
-        bail!("vm name {name:?} contains illegal characters (allowed: A-Z a-z 0-9 - _ .)");
+        crate::fail!(
+            InvalidArgs,
+            "vm name {name:?} contains illegal characters (allowed: A-Z a-z 0-9 - _ .)"
+        );
     }
     Ok(())
 }
@@ -101,11 +104,16 @@ pub async fn list(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig) -> Result<V
     let cmd = format!("{VIRSH} list --all");
     let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
-        bail!(
-            "virsh list failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "virsh list failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(parse_virsh_list(&res.stdout))
 }
@@ -120,11 +128,16 @@ pub async fn domstate(
     let cmd = format!("{VIRSH} domstate {vm}");
     let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
-        bail!(
-            "virsh domstate {vm} failed (exit={:?}): {}",
-            res.exit_code,
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "virsh domstate {vm} failed (exit={:?}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout.trim().to_string())
 }
@@ -134,12 +147,17 @@ pub async fn start(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig, vm: &str) 
     let cmd = format!("{VIRSH} start {vm}");
     let res = ssh.exec(ctx, host, &cmd, None, false).await?;
     if !res.ok() {
-        bail!(
-            "virsh start {vm} failed (exit={:?}): {} / {}",
-            res.exit_code,
-            res.stdout.trim(),
-            res.stderr.trim()
-        );
+        return Err(crate::error_class::ClassifiedError::exec_failure(
+            &res,
+            false,
+            format!(
+                "virsh start {vm} failed (exit={:?}): {} / {}",
+                res.exit_code,
+                res.stdout.trim(),
+                res.stderr.trim()
+            ),
+        )
+        .into());
     }
     Ok(res.stdout.trim().to_string())
 }
@@ -210,10 +228,15 @@ pub async fn stop(
         });
     }
 
-    Err(anyhow!(
-        "stop_vm exhausted all fallbacks; last destroy stderr: {}",
-        res.stderr.trim()
-    ))
+    Err(crate::error_class::ClassifiedError::exec_failure(
+        &res,
+        false,
+        format!(
+            "stop_vm exhausted all fallbacks; last destroy stderr: {}",
+            res.stderr.trim()
+        ),
+    )
+    .into())
 }
 
 async fn wait_for_state(

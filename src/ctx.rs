@@ -3,14 +3,16 @@
 //! One [`CallCtx`] is built at the top of every tool call and threaded
 //! through authorization (`Prompto::authorize`), the SSH layer (which
 //! exports the request ID to the remote command) and `finish_tool` (the
-//! single emission point for the gain tracker, and later the audit log).
+//! single emission point for the gain tracker and the audit log).
 //!
 //! The request ID is a ULID: sortable by time, unique without
 //! coordination, and returned to the caller on success and error alike,
 //! so a caller-side transcript, prompto's logs and the target host's
 //! logs can all be joined on it.
 
+use crate::audit::{CallScope, Notes};
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use ulid::Ulid;
 
@@ -38,6 +40,15 @@ pub struct CallCtx {
     pub session_id: Option<String>,
     /// When the call started, for `duration_ms`.
     pub started: Instant,
+    /// The client's `User-Agent` (HTTP only), for the audit record.
+    pub user_agent: Option<String>,
+    /// The raw call as the client sent it (tool name and arguments), set
+    /// by `Prompto::call_tool`. `None` outside an MCP tool call (`/log`,
+    /// unit tests).
+    pub call: Option<CallScope>,
+    /// What authorization found out, for the audit record: filled in by
+    /// `authz` and the policy, read by `finish_tool`.
+    pub notes: Arc<Mutex<Notes>>,
 }
 
 impl CallCtx {
@@ -49,7 +60,23 @@ impl CallCtx {
             agent: None,
             session_id: None,
             started: Instant::now(),
+            user_agent: None,
+            call: None,
+            notes: Default::default(),
         }
+    }
+
+    /// Update the audit notes.
+    pub fn note(&self, f: impl FnOnce(&mut Notes)) {
+        // A poisoned lock only means another note panicked; the data is
+        // plain values and still usable.
+        let mut n = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut n);
+    }
+
+    /// A copy of the audit notes.
+    pub fn notes(&self) -> Notes {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Attach the caller's identity (agent and session).

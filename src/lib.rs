@@ -6,6 +6,7 @@
 pub mod advisor;
 pub mod agent;
 pub mod apytti_client;
+pub mod audit;
 pub mod authz;
 pub mod baselines;
 pub mod batch;

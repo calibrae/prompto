@@ -29,6 +29,22 @@ use std::net::IpAddr;
 
 tokio::task_local! {
     static CALLER_IP: IpAddr;
+    static USER_AGENT: Option<String>;
+}
+
+/// Longest `User-Agent` kept for the audit record.
+pub const MAX_USER_AGENT: usize = 256;
+
+/// Run `f` with the request's `User-Agent` (cut to [`MAX_USER_AGENT`]
+/// chars) installed for the audit record.
+pub async fn scoped_user_agent<F: std::future::Future>(ua: Option<&str>, f: F) -> F::Output {
+    let ua = ua.map(|s| s.chars().take(MAX_USER_AGENT).collect());
+    USER_AGENT.scope(ua, f).await
+}
+
+/// The current request's `User-Agent`, if any.
+pub fn user_agent() -> Option<String> {
+    USER_AGENT.try_with(Clone::clone).ok().flatten()
 }
 
 /// Run `f` with `ip` installed as the current caller for the duration

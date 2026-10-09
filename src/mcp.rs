@@ -1,9 +1,12 @@
 //! rmcp tool router for prompto. Every tool builds a [`CallCtx`], passes
-//! [`Prompto::authorize`] (or `authz::authorize_tool` when it targets no
-//! host, `authz::lookup` when it only reads the inventory) before
-//! touching anything, returns `anyhow::Result<impl
-//! Serialize>`, and routes through `finish_tool`, which records one event
-//! per call and stamps the request ID on the result.
+//! [`Prompto::authorize`] (or `authorize_tool` when it targets no host,
+//! `lookup` when it only reads the inventory) before touching anything,
+//! returns `anyhow::Result<impl Serialize>`, and routes through
+//! `finish_tool`, which records the gain event and the audit record
+//! (`crate::audit`) and stamps the request ID on the result. Each gate
+//! also asks the audit log whether it can record the call
+//! ([`crate::audit::Audit::preflight`]), so in strict mode nothing runs
+//! unaudited.
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -19,12 +22,13 @@ use mcp_gain::Tracker;
 
 use crate::advisor::Advisor;
 use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
+use crate::audit::{self, Audit};
 use crate::authz::{self, Authorized, Need};
 use crate::batch;
 use crate::claudemgr::{self, Scope};
 use crate::ctx::CallCtx;
 use crate::diagnose;
-use crate::error_class::{ClassifiedError, ErrorClass};
+use crate::error_class::{self, ClassifiedError, Classify, ErrorClass};
 use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
@@ -56,7 +60,8 @@ fn require_systemd(
         crate::inventory::Platform::Macos => "launchctl",
         _ => "service(8) / rc.d",
     };
-    anyhow::bail!(
+    crate::fail!(
+        RefusedCapability,
         "{tool} drives systemd, and {name:?} is {} — no systemctl/journalctl there. \
          Use ssh_exec with {alt} instead.",
         host.platform.as_str()
@@ -81,6 +86,10 @@ pub struct Prompto {
     identity: crate::agent::Identity,
     /// Policy (`crate::policy`); `None` with `PROMPTO_AUTH=off`.
     policy: Option<crate::policy::Enforcer>,
+    /// The audit log (`crate::audit`). [`Audit::null`] unless set.
+    audit: Audit,
+    /// The client's `User-Agent`, snapshotted like `caller_ip`.
+    user_agent: Option<String>,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -437,6 +446,8 @@ impl Prompto {
             caller_ip,
             identity: Default::default(),
             policy: None,
+            audit: Audit::null(),
+            user_agent: None,
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
@@ -453,6 +464,18 @@ impl Prompto {
     /// policy off).
     pub fn with_policy(mut self, policy: Option<crate::policy::Enforcer>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Record every call made through this instance in `audit`.
+    pub fn with_audit(mut self, audit: Audit) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// The client's `User-Agent`, for the audit record.
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
         self
     }
 
@@ -524,7 +547,23 @@ impl Prompto {
     /// A fresh [`CallCtx`] for one tool call: new request ID, this
     /// instance's caller IP and identity, clock started.
     fn new_ctx(&self) -> CallCtx {
-        CallCtx::new(self.caller_ip).with_identity(self.identity.clone())
+        let mut ctx = CallCtx::new(self.caller_ip).with_identity(self.identity.clone());
+        ctx.user_agent = self.user_agent.clone();
+        ctx.call = audit::current_call();
+        ctx
+    }
+
+    /// After a gate let a call through: note it for the record, and in
+    /// strict mode refuse it unless the audit log can record it.
+    fn passed(&self, ctx: &CallCtx, tool: &str, rule: Option<&str>) -> Result<(), ClassifiedError> {
+        self.audit.preflight(ctx, tool)?;
+        ctx.note(|n| {
+            n.authorized = true;
+            if n.rule.is_none() {
+                n.rule = rule.map(str::to_string);
+            }
+        });
+        Ok(())
     }
 
     /// The single authorization gate for a tool call that targets a host:
@@ -537,14 +576,24 @@ impl Prompto {
         host: &str,
         need: Need,
     ) -> Result<Authorized, ClassifiedError> {
-        authz::authorize(
+        let target = authz::authorize(
             &self.inv.snapshot(),
             self.policy.as_ref(),
             ctx,
             tool,
             host,
             need,
-        )
+        )?;
+        self.passed(ctx, tool, target.rule.as_deref())?;
+        Ok(target)
+    }
+
+    /// The gate for a tool that reads a host's inventory entry and never
+    /// contacts it. See [`authz::lookup`].
+    fn lookup(&self, ctx: &CallCtx, tool: &str, host: &str) -> Result<Authorized, ClassifiedError> {
+        let target = authz::lookup(&self.inv.snapshot(), self.policy.as_ref(), ctx, tool, host)?;
+        self.passed(ctx, tool, target.rule.as_deref())?;
+        Ok(target)
     }
 
     /// What the inventory tools may show this caller of `host`: all of it
@@ -567,13 +616,14 @@ impl Prompto {
     /// The gate for a tool that targets no host. See
     /// [`authz::authorize_tool`].
     fn authorize_tool(&self, ctx: &CallCtx, tool: &str) -> Result<(), ClassifiedError> {
-        authz::authorize_tool(self.policy.as_ref(), ctx, tool).map(|_| ())
+        let rule = authz::authorize_tool(self.policy.as_ref(), ctx, tool)?;
+        self.passed(ctx, tool, rule.as_deref())
     }
 
     /// Finalise a tool call. The single emission point for every call's
-    /// outcome: records the gain-tracker event (and, with E4, the audit
-    /// record), stamps the request ID on the result — success and error
-    /// alike — and converts `anyhow::Result<T>` to what rmcp expects.
+    /// outcome: records the gain-tracker event and the audit record,
+    /// stamps the request ID on the result — success and error alike —
+    /// and converts `anyhow::Result<T>` to what rmcp expects.
     fn finish_tool<T: serde::Serialize>(
         &self,
         ctx: &CallCtx,
@@ -587,9 +637,11 @@ impl Prompto {
         match res {
             Ok(v) => {
                 let payload = serde_json::to_value(&v).unwrap_or_default();
+                let verdict = self.judge(ctx, tool, &audit::Outcome::Success(&payload));
                 let mut blocks = success_blocks(payload, &request_id);
                 let bytes = blocks.iter().map(|b| b.len()).sum::<usize>();
                 self.tracker.record(tool, host, true, exec_ms, bytes as u64);
+                self.audit_record(ctx, tool, host, verdict, bytes as u64);
                 if let Some(h) = hint {
                     blocks.push(format!("[advisor] {h}"));
                 }
@@ -602,6 +654,8 @@ impl Prompto {
                 let (msg, data) = error_parts(&e, classified, &request_id);
                 self.tracker
                     .record(tool, host, false, exec_ms, msg.len() as u64);
+                let verdict = self.judge(ctx, tool, &audit::Outcome::Failure(&e));
+                self.audit_record(ctx, tool, host, verdict, msg.len() as u64);
                 // mcp-gain's Event has no room for a class, so a
                 // classified failure is also logged here, for journald.
                 if let Some(c) = classified {
@@ -620,6 +674,93 @@ impl Prompto {
                 Err(McpError::internal_error(msg, Some(data)))
             }
         }
+    }
+
+    /// The audit verdict on a call's outcome.
+    fn judge(&self, ctx: &CallCtx, tool: &str, outcome: &audit::Outcome) -> audit::Verdict {
+        let args = ctx.call.as_ref().map(|c| c.args.clone());
+        // Did it run through prompto's sudo path (for `sudo_guard`)?
+        let sudo = authz::ROOT_TOOLS.contains(&tool)
+            || args.as_ref().and_then(|a| a.get("sudo")) == Some(&serde_json::Value::Bool(true));
+        audit::judge(tool, outcome, &ctx.notes(), sudo)
+    }
+
+    /// Write the call's audit record. `host` is what the caller typed;
+    /// the record resolves it against the live inventory.
+    fn audit_record(
+        &self,
+        ctx: &CallCtx,
+        tool: &str,
+        host: Option<&str>,
+        verdict: audit::Verdict,
+        bytes: u64,
+    ) {
+        let args = ctx
+            .call
+            .as_ref()
+            .map(|c| (*c.args).clone())
+            .unwrap_or(serde_json::Value::Null);
+        let inv = self.inv.snapshot();
+        let mut rec = audit::tool_record(ctx, tool, args.clone()).with_verdict(verdict);
+        (rec.host, rec.queried_as) = audit::resolve_host(&inv, host);
+        if tool == "rsync_sync" {
+            let dest = args.get("dest_host").and_then(|v| v.as_str());
+            (rec.dest_host, rec.dest_queried_as) = audit::resolve_host(&inv, dest);
+        }
+        rec.bytes = bytes;
+        self.audit.write(&rec);
+        if let Some(c) = &ctx.call {
+            c.mark_recorded();
+        }
+    }
+
+    /// Record a call no handler recorded: its arguments did not parse, or
+    /// it named no tool. One record per call, always.
+    fn audit_unrouted(&self, call: &audit::CallScope, res: &Result<CallToolResponse, McpError>) {
+        let mut ctx = self.new_ctx();
+        ctx.call = Some(call.clone());
+        // rmcp answers bad arguments with an error *result*, and an
+        // unknown tool with an error.
+        let rejected = match res {
+            Err(e) => Some(e.message.to_string()),
+            Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => Some(
+                r.content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default(),
+            ),
+            Ok(_) => None,
+        };
+        let (class, msg) = match rejected {
+            Some(m) => (ErrorClass::InvalidArgs, m),
+            // A handler that returned without `finish_tool` is a bug.
+            None => {
+                error_class::note_unclassified();
+                tracing::error!(tool = %call.tool, "BUG: tool returned without an audit record");
+                (
+                    ErrorClass::Internal,
+                    String::from("tool returned without an audit record"),
+                )
+            }
+        };
+        let err = anyhow::Error::new(ClassifiedError::refused(class, msg.clone()));
+        let verdict = audit::judge(
+            &call.tool,
+            &audit::Outcome::Failure(&err),
+            &ctx.notes(),
+            false,
+        );
+        let host = call
+            .args
+            .get("host")
+            .or_else(|| call.args.get("client"))
+            .or_else(|| call.args.get("source_host"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // The name is the client's; keep the record bounded.
+        let tool: String = call.tool.chars().take(128).collect();
+        self.audit_record(&ctx, &tool, host.as_deref(), verdict, msg.len() as u64);
     }
 
     #[tool(description = "Wake a host via WOL magic packet.")]
@@ -848,7 +989,7 @@ impl Prompto {
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
             if args.commands.is_empty() {
-                anyhow::bail!("commands list is empty");
+                crate::fail!(InvalidArgs, "commands list is empty");
             }
             let target =
                 self.authorize(&ctx, "ssh_batch", &args.host, Need::Cap(Capability::Exec))?;
@@ -859,7 +1000,8 @@ impl Prompto {
             // bash may have crashed", which blames the protocol rather
             // than the absent shell. Say the real thing instead.
             if !host.platform.has_bash() {
-                anyhow::bail!(
+                crate::fail!(
+                    RefusedCapability,
                     "ssh_batch needs bash, and {:?} is {} (no bash — OPNsense ships csh/tcsh). \
                      Use ssh_exec instead, one call per command.",
                     args.host,
@@ -878,7 +1020,21 @@ impl Prompto {
                 .exec_stdin(&ctx, host, "bash", script.as_bytes(), to, false)
                 .await?;
             if raw.timed_out {
-                anyhow::bail!("batch timed out (>{:?})", to.unwrap_or_default());
+                crate::fail!(Timeout, "batch timed out (>{:?})", to.unwrap_or_default());
+            }
+            // ssh itself failed: no batch ran, so say that rather than
+            // "missing record for command 0".
+            if let Some(class @ (ErrorClass::SshConnect | ErrorClass::SshAuth)) =
+                crate::error_class::classify_exec(&raw, false)
+            {
+                return Err(ClassifiedError {
+                    class,
+                    exit_code: raw.exit_code,
+                    stderr_tail: Some(crate::error_class::stderr_tail(&raw.stderr)),
+                    message: "ssh_batch: ssh failed before the batch ran".into(),
+                    rule: None,
+                }
+                .into());
             }
             let parsed = batch::parse_output(&raw.stdout, &args.commands)?;
             Ok(parsed)
@@ -899,7 +1055,7 @@ impl Prompto {
         let total_timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
         let res: anyhow::Result<_> = async {
             if args.task.trim().is_empty() {
-                anyhow::bail!("task is empty");
+                crate::fail!(InvalidArgs, "task is empty");
             }
             let target = self.authorize(
                 &ctx,
@@ -908,10 +1064,9 @@ impl Prompto {
                 Need::Cap(Capability::ClaudeExec),
             )?;
             let host = &target.host;
-            let url = host
-                .apytti_url
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("host {} has no apytti_url", args.host))?;
+            let Some(url) = host.apytti_url.as_deref() else {
+                crate::fail!(RefusedCapability, "host {} has no apytti_url", args.host);
+            };
 
             let route = router::route(
                 args.tier,
@@ -1078,11 +1233,16 @@ impl Prompto {
                 .exec(&ctx, host, &cmd, Some(Duration::from_secs(10)), false)
                 .await?;
             if !raw.ok() {
-                anyhow::bail!(
-                    "ls failed (exit={:?}): {}",
-                    raw.exit_code,
-                    raw.stderr.trim()
-                );
+                return Err(crate::error_class::ClassifiedError::exec_failure(
+                    &raw,
+                    false,
+                    format!(
+                        "ls failed (exit={:?}): {}",
+                        raw.exit_code,
+                        raw.stderr.trim()
+                    ),
+                )
+                .into());
             }
             let entries = files::parse_ls(host.platform, &raw.stdout);
             Ok(serde_json::json!({
@@ -1116,11 +1276,16 @@ impl Prompto {
                 .exec(&ctx, host, &cmd, Some(Duration::from_secs(10)), false)
                 .await?;
             if !raw.ok() {
-                anyhow::bail!(
-                    "stat failed (exit={:?}): {}",
-                    raw.exit_code,
-                    raw.stderr.trim()
-                );
+                return Err(crate::error_class::ClassifiedError::exec_failure(
+                    &raw,
+                    false,
+                    format!(
+                        "stat failed (exit={:?}): {}",
+                        raw.exit_code,
+                        raw.stderr.trim()
+                    ),
+                )
+                .into());
             }
             let parsed = files::parse_stat(&raw.stdout);
             Ok(serde_json::json!({
@@ -1185,13 +1350,7 @@ impl Prompto {
         let ctx = self.new_ctx();
         let host_name = args.name.clone();
         let res: anyhow::Result<_> = async {
-            let target = authz::lookup(
-                &self.inv.snapshot(),
-                self.policy.as_ref(),
-                &ctx,
-                "inventory_get_host",
-                &args.name,
-            )?;
+            let target = self.lookup(&ctx, "inventory_get_host", &args.name)?;
             let h = &target.host;
             // Report the canonical name, not whatever the caller typed —
             // asking for an alias and being told it IS that host hides
@@ -1372,7 +1531,8 @@ impl Prompto {
         let host_name = args.host.clone();
         let res: anyhow::Result<_> = async {
             if !ACTIONS.contains(&args.action.as_str()) {
-                anyhow::bail!(
+                crate::fail!(
+                    InvalidArgs,
                     "action {:?} not in allow-list (allowed: {:?})",
                     args.action,
                     ACTIONS
@@ -1822,7 +1982,7 @@ impl Prompto {
         let res = self
             .authorize_tool(&ctx, "prompto_gain")
             .map_err(anyhow::Error::from)
-            .and_then(|()| self.tracker.summary(cutoff));
+            .and_then(|()| self.tracker.summary(cutoff).class(ErrorClass::Internal));
         self.finish_tool(&ctx, "prompto_gain", None, res)
     }
 }
@@ -1895,6 +2055,24 @@ fn error_parts(
 
 #[tool_handler]
 impl ServerHandler for Prompto {
+    /// rmcp's generated dispatch, inside an audit scope holding the raw
+    /// call: `finish_tool` takes the record's arguments from it, and a
+    /// call no handler recorded (arguments that don't parse, an unknown
+    /// tool) is recorded here.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let call = audit::CallScope::new(&request.name, request.arguments.clone());
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let res = audit::scoped(call.clone(), self.tool_router.call(tcc)).await;
+        if !call.recorded() {
+            self.audit_unrouted(&call, &res);
+        }
+        res
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
