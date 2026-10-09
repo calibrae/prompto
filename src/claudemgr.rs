@@ -16,6 +16,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::ctx::CallCtx;
 use crate::inventory::HostConfig;
 use crate::ssh::SshClient;
 
@@ -77,9 +78,11 @@ fn wrap(remote: &str) -> String {
     )
 }
 
-pub async fn list(ssh: &SshClient, host: &HostConfig) -> Result<String> {
+pub async fn list(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig) -> Result<String> {
     let cmd = wrap("claude mcp list");
-    let res = ssh.exec(host, &cmd, Some(cmd_timeout()), false).await?;
+    let res = ssh
+        .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
+        .await?;
     if !res.ok() {
         bail!(
             "claude mcp list failed (exit={:?}): {}",
@@ -90,10 +93,12 @@ pub async fn list(ssh: &SshClient, host: &HostConfig) -> Result<String> {
     Ok(res.stdout)
 }
 
-pub async fn get(ssh: &SshClient, host: &HostConfig, name: &str) -> Result<String> {
+pub async fn get(ssh: &SshClient, ctx: &CallCtx, host: &HostConfig, name: &str) -> Result<String> {
     validate_token("name", name)?;
     let cmd = wrap(&format!("claude mcp get {name}"));
-    let res = ssh.exec(host, &cmd, Some(cmd_timeout()), false).await?;
+    let res = ssh
+        .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
+        .await?;
     if !res.ok() {
         bail!(
             "claude mcp get {name} failed (exit={:?}): {}",
@@ -106,6 +111,7 @@ pub async fn get(ssh: &SshClient, host: &HostConfig, name: &str) -> Result<Strin
 
 pub async fn add(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     name: &str,
     transport: &str,
@@ -119,7 +125,9 @@ pub async fn add(
         "claude mcp add --transport {transport} --scope {} {name} {url_or_cmd}",
         scope.as_arg()
     ));
-    let res = ssh.exec(host, &cmd, Some(cmd_timeout()), false).await?;
+    let res = ssh
+        .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
+        .await?;
     if !res.ok() {
         bail!(
             "claude mcp add {name} failed (exit={:?}): {} / {}",
@@ -135,6 +143,7 @@ pub async fn add(
 
 pub async fn remove(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     name: &str,
     scope: Scope,
@@ -144,7 +153,9 @@ pub async fn remove(
         "claude mcp remove --scope {} {name}",
         scope.as_arg()
     ));
-    let res = ssh.exec(host, &cmd, Some(cmd_timeout()), false).await?;
+    let res = ssh
+        .exec(ctx, host, &cmd, Some(cmd_timeout()), false)
+        .await?;
     if !res.ok() {
         bail!(
             "claude mcp remove {name} failed (exit={:?}): {}",
@@ -160,6 +171,7 @@ pub async fn remove(
 /// `sudo_exec` capability on the target.
 pub async fn journalctl_tail(
     ssh: &SshClient,
+    ctx: &CallCtx,
     host: &HostConfig,
     unit: &str,
     lines: u32,
@@ -168,7 +180,7 @@ pub async fn journalctl_tail(
     let lines = lines.clamp(1, 1000);
     let cmd = format!("journalctl -u {unit} -n {lines} --no-pager");
     let res = ssh
-        .exec(host, &cmd, Some(Duration::from_secs(15)), true)
+        .exec(ctx, host, &cmd, Some(Duration::from_secs(15)), true)
         .await?;
     if !res.ok() {
         bail!(
@@ -202,10 +214,16 @@ pub fn validate_unit_name(unit: &str) -> Result<()> {
 /// `systemctl --user restart claudecli` first, then falls back to
 /// re-spawning the tmux session if that fails. Caller should accept either
 /// form of success.
-pub async fn restart_claudecli(ssh: &SshClient, host: &HostConfig) -> Result<String> {
+pub async fn restart_claudecli(
+    ssh: &SshClient,
+    ctx: &CallCtx,
+    host: &HostConfig,
+) -> Result<String> {
     // Try systemd --user first.
     let cmd1 = "systemctl --user restart claudecli 2>&1 && echo OK_SYSTEMD || true";
-    let r1 = ssh.exec(host, cmd1, Some(cmd_timeout()), false).await?;
+    let r1 = ssh
+        .exec(ctx, host, cmd1, Some(cmd_timeout()), false)
+        .await?;
     if r1.stdout.contains("OK_SYSTEMD") {
         return Ok("restarted via systemctl --user".to_string());
     }
@@ -215,7 +233,9 @@ pub async fn restart_claudecli(ssh: &SshClient, host: &HostConfig) -> Result<Str
            tmux new-session -d -s claudecli "cd ~/Developer/perso/claudecli && npm start" 2>&1 \
            && echo OK_TMUX || echo FAIL"#,
     );
-    let r2 = ssh.exec(host, &cmd2, Some(cmd_timeout()), false).await?;
+    let r2 = ssh
+        .exec(ctx, host, &cmd2, Some(cmd_timeout()), false)
+        .await?;
     if r2.stdout.contains("OK_TMUX") {
         Ok("restarted via tmux".to_string())
     } else {

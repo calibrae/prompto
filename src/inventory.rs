@@ -139,7 +139,7 @@ impl Chassis {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
     /// Literal IPv4/IPv6 address — NOT a hostname. Typed as [`IpAddr`] on
-    /// purpose: [`Inventory::require_remote`]'s self-targeting guard compares
+    /// purpose: the self-targeting guard (`authz::authorize`) compares
     /// this against the MCP caller's source IP, and a value it can't compare
     /// would silently disable that guard. Parsing at load time makes the
     /// unguardable state unrepresentable rather than merely discouraged.
@@ -349,43 +349,6 @@ impl Inventory {
         }
         Ok(host)
     }
-
-    /// Like [`require`], but ALSO refuses if the MCP caller's IP equals
-    /// the target host's IP — i.e. the calling agent is asking prompto
-    /// to SSH back to its own box. Wasteful (the agent has local Bash)
-    /// and a self-escalation vector on prompto's own host (the SSH
-    /// session runs as the inventory's `ssh_user`, sidestepping
-    /// prompto's systemd hardening).
-    ///
-    /// `caller_ip` is `None` on transports that don't expose source
-    /// addresses (stdio, tests). In that case the self-check is
-    /// skipped and only the capability check applies — so legitimate
-    /// code paths that don't carry caller info aren't broken.
-    ///
-    /// That `None` is the *only* way to skip the comparison. Until
-    /// v0.6.20 `ip` was a `String` parsed here, and an unparseable value
-    /// made the `if let` chain fall through — silently disabling the
-    /// guard for that host with no error and no log. `ip` is now an
-    /// [`IpAddr`], so the comparison can never be skipped by inventory
-    /// content.
-    pub fn require_remote(
-        &self,
-        name: &str,
-        caller_ip: Option<IpAddr>,
-        cap: Capability,
-    ) -> Result<&HostConfig> {
-        let host = self.require(name, cap)?;
-        if let Some(caller) = caller_ip
-            && caller == host.ip
-        {
-            bail!(
-                "refused: target {name:?} is the calling agent's own host (source IP {caller}). \
-                 Use your local shell tool instead — routing a same-host shell call through SSH \
-                 wastes a round trip and bypasses any local sandboxing."
-            );
-        }
-        Ok(host)
-    }
 }
 
 /// Atomically-swappable wrapper around an `Inventory` so SIGHUP can replace
@@ -488,47 +451,9 @@ capabilities = ["exec", "sudo_exec"]
         assert!(err.to_string().contains("unknown host"));
     }
 
-    #[test]
-    fn require_remote_allows_when_caller_differs_from_target() {
-        let inv = Inventory::from_toml_str(sample()).unwrap();
-        let caller: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        inv.require_remote("alpha", Some(caller), Capability::Exec)
-            .unwrap();
-    }
-
-    #[test]
-    fn require_remote_blocks_when_caller_equals_target() {
-        let inv = Inventory::from_toml_str(sample()).unwrap();
-        // alpha's IP is 192.0.2.12 (per sample)
-        let caller: std::net::IpAddr = "192.0.2.12".parse().unwrap();
-        let err = inv
-            .require_remote("alpha", Some(caller), Capability::Exec)
-            .unwrap_err();
-        assert!(err.to_string().contains("calling agent's own host"));
-        assert!(err.to_string().contains("192.0.2.12"));
-    }
-
-    #[test]
-    fn require_remote_skips_check_when_caller_is_none() {
-        let inv = Inventory::from_toml_str(sample()).unwrap();
-        // Falls back to plain require: capability still enforced,
-        // self-check skipped because the transport doesn't expose it.
-        inv.require_remote("alpha", None, Capability::Exec).unwrap();
-    }
-
-    #[test]
-    fn require_remote_still_enforces_capability() {
-        let inv = Inventory::from_toml_str(sample()).unwrap();
-        let caller: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        let err = inv
-            .require_remote("bravo", Some(caller), Capability::Wake)
-            .unwrap_err();
-        assert!(err.to_string().contains("lacks capability"));
-    }
-
     /// Regression: a hostname in `ip` used to load fine and then silently
     /// disable the self-targeting guard for that host (the parse in
-    /// `require_remote` failed, the `if let` chain fell through, the call
+    /// the self-target guard failed, the `if let` chain fell through, the call
     /// was allowed). Rejecting at load time is what makes that impossible.
     #[test]
     fn rejects_hostname_in_ip_field() {
@@ -554,11 +479,12 @@ capabilities = ["exec"]
     fn every_loadable_host_is_guardable() {
         let inv = Inventory::from_toml_str(sample()).unwrap();
         for (name, host) in &inv.hosts {
-            let err = inv
-                .require_remote(name, Some(host.ip), Capability::Exec)
-                .unwrap_err();
+            let ctx = crate::ctx::CallCtx::new(Some(host.ip));
+            let err =
+                crate::authz::authorize(&inv, &ctx, "ssh_exec", name, crate::authz::Need::Lookup)
+                    .unwrap_err();
             assert!(
-                err.to_string().contains("calling agent's own host"),
+                err.message.contains("calling agent's own host"),
                 "host {name} was not self-guarded"
             );
         }

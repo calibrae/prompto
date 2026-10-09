@@ -7,6 +7,7 @@
 //! chain is not evidence that it works.
 
 use crate::advisor::Advisor;
+use crate::authz::Need;
 use crate::caller;
 use crate::filters::FilterChain;
 use crate::inventory::InventoryStore;
@@ -115,6 +116,8 @@ struct LogQuery {
 
 /// `GET /log?host=<name>&unit=<unit>&lines=<n>` — tail a systemd unit's
 /// journal as plain text, outside the MCP protocol, for curl and browsers.
+/// Every response carries the call's request ID in
+/// [`REQUEST_ID_HEADER`].
 ///
 /// # No authentication
 ///
@@ -125,7 +128,7 @@ struct LogQuery {
 /// grants `sudo_exec`.
 ///
 /// It is held to *exactly* the same limits as the `service_logs` MCP tool
-/// and given no capability the tool lacks: same `sudo_exec` gate, same
+/// and given no capability the tool lacks: same `sudo_exec` gate and self-target guard (via `authz`), same
 /// `validate_unit_name` on the unit (so it cannot be turned into a shell),
 /// same 1..=1000 line clamp, same 15 s timeout. So it widens *reach*, not
 /// *power* — the MCP surface was already unauthenticated on the same port.
@@ -134,6 +137,16 @@ async fn log_handler(
     axum::extract::State(state): axum::extract::State<LogState>,
     axum::extract::Query(q): axum::extract::Query<LogQuery>,
 ) -> impl axum::response::IntoResponse {
+    let ctx = crate::ctx::CallCtx::new(caller::current());
+    let status_and_body = log_tail(&state, &ctx, &q).await;
+    ([(REQUEST_ID_HEADER, ctx.request_id())], status_and_body)
+}
+
+async fn log_tail(
+    state: &LogState,
+    ctx: &crate::ctx::CallCtx,
+    q: &LogQuery,
+) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
 
     // Validate up front so a malformed unit is a 400 (caller's fault),
@@ -142,18 +155,29 @@ async fn log_handler(
     if let Err(e) = crate::claudemgr::validate_unit_name(&q.unit) {
         return (StatusCode::BAD_REQUEST, format!("{e}\n"));
     }
-    let inv = state.store.snapshot();
-    let host = match inv.require(&q.host, crate::inventory::Capability::SudoExec) {
-        Ok(h) => h.clone(),
-        // Unknown host or missing capability are both caller errors.
+    // Same gate as the tool, under the tool's name, so `/log` keeps
+    // exactly the tool's limits — the self-target guard included.
+    let target = match crate::authz::authorize(
+        &state.store.snapshot(),
+        ctx,
+        "service_logs",
+        &q.host,
+        Need::Cap(crate::inventory::Capability::SudoExec),
+    ) {
+        Ok(t) => t,
+        // Unknown host, missing capability or self-target are all
+        // caller errors.
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")),
     };
-    match crate::claudemgr::journalctl_tail(&state.ssh, &host, &q.unit, q.lines.unwrap_or(50)).await
-    {
+    let lines = q.lines.unwrap_or(50);
+    match crate::claudemgr::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines).await {
         Ok(out) => (StatusCode::OK, out),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}\n")),
     }
 }
+
+/// Response header carrying the request ID on `GET /log`.
+pub const REQUEST_ID_HEADER: &str = "x-prompto-request-id";
 
 /// Build the axum router serving MCP at `/mcp` and the plain-HTTP log
 /// tail at `/log`.
