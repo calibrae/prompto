@@ -106,6 +106,7 @@ capabilities = []
 | `apytti_url` | Gateway URL; required with `claude_exec`. |
 | `sudo_password_vault_path` / `sudo_password_vault_field` | Vault-held sudo password (field defaults to `password`). Requires `sudo_exec`. |
 | `extra_ips` | Other addresses the machine may call prompto from (second NIC, Wi-Fi, VPN, IPv6). Used only by the self-targeting guard, never to reach the host. Literal IPs, canonicalized at load (`::ffff:a.b.c.d` → `a.b.c.d`). Load errors: unspecified or multicast addresses, repeats, and an address claimed by two hosts. |
+| `groups` | Policy host groups, matched by `group:<g>` in [`policy.toml`](#policy-policytoml). Names use `[a-z0-9_-]`; repeats are load errors. They mean nothing outside policy. |
 | `request_id_env` | How `PROMPTO_REQUEST_ID` reaches remote commands. `export` adds an `export …;` prefix plus `ssh -o SetEnv`; it is the default on `linux` and `macos`. `setenv` uses `SetEnv` only, leaving the command line untouched; it is the default on `freebsd` and `windows`. `off` sends nothing: no prefix, no `SetEnv`, no `env` on the vault sudo path. Use `off` for keys restricted by `command=`, rrsync or git-shell. Use `setenv` for a non-POSIX login shell on Linux or macOS. Any other value is a load error. |
 
 The whole file is validated at load (unknown hypervisors, alias collisions, `wake` on a VM, malformed vault paths, …). `SIGHUP` reloads it without dropping the listener; a file that fails validation is rejected and the previous inventory stays live.
@@ -164,7 +165,7 @@ disabled = false
 - The stdio transport is always agent `local`.
 - Any other `PROMPTO_AUTH` value stops the server at startup, so a typo can't silently mean `off`.
 - Tokens are hashed, then compared in constant time against every entry.
-- Agent names use `[a-z0-9_-]`; `anonymous` and `local` are reserved. Names and groups are what policy (E3) and the audit log (E4) will key on.
+- Agent names use `[a-z0-9_-]`; `anonymous` and `local` are reserved. Names and groups are what [policy](#policy-policytoml) keys on, and the audit log (E4) will.
 - Until those land, the agent and session appear in the journald line of every failed call: `tool call failed request_id=… agent="builder" session_id="…"`.
 - Tool results don't echo the agent. The caller knows who it is, and an unchanged result shape keeps `off` byte-identical.
 
@@ -195,11 +196,69 @@ sudo systemctl reload prompto                       # SIGHUP: a running server r
 
 **Rollout:**
 
-1. Set `PROMPTO_AUTH=optional`.
-2. Mint a token per role.
-3. Register clients with their token.
-4. Watch the logs for `agent="anonymous"`.
-5. Switch to `required`. This needs a restart, since env is read at startup.
+1. Write `policy.toml` first (see below): `optional` and `required` enforce it, and without one every call is refused. To start permissive, grant `anonymous` and your roles `tools = ["*"]` (plus a `sudo = true` twin) on `hosts = ["*"]`, then narrow.
+2. Set `PROMPTO_AUTH=optional`.
+3. Mint a token per role.
+4. Register clients with their token.
+5. Watch the logs for `agent="anonymous"`.
+6. Drop the `anonymous` grants and switch to `required`. This needs a restart, since env is read at startup.
+
+## Policy (`policy.toml`)
+
+With `PROMPTO_AUTH=optional` or `required`, every tool call must be granted by `/etc/prompto/policy.toml` (`PROMPTO_POLICY`). With `off` the file is not read at all and nothing changes. A copy to start from is in `deploy/policy.toml.example`.
+
+```toml
+[[rule]]
+id = "builder-exec"                # optional; names the rule in logs and refusals
+agents = ["builder", "group:ops"]  # agent names or group:<g> from agents.toml
+hosts = ["build-*", "group:build"] # inventory names/aliases, * ? globs, group:<g>
+tools = ["ssh_exec", "file_*", "inventory_*"]
+
+[[rule]]
+agents = ["builder"]
+hosts = ["build-1"]
+tools = ["ssh_sudo_exec", "file_write", "service_control"]
+sudo = true                        # this rule grants the root-capable calls
+approval = "human"                 # none (default) | ticket | human
+```
+
+**Matching.** Rules are read top to bottom; **the first rule that matches decides**, and no match is a deny. Rules only grant (there are no deny rules), so order matters only for which rule's `approval` applies: put the narrow, stricter rule first. A rule matches when:
+
+- **agents**: the agent's name is listed, or `group:<g>` names one of its groups. Groups are read from the *live* `agents.toml` at every call, so a reload that changes them applies to open sessions too. No globs, so a rule never grants an agent nobody named. `anonymous` (no valid token under `optional`) and `local` (stdio) match only by name.
+- **hosts**: an entry matches the host's inventory name or any of its aliases (`*` and `?` are wildcards), or is `group:<g>` with `<g>` in the host's inventory `groups`. Tools that target no host (`inventory_list`, `prompto_gain`, `mcp_reconnect_hint`) skip this check.
+- **tools**: an entry matches the tool name (`*`, `?`).
+- **sudo**: root-capable calls are a **separate grant**. They match only rules with `sudo = true`, and those rules match only them. So `tools = ["*"]` grants every ordinary tool and nothing that runs as root. Root-capable: `ssh_sudo_exec`, `file_write` with `sudo = true`, `service_control`, `host_sleep`, `service_logs` / `mcp_logs` / `GET /log` (journal via sudo), and `vm_stop`.
+
+**Approval.** A rule with `approval = "ticket"` or `"human"` refuses what it matches with `approval_required`: tickets and human approval are not implemented yet, so such a rule fails closed rather than allowing anything.
+
+**What policy cannot do.** It only narrows: effective permission = policy ∩ host capability, minus the caller's own machine. The capability check and the self-targeting guard run first and no rule can undo them.
+
+**Refusals** are classified `refused_policy` (or `approval_required`), carry the deciding rule in `error.data.rule` (`policy.toml:<line>`, with ` (<id>)` when the rule has one, or `default-deny`), and say what is missing:
+
+```
+refused_policy: agent builder has no grant for ssh_sudo_exec (root-capable) on build-2 (no rule matched;
+root-capable calls need a rule with sudo = true — policy.toml:2 (builder-exec) grants ssh_sudo_exec on
+build-2 but without sudo). Ask the operator for a policy.toml rule if you need it.
+```
+
+Allowed calls log `policy allow request_id=… agent=… tool=… host=… root=… rule=…` at info level. `GET /log` answers a policy refusal with 403.
+
+**Loading.** Like `agents.toml`: reloaded on SIGHUP, each file independently, and a file that fails to parse keeps the previous policy live. A malformed file at startup stops the server. A **missing** file means *deny every call*, with a loud warning at startup and on each reload. The server lints the policy at startup and after every reload, and logs the findings. They never block loading: a rule naming something that doesn't exist simply grants nothing.
+
+**Checking a policy:**
+
+```bash
+prompto policy lint     # against $PROMPTO_INVENTORY, $PROMPTO_AGENTS and the tool list; exit 1 on errors
+prompto policy check --agent builder --host build-2 --tool ssh_sudo_exec    # ALLOW/DENY + rule; exit 0/1
+prompto policy check --agent builder --host build-2 --tool file_write --sudo
+```
+
+- **Lint errors:** unknown agents, agent groups nobody is in, unknown hosts, host groups no host is in, unknown tools.
+- **Lint warnings:** globs that match nothing, revoked agents, `approval` rules (always refused for now), and rules that can never decide a call. Lint finds those by enumerating every agent × host × tool × root combination: a rule is either *shadowed* (an earlier rule always wins; the warning names it), or matches nothing at all (for example `sudo = true` on tools that are never root-capable).
+- `policy check` evaluates policy only; capability and the self-targeting guard are checked at call time, before policy.
+- `cargo run --example inv_check -- prompto.toml policy.toml agents.toml` runs the same lint.
+
+**Kill one agent on one host:** drop the host from its rules and reload.
 
 ## `GET /log`
 
@@ -207,7 +266,7 @@ sudo systemctl reload prompto                       # SIGHUP: a running server r
 GET /log?host=<name>&unit=<systemd unit>&lines=<1..1000, default 50>
 ```
 
-Plain-text journal tail for scripts and dashboards. It has the same gate as `service_logs` (`sudo_exec`, self-targeting guard, unit-name validation) and the same authentication as `/mcp`.
+Plain-text journal tail for scripts and dashboards. It has the same gate as `service_logs` (`sudo_exec`, self-targeting guard, policy, unit-name validation) and the same authentication as `/mcp`.
 
 - With `PROMPTO_AUTH` `off` or `optional` it is **unauthenticated**: anyone who can reach the listener can read journals on any `sudo_exec` host. Keep the listener behind a trusted proxy or firewall.
 - With `required`, send `Authorization: Bearer <token>`.
@@ -242,17 +301,19 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_VAULT_CACERT` | unset | PEM file (one or more certs) trusted as extra roots for the vault client, on top of the bundled webpki roots — for a vault behind a private CA. The system trust store is not consulted. Unreadable or certificate-less file = startup error. |
 | `PROMPTO_AUTH` | `off` | `off`, `optional` or `required`; see [Agent identity](#agent-identity-prompto_auth). Anything else is a startup error. |
 | `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents; unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto agent`. |
+| `PROMPTO_POLICY` | `/etc/prompto/policy.toml` | Policy rules. Missing file = deny every call (loud warning); unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto policy`. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
-Env is read once at startup: changes need a restart. Only the inventory and `agents.toml` (unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently.
+Env is read once at startup: changes need a restart. Only the inventory, `agents.toml` and `policy.toml` (the last two unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently.
 
 CLI:
 
 - `--stdio` selects stdio transport instead of HTTP.
 - `gain` runs the analytics report and exits.
 - `agent add|list|revoke` manages agent tokens and exits.
+- `policy check|lint` dry-runs a call against the policy, or lints it, and exits.
 
 ## Registering with Claude Code
 

@@ -62,6 +62,8 @@ file_read.path       = ["/etc/nginx/**", "/var/log/nginx/**"]
 
 Effective permission = agent policy ∩ host capabilities, minus the caller's own machine. Every decision names the rule that allowed or denied it.
 
+*As built (v0.12, E3):* the file is an ordered list of `[[rule]]` grants (`agents` × `hosts` × `tools`, plus `sudo` and `approval`), and the first match decides. Root-capable calls need a rule with `sudo = true`, and host groups come from the inventory's `groups`. The sketch above is the shape argument rules (v0.14) will extend. See the README's *Policy* section for the semantics.
+
 **Self-targeting is not a policy dimension.** A call that would contact the caller's own machine is refused (`refused_self_target`) before policy is consulted, for every tool that contacts a host and for every agent, `infra`'s `hosts = ["*"]` included. No rule, approval mode or ticket can grant it, and policy must not grow a way to. The only exceptions are tools that never contact a host (`inventory_list`, `inventory_get_host`, `mcp_reconnect_hint`, `prompto_gain`). An agent acting on its own machine uses its local shell.
 
 **On `ssh_exec`:** a command string can't be policed reliably (`sh -c`, quoting, aliases), so policy treats `ssh_exec`/`bash_exec`/`ssh_sudo_exec` as what they are — a full shell on that host — and grants them per host, not per command. The pressure goes the other way: make typed tools good enough that agents choose them, and grant those widely. The audit log records the full command either way.
