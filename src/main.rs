@@ -430,7 +430,7 @@ Usage: prompto kill on [reason…]                stop every tool call (global)
        prompto kill host <name> [reason…]       stop every call to one host
        prompto kill session <id> [reason…]      stop one X-Prompto-Session
        prompto unkill agent|host|session <name> lift a scoped kill
-       prompto kill status                      list what is stopped
+       prompto kill status                      list what is stopped (as root)
 
 The global switch is $PROMPTO_KILL_FILE (default /etc/prompto/kill); scoped
 ones are files in kill.d next to it ($PROMPTO_KILL_DIR): agent-<name>,
@@ -484,7 +484,11 @@ fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
         }
         Some("status") if args.len() == 1 => {
             if let Err(e) = kill.probe() {
-                eprintln!("WARNING: the server may not be able to check {e}");
+                anyhow::bail!(
+                    "cannot check the kill switches as this user ({e}); run it with sudo. \
+                     Whether the server itself can is in its startup log (`kill switches \
+                     checked on every call`, or `CANNOT CHECK KILL SWITCH`)."
+                );
             }
             let (kills, ignored) = kill.list()?;
             if kills.is_empty() {
