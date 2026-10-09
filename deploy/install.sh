@@ -62,4 +62,7 @@ prompto installed. Next steps:
   3. sudo systemctl enable --now prompto
   4. sudo systemctl status prompto
   5. From any client:  claude mcp add --transport http prompto http://YOUR-HOST:6337/mcp
+  6. Optional agent tokens: sudo /opt/prompto/bin/prompto agent add <role>, set
+     PROMPTO_AUTH=optional|required in /etc/prompto/env, restart, and add
+     --header "Authorization: Bearer <token>" on the client (see README).
 EOF

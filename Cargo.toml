@@ -26,6 +26,9 @@ tier-parse = { git = "https://github.com/calibrae/tier-parse" }
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ulid = "3.0.0"
+sha2 = "0.10"
+subtle = "2.6"
+getrandom = "0.3"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

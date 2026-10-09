@@ -4,6 +4,7 @@
 //! binary uses.
 
 pub mod advisor;
+pub mod agent;
 pub mod apytti_client;
 pub mod authz;
 pub mod baselines;

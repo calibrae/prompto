@@ -1,0 +1,664 @@
+//! Agent authentication (`PROMPTO_AUTH`, role tokens), end to end.
+//!
+//! The router tests drive `prompto::server::build_router` — the shipping
+//! middleware chain — and read the agent back from the journald warn line
+//! that every classified failure emits, which is where attribution lives
+//! until the audit log (E4). The binary tests run the real `prompto`
+//! executable for what only `main` wires: the `agent` CLI, SIGHUP reload
+//! and the stdio identity.
+//!
+//! Refusals are asserted, not just successes: an auth layer that lets
+//! everything through passes every "does it still work?" test.
+
+use mcp_gain::Tracker;
+use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode};
+use prompto::inventory::{Inventory, InventoryStore};
+use prompto::server::{AllowedHosts, HttpParams, build_router};
+use prompto::ssh::SshClient;
+use serde_json::{Value, json};
+use std::io::{BufRead, Write};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// `bare` has no capabilities, so `ssh_exec` on it is a classified
+/// refusal (and a warn line) without any network. `multi` answers from a
+/// second address, for the `extra_ips` guard.
+const INVENTORY: &str = r#"
+[host.bare]
+ip = "192.0.2.77"
+ssh_user = "admin"
+ssh_key = "/dev/null"
+capabilities = []
+
+[host.multi]
+ip = "192.0.2.78"
+extra_ips = ["198.51.100.9", "2001:db8::9"]
+ssh_user = "admin"
+ssh_key = "/dev/null"
+capabilities = ["exec"]
+"#;
+
+// ---------------------------------------------------------------------------
+// Log capture: one global subscriber for this test binary. Tests run in
+// parallel, so each one tags its calls with a unique session ID and
+// looks only at lines carrying it.
+// ---------------------------------------------------------------------------
+
+static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct Capture;
+impl Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        LOGS.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn init_logs() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter("prompto=info")
+            .with_writer(|| Capture)
+            .with_ansi(false)
+            .init();
+    });
+}
+
+fn log_lines(needle: &str) -> Vec<String> {
+    String::from_utf8_lossy(&LOGS.lock().unwrap())
+        .lines()
+        .filter(|l| l.contains(needle))
+        .map(String::from)
+        .collect()
+}
+
+fn unique(tag: &str) -> String {
+    format!("{tag}-{}", ulid::Ulid::generate())
+}
+
+// ---------------------------------------------------------------------------
+// Router harness
+// ---------------------------------------------------------------------------
+
+struct Server {
+    addr: SocketAddr,
+    cancel: CancellationToken,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+async fn spawn_server_with(auth: AuthConfig) -> Server {
+    init_logs();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let app = build_router(HttpParams {
+        store: InventoryStore::new(Inventory::from_toml_str(INVENTORY).unwrap(), None),
+        ssh: Arc::new(SshClient::new("ssh".into(), Duration::from_secs(5))),
+        tracker: Arc::new(Tracker::disabled()),
+        stop_vm_step: Duration::from_secs(5),
+        trusted_proxies: Arc::new(prompto::caller::DEFAULT_TRUSTED_PROXIES.to_vec()),
+        allowed_hosts: AllowedHosts::List(vec!["127.0.0.1".into(), "localhost".into()]),
+        legacy_session_mode: false,
+        auth,
+        cancel: cancel.clone(),
+    });
+    let shutdown = cancel.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    Server { addr, cancel }
+}
+
+/// A store holding `alpha` (token `pto_alpha`, groups `ops`) and the
+/// revoked `retired` (token `pto_retired`).
+fn store() -> AgentStore {
+    let mut a = Agents::default();
+    for (name, token, disabled) in [
+        ("alpha", "pto_alpha", false),
+        ("retired", "pto_retired", true),
+    ] {
+        a.agents.insert(
+            name.into(),
+            prompto::agent::AgentEntry {
+                groups: vec!["ops".into()],
+                token_sha256: prompto::agent::hex(&prompto::agent::sha256(token.as_bytes())),
+                created: None,
+                disabled,
+            },
+        );
+    }
+    AgentStore::new(
+        Agents::from_toml_str(&a.to_toml_string().unwrap()).unwrap(),
+        None,
+    )
+}
+
+async fn server(mode: AuthMode) -> Server {
+    spawn_server_with(AuthConfig {
+        mode,
+        store: store(),
+    })
+    .await
+}
+
+/// `tools/call` over the stateless path. Returns (status, parsed body).
+async fn call(server: &Server, tool: &str, args: Value, headers: &[(&str, &str)]) -> (u16, Value) {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{}/mcp", server.addr))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", tool);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = req
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": args,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": { "name": "prompto-tests", "version": "0" },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    let raw = text
+        .lines()
+        .find_map(|l| l.strip_prefix("data: ").filter(|d| d.starts_with('{')))
+        .unwrap_or(&text);
+    (
+        status,
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{e}: {text}")),
+    )
+}
+
+/// `ssh_exec` on `bare`: refused for capability, so the server logs a
+/// warn line carrying agent and session. Returns (status, warn lines for
+/// this session).
+async fn refused_call(server: &Server, session: &str, auth: Option<&str>) -> (u16, Vec<String>) {
+    let bearer = auth.map(|t| format!("Bearer {t}"));
+    let mut headers = vec![("x-prompto-session", session)];
+    if let Some(b) = &bearer {
+        headers.push(("authorization", b.as_str()));
+    }
+    let (status, body) = call(
+        server,
+        "ssh_exec",
+        json!({ "host": "bare", "cmd": "true" }),
+        &headers,
+    )
+    .await;
+    if status == 200 {
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("refused_capability"),
+            "{body}"
+        );
+    }
+    (status, log_lines(&format!("session_id=\"{session}\"")))
+}
+
+fn assert_401_jsonrpc(status: u16, body: &Value, reason: &str) {
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["jsonrpc"], "2.0");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.starts_with("unauthorized: "), "{msg}");
+    assert!(msg.contains(reason), "{msg}");
+}
+
+async fn get_log(server: &Server, auth: Option<&str>) -> (u16, String) {
+    let mut req = reqwest::Client::new().get(format!(
+        "http://{}/log?host=bare&unit=ssh.service",
+        server.addr
+    ));
+    if let Some(t) = auth {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await.unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Modes
+// ---------------------------------------------------------------------------
+
+/// Default (off): no token needed, any token ignored, no agent attached.
+/// This is the existing deployment's behaviour.
+#[tokio::test]
+async fn off_needs_no_token_and_attributes_nothing() {
+    let s = spawn_server_with(AuthConfig::default()).await;
+    for token in [None, Some("garbage")] {
+        let sess = unique("off");
+        let (status, lines) = refused_call(&s, &sess, token).await;
+        assert_eq!(status, 200);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("agent=\"-\""), "{}", lines[0]);
+    }
+    let (status, body) = get_log(&s, None).await;
+    assert_eq!(status, 400, "past auth, refused for capability: {body}");
+}
+
+#[tokio::test]
+async fn optional_without_token_is_anonymous() {
+    let s = server(AuthMode::Optional).await;
+    let sess = unique("anon");
+    let (status, lines) = refused_call(&s, &sess, None).await;
+    assert_eq!(status, 200);
+    assert!(lines[0].contains("agent=\"anonymous\""), "{lines:?}");
+}
+
+#[tokio::test]
+async fn optional_with_invalid_token_is_anonymous_and_warned() {
+    let s = server(AuthMode::Optional).await;
+    let sess = unique("bad");
+    let (status, lines) = refused_call(&s, &sess, Some("pto_wrong_secret_value")).await;
+    assert_eq!(status, 200);
+    let warn = lines
+        .iter()
+        .find(|l| l.contains("invalid bearer token presented"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(warn.contains("caller_ip=Some(127.0.0.1)"), "{warn}");
+    assert!(
+        lines.iter().any(|l| l.contains("agent=\"anonymous\"")),
+        "{lines:?}"
+    );
+    assert!(
+        log_lines("pto_wrong_secret_value").is_empty(),
+        "a presented token must never be logged"
+    );
+}
+
+#[tokio::test]
+async fn optional_with_valid_token_names_the_agent() {
+    let s = server(AuthMode::Optional).await;
+    let sess = unique("valid");
+    let (status, lines) = refused_call(&s, &sess, Some("pto_alpha")).await;
+    assert_eq!(status, 200);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("agent=\"alpha\""), "{}", lines[0]);
+}
+
+#[tokio::test]
+async fn optional_with_revoked_token_is_anonymous_and_warned() {
+    let s = server(AuthMode::Optional).await;
+    let sess = unique("revoked-opt");
+    let (status, lines) = refused_call(&s, &sess, Some("pto_retired")).await;
+    assert_eq!(status, 200);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("revoked agent token presented") && l.contains("retired")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("tool call failed") && l.contains("agent=\"anonymous\"")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn required_without_or_with_bad_token_is_401() {
+    let s = server(AuthMode::Required).await;
+    let args = json!({});
+    let (status, body) = call(&s, "inventory_list", args.clone(), &[]).await;
+    assert_401_jsonrpc(status, &body, "missing bearer token");
+    for bad in [
+        "Bearer pto_nope",
+        "Basic YWxwaGE6eA==",
+        "Bearer",
+        "pto_alpha",
+    ] {
+        let (status, body) = call(
+            &s,
+            "inventory_list",
+            args.clone(),
+            &[("authorization", bad)],
+        )
+        .await;
+        assert_401_jsonrpc(status, &body, "invalid bearer token");
+    }
+}
+
+#[tokio::test]
+async fn required_with_revoked_token_is_401() {
+    let s = server(AuthMode::Required).await;
+    let (status, body) = call(
+        &s,
+        "inventory_list",
+        json!({}),
+        &[("authorization", "Bearer pto_retired")],
+    )
+    .await;
+    assert_401_jsonrpc(status, &body, "revoked token");
+    let (status, _) = get_log(&s, Some("pto_retired")).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn required_with_valid_token_works_and_names_the_agent() {
+    let s = server(AuthMode::Required).await;
+    let (status, body) = call(
+        &s,
+        "inventory_list",
+        json!({}),
+        &[("authorization", "Bearer pto_alpha")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["isError"], json!(false), "{body}");
+    let sess = unique("req-valid");
+    let (status, lines) = refused_call(&s, &sess, Some("pto_alpha")).await;
+    assert_eq!(status, 200);
+    assert!(lines[0].contains("agent=\"alpha\""), "{lines:?}");
+}
+
+#[tokio::test]
+async fn log_endpoint_is_gated_the_same_way() {
+    let s = server(AuthMode::Required).await;
+    let (status, body) = get_log(&s, None).await;
+    assert_eq!(status, 401);
+    assert_eq!(body, "unauthorized: missing bearer token\n");
+    let (status, _) = get_log(&s, Some("pto_nope")).await;
+    assert_eq!(status, 401);
+    // Past auth; `bare` lacks sudo_exec, so the request is then refused
+    // by the same gate as service_logs.
+    let (status, body) = get_log(&s, Some("pto_alpha")).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// X-Prompto-Session
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_header_is_bounded_and_charset_checked() {
+    let s = server(AuthMode::Optional).await;
+
+    // 128 chars of the allowed charset: kept.
+    let max = format!("{}{}", unique("s"), "x".repeat(128))[..128].to_string();
+    let (_, lines) = refused_call(&s, &max, Some("pto_alpha")).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+
+    // 129 chars: dropped, the call proceeds without a session.
+    let long = format!("{max}x");
+    let (status, lines) = refused_call(&s, &long, Some("pto_alpha")).await;
+    assert_eq!(status, 200);
+    assert!(
+        lines.is_empty(),
+        "overlong session id was logged: {lines:?}"
+    );
+
+    // Outside the charset: dropped too.
+    let tag = unique("charset");
+    let bad = format!("{tag} \"injected=1");
+    let (status, _) = refused_call(&s, &bad, Some("pto_alpha")).await;
+    assert_eq!(status, 200);
+    assert!(log_lines(&tag).is_empty(), "{:?}", log_lines(&tag));
+}
+
+// ---------------------------------------------------------------------------
+// extra_ips
+// ---------------------------------------------------------------------------
+
+/// A machine calling from a second address (Wi-Fi, VPN, IPv6) is still
+/// itself. The test client's TCP peer is loopback, a trusted proxy, so
+/// X-Real-IP sets the caller.
+#[tokio::test]
+async fn extra_ips_are_self_targeting() {
+    let s = spawn_server_with(AuthConfig::default()).await;
+    for ip in ["198.51.100.9", "::ffff:198.51.100.9", "2001:db8::9"] {
+        let (_, body) = call(
+            &s,
+            "ssh_exec",
+            json!({ "host": "multi", "cmd": "true" }),
+            &[("x-real-ip", ip)],
+        )
+        .await;
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("refused_self_target"), "{ip}: {body}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real binary: CLI, SIGHUP reload, stdio, startup config
+// ---------------------------------------------------------------------------
+
+const BIN: &str = env!("CARGO_BIN_EXE_prompto");
+
+struct Proc {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn write_inventory(dir: &Path) -> PathBuf {
+    let p = dir.join("prompto.toml");
+    std::fs::write(&p, INVENTORY).unwrap();
+    p
+}
+
+fn agent_cli(agents: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(BIN)
+        .arg("agent")
+        .args(args)
+        .env("PROMPTO_AGENTS", agents)
+        .output()
+        .unwrap()
+}
+
+fn spawn_binary(dir: &Path, agents: &Path) -> Proc {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let child = std::process::Command::new(BIN)
+        .env("PROMPTO_INVENTORY", write_inventory(dir))
+        .env("PROMPTO_AGENTS", agents)
+        .env("PROMPTO_AUTH", "required")
+        .env("PROMPTO_BIND", format!("127.0.0.1:{port}"))
+        .env("PROMPTO_ALLOWED_HOSTS", "127.0.0.1")
+        .env("PROMPTO_GAIN_ENABLED", "false")
+        .env("PROMPTO_USAGE_LOG", dir.join("usage.jsonl"))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Owned by `Proc` from here, whose Drop kills and reaps it.
+    let p = Proc { child, port };
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return p;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("prompto did not start listening");
+}
+
+async fn status_with(p: &Proc, token: Option<&str>) -> u16 {
+    let s = Server {
+        addr: SocketAddr::from(([127, 0, 0, 1], p.port)),
+        cancel: CancellationToken::new(),
+    };
+    let headers: Vec<(&str, String)> = token
+        .map(|t| vec![("authorization", format!("Bearer {t}"))])
+        .unwrap_or_default();
+    let h: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    call(&s, "inventory_list", json!({}), &h).await.0
+}
+
+async fn sighup(p: &Proc) {
+    let ok = std::process::Command::new("kill")
+        .args(["-HUP", &p.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// The whole lifecycle without a restart: no agents → 401; `agent add`
+/// alone changes nothing until SIGHUP; after it the token works; a
+/// broken file on reload keeps the previous agents; `agent revoke` +
+/// SIGHUP → 401 again.
+#[tokio::test]
+async fn cli_add_and_revoke_take_effect_on_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents.toml");
+    let p = spawn_binary(dir.path(), &agents);
+
+    assert_eq!(status_with(&p, None).await, 401);
+
+    let out = agent_cli(&agents, &["add", "sbx-tester", "--groups", "ops,build"]);
+    assert!(out.status.success(), "{out:?}");
+    let token = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert!(token.starts_with("pto_"), "stdout must be just the token");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reload"),
+        "CLI must say to reload: {stderr}"
+    );
+    let file = std::fs::read_to_string(&agents).unwrap();
+    assert!(!file.contains(&token), "token written to disk");
+
+    assert_eq!(status_with(&p, Some(&token)).await, 401, "no reload yet");
+    sighup(&p).await;
+    assert_eq!(status_with(&p, Some(&token)).await, 200);
+
+    // Fail-safe reload: a broken file keeps the previous agents.
+    std::fs::write(&agents, "[agent.x]\ntoken_sha256 = \"short\"\n").unwrap();
+    sighup(&p).await;
+    assert_eq!(status_with(&p, Some(&token)).await, 200);
+    std::fs::write(&agents, &file).unwrap();
+
+    let out = agent_cli(&agents, &["revoke", "sbx-tester"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(status_with(&p, Some(&token)).await, 200, "no reload yet");
+    sighup(&p).await;
+    assert_eq!(status_with(&p, Some(&token)).await, 401);
+
+    let out = agent_cli(&agents, &["list"]);
+    let list = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        list.contains("sbx-tester") && list.contains("revoked"),
+        "{list}"
+    );
+    let hash = prompto::agent::hex(&prompto::agent::sha256(token.as_bytes()));
+    assert!(list.contains(&hash[..8]) && !list.contains(&hash), "{list}");
+}
+
+#[test]
+fn cli_refuses_duplicates_reserved_names_and_unknown_revokes() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents.toml");
+    assert!(agent_cli(&agents, &["add", "one"]).status.success());
+    assert!(!agent_cli(&agents, &["add", "one"]).status.success());
+    assert!(!agent_cli(&agents, &["add", "anonymous"]).status.success());
+    assert!(!agent_cli(&agents, &["add", "Bad Name"]).status.success());
+    assert!(!agent_cli(&agents, &["revoke", "two"]).status.success());
+}
+
+#[test]
+fn unknown_auth_mode_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(BIN)
+        .env("PROMPTO_INVENTORY", write_inventory(dir.path()))
+        .env("PROMPTO_AGENTS", dir.path().join("agents.toml"))
+        .env("PROMPTO_AUTH", "requried")
+        .env("PROMPTO_BIND", "127.0.0.1:0")
+        .env("PROMPTO_GAIN_ENABLED", "false")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PROMPTO_AUTH"));
+}
+
+/// stdio is agent `local`, whatever PROMPTO_AUTH says.
+#[test]
+fn stdio_is_agent_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(BIN)
+        .arg("--stdio")
+        .env("PROMPTO_INVENTORY", write_inventory(dir.path()))
+        .env("PROMPTO_AGENTS", dir.path().join("agents.toml"))
+        .env("PROMPTO_AUTH", "required")
+        .env("PROMPTO_GAIN_ENABLED", "false")
+        .env("RUST_LOG", "prompto=info")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for msg in [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"ssh_exec","arguments":{"host":"bare","cmd":"true"}}}),
+    ] {
+        writeln!(stdin, "{msg}").unwrap();
+    }
+    stdin.flush().unwrap();
+    let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let line = stderr
+        .lines()
+        .map_while(Result::ok)
+        .find(|l| l.contains("tool call failed"));
+    let _ = child.kill();
+    let _ = child.wait();
+    // The subscriber colours its output; drop the escape sequences.
+    let line: String = {
+        let raw = line.expect("no warn line from the stdio call");
+        let mut out = String::new();
+        let mut esc = false;
+        for c in raw.chars() {
+            match (esc, c) {
+                (_, '\x1b') => esc = true,
+                (true, 'm') => esc = false,
+                (true, _) => {}
+                (false, c) => out.push(c),
+            }
+        }
+        out
+    };
+    assert!(line.contains("agent=\"local\""), "{line}");
+}

@@ -75,6 +75,9 @@ pub struct Prompto {
     /// `streamable_http_server::tower:657`), the task-local is gone —
     /// hence the eager snapshot. None on stdio / tests.
     caller_ip: Option<std::net::IpAddr>,
+    /// Agent and session, snapshotted the same way from the auth
+    /// middleware's task-local (`agent::current`). `local` on stdio.
+    identity: crate::agent::Identity,
     stop_vm_step: Duration,
     #[allow(dead_code)]
     tool_router: ToolRouter<Prompto>,
@@ -429,9 +432,17 @@ impl Prompto {
             filters,
             advisor,
             caller_ip,
+            identity: Default::default(),
             stop_vm_step,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Set the caller's identity (agent + session) for every call made
+    /// through this instance.
+    pub fn with_identity(mut self, identity: crate::agent::Identity) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Shared body for the trivial interpreter wrappers (ruby/perl/deno
@@ -491,9 +502,9 @@ impl Prompto {
     }
 
     /// A fresh [`CallCtx`] for one tool call: new request ID, this
-    /// instance's caller IP, clock started.
+    /// instance's caller IP and identity, clock started.
     fn new_ctx(&self) -> CallCtx {
-        CallCtx::new(self.caller_ip)
+        CallCtx::new(self.caller_ip).with_identity(self.identity.clone())
     }
 
     /// The single authorization gate for a tool call that targets a host:
@@ -546,6 +557,8 @@ impl Prompto {
                 if let Some(c) = classified {
                     tracing::warn!(
                         request_id,
+                        agent = ctx.agent_name(),
+                        session_id = ctx.session_id.as_deref(),
                         tool,
                         host,
                         error_class = c.class.as_str(),

@@ -7,6 +7,7 @@
 //! chain is not evidence that it works.
 
 use crate::advisor::Advisor;
+use crate::agent::{self, AuthConfig, Decision};
 use crate::authz::Need;
 use crate::caller;
 use crate::filters::FilterChain;
@@ -68,6 +69,9 @@ pub struct HttpParams {
     /// and a restart instead of a rebuild — cheap insurance for the box
     /// that controls every other box.
     pub legacy_session_mode: bool,
+    /// `PROMPTO_AUTH` and the agent token store. `Default` is auth off,
+    /// which is today's behaviour.
+    pub auth: AuthConfig,
     pub cancel: CancellationToken,
 }
 
@@ -99,6 +103,63 @@ async fn capture_caller_ip(
     caller::scoped(client, next.run(req)).await
 }
 
+/// axum middleware: authenticate the caller (`PROMPTO_AUTH`) and install
+/// the resulting [`agent::Identity`] in the agent task-local, which the
+/// rmcp factory and `/log` snapshot like the caller IP.
+///
+/// Runs inside [`capture_caller_ip`], so warnings carry the real client
+/// address. A refusal is a 401: a JSON-RPC error object on `/mcp` (so an
+/// MCP client can show the reason), plain text on `/log`.
+async fn authenticate(auth: AuthConfig, req: axum::extract::Request, next: Next) -> Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let decision = {
+        let headers = req.headers();
+        // A header that isn't visible ASCII is "present but invalid",
+        // not "absent": in required mode it must not fall through to
+        // the missing-token branch, and either way it is a warning.
+        let authz = headers
+            .get(header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap_or(""));
+        let session = headers
+            .get(agent::SESSION_HEADER)
+            .map(|v| v.to_str().unwrap_or("\u{fffd}"));
+        agent::authenticate_request(&auth, authz, session, caller::current())
+    };
+    match decision {
+        Decision::Proceed(id) => agent::scoped(id, next.run(req)).await,
+        Decision::Reject(reason) => {
+            let www = (header::WWW_AUTHENTICATE, r#"Bearer realm="prompto""#);
+            if req.uri().path() == "/log" {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [www],
+                    format!("unauthorized: {reason}\n"),
+                )
+                    .into_response()
+            } else {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32001,
+                        "message": format!(
+                            "unauthorized: {reason} — prompto requires `Authorization: Bearer <agent token>`"
+                        ),
+                    }
+                });
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [www, (header::CONTENT_TYPE, "application/json")],
+                    body.to_string(),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 /// State for the plain-HTTP `/log` endpoint.
 #[derive(Clone)]
 struct LogState {
@@ -119,25 +180,23 @@ struct LogQuery {
 /// Every response carries the call's request ID in
 /// [`REQUEST_ID_HEADER`].
 ///
-/// # No authentication
+/// # Authentication
 ///
-/// This endpoint is deliberately unauthenticated (operator's call). It is
-/// reachable wherever prompto's listener is: in the homelab deployment
-/// that is the public vhost, i.e. anyone on the LAN or WireGuard.
-/// Anyone who can reach it can read journals on any inventory host that
-/// grants `sudo_exec`.
+/// Gated exactly like `/mcp` by [`authenticate`]: with `PROMPTO_AUTH=off`
+/// (the default) it is unauthenticated, and anyone who can reach the
+/// listener can read journals on any inventory host that grants
+/// `sudo_exec`; `required` makes it a 401 without a valid agent token.
 ///
 /// It is held to *exactly* the same limits as the `service_logs` MCP tool
 /// and given no capability the tool lacks: same `sudo_exec` gate and self-target guard (via `authz`), same
 /// `validate_unit_name` on the unit (so it cannot be turned into a shell),
 /// same 1..=1000 line clamp, same 15 s timeout. So it widens *reach*, not
-/// *power* — the MCP surface was already unauthenticated on the same port.
-/// Adding auth here without also adding it to `/mcp` would be theatre.
+/// *power* — it shares `/mcp`'s listener and its authentication.
 async fn log_handler(
     axum::extract::State(state): axum::extract::State<LogState>,
     axum::extract::Query(q): axum::extract::Query<LogQuery>,
 ) -> impl axum::response::IntoResponse {
-    let ctx = crate::ctx::CallCtx::new(caller::current());
+    let ctx = crate::ctx::CallCtx::new(caller::current()).with_identity(agent::current());
     let status_and_body = log_tail(&state, &ctx, &q).await;
     ([(REQUEST_ID_HEADER, ctx.request_id())], status_and_body)
 }
@@ -212,6 +271,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         tracker,
         stop_vm_step,
         trusted_proxies,
+        auth,
         ..
     } = p;
 
@@ -235,7 +295,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
                 advisor.clone(),
                 stop_vm_step,
                 caller::current(),
-            ))
+            )
+            .with_identity(agent::current()))
         },
         LocalSessionManager::default().into(),
         http_config,
@@ -252,6 +313,12 @@ pub fn build_router(p: HttpParams) -> axum::Router {
             "/log",
             axum::routing::get(log_handler).with_state(log_state),
         )
+        // Layers wrap outward: the caller-IP layer (added last) runs
+        // first, so authentication sees the resolved client address.
+        .layer(middleware::from_fn(move |req, next| {
+            let auth = auth.clone();
+            async move { authenticate(auth, req, next).await }
+        }))
         .layer(middleware::from_fn(
             move |conn: ConnectInfo<SocketAddr>, req, next| {
                 let trusted = trusted_proxies.clone();

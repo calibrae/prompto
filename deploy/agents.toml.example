@@ -1,0 +1,13 @@
+# /etc/prompto/agents.toml — agent role tokens (PROMPTO_AGENTS).
+# Do not write hashes by hand: `prompto agent add <name> [--groups a,b]` mints a
+# token, prints it once and stores only its SHA-256 here; `prompto agent revoke
+# <name>` sets disabled = true. Reload a running server with SIGHUP
+# (`systemctl reload prompto`). Keep the file 0640 root:prompto.
+#
+# Names: a-z 0-9 - _ ("anonymous" and "local" are reserved).
+
+[agent.builder]
+groups = ["build"]
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+created = "2026-01-01T00:00:00Z"
+disabled = true
