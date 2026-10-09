@@ -7,12 +7,30 @@ fn main() {
             v.sort_by_key(|(n, _)| n.to_string());
             for (n, h) in v {
                 let hv = h.hypervisor.clone().unwrap_or_default();
-                let al = if h.aliases.is_empty() { String::new() } else { format!(" aka {:?}", h.aliases) };
-                println!("  {:11} {:14} {:8} {:9} {:10} {}{}", n, h.ip.to_string(),
-                    h.platform.as_str(), h.chassis.as_str(), hv,
-                    h.capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","), al);
+                let al = if h.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" aka {:?}", h.aliases)
+                };
+                println!(
+                    "  {:11} {:14} {:8} {:9} {:10} {}{}",
+                    n,
+                    h.ip.to_string(),
+                    h.platform.as_str(),
+                    h.chassis.as_str(),
+                    hv,
+                    h.capabilities
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    al
+                );
             }
         }
-        Err(e) => { println!("REJECTED: {e:#}"); std::process::exit(1); }
+        Err(e) => {
+            println!("REJECTED: {e:#}");
+            std::process::exit(1);
+        }
     }
 }

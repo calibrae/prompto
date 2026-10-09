@@ -234,7 +234,9 @@ impl HostConfig {
             // A vault path on a host that can't sudo is a typo or a
             // forgotten capability — either way it would never be used.
             if !self.has(Capability::SudoExec) {
-                bail!("host {name}: sudo_password_vault_path is set but the host lacks `sudo_exec`");
+                bail!(
+                    "host {name}: sudo_password_vault_path is set but the host lacks `sudo_exec`"
+                );
             }
         }
         if self.sudo_password_vault_field.is_some() && self.sudo_password_vault_path.is_none() {
@@ -427,7 +429,6 @@ impl InventoryStore {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
-
 }
 
 #[cfg(test)]
@@ -668,11 +669,13 @@ capabilities = ["exec"]
         );
         assert!(err.contains("needs sudo_password_vault_path"), "{err}");
         // Path traversal.
-        assert!(Inventory::from_toml_str(&base(
-            "sudo_password_vault_path = \"infra/../sys\"",
-            "[\"exec\", \"sudo_exec\"]"
-        ))
-        .is_err());
+        assert!(
+            Inventory::from_toml_str(&base(
+                "sudo_password_vault_path = \"infra/../sys\"",
+                "[\"exec\", \"sudo_exec\"]"
+            ))
+            .is_err()
+        );
     }
 
     /// THE regression: a Windows guest carrying `wake` and a QEMU/KVM
@@ -716,8 +719,11 @@ capabilities = ["exec"]
 "#;
         Inventory::from_toml_str(ok).unwrap();
 
-        let bad = ok.replace(r#"capabilities = ["exec"]"#, r#"mac = "52:54:00:1:2:3"
-capabilities = ["wake"]"#);
+        let bad = ok.replace(
+            r#"capabilities = ["exec"]"#,
+            r#"mac = "52:54:00:1:2:3"
+capabilities = ["wake"]"#,
+        );
         let err = format!("{:#}", Inventory::from_toml_str(&bad).unwrap_err());
         assert!(err.contains("vm_start <hypervisor> foreign"), "{err}");
     }

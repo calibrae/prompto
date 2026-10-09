@@ -30,7 +30,11 @@ impl CommandFilter for ZfsList {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -51,7 +55,11 @@ impl CommandFilter for ZfsGet {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -74,7 +82,11 @@ impl CommandFilter for ZpoolStatus {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -96,7 +108,11 @@ impl CommandFilter for ZpoolList {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -136,7 +152,9 @@ fn cap<'a>(stdout: &'a str, cap_n: usize, unit: &str) -> Cow<'a, str> {
     }
     let mut out: String = stdout.lines().take(cap_n).collect::<Vec<_>>().join("\n");
     out.push('\n');
-    out.push_str(&format!("… truncated ({cap_n} {unit} kept, {total} total)\n"));
+    out.push_str(&format!(
+        "… truncated ({cap_n} {unit} kept, {total} total)\n"
+    ));
     Cow::Owned(out)
 }
 

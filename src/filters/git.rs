@@ -25,7 +25,11 @@ impl CommandFilter for GitLog {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -73,7 +77,11 @@ impl CommandFilter for GitDiff {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("diff truncated") { 2 } else { 1 }
+        if filtered.contains("diff truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -95,7 +103,11 @@ impl CommandFilter for GitShow {
     }
 
     fn tier(&self, filtered: &str) -> u8 {
-        if filtered.contains("… truncated") { 2 } else { 1 }
+        if filtered.contains("… truncated") {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -448,8 +460,12 @@ mod tests {
 
     #[test]
     fn git_worktree_list_normalizes_columns() {
-        let s = "/repo/main             abc1234 [main]\n/repo/feature-x        def5678 [feature/x]\n";
+        let s =
+            "/repo/main             abc1234 [main]\n/repo/feature-x        def5678 [feature/x]\n";
         let out = GitWorktreeList.filter("git worktree list", s);
-        assert_eq!(out, "/repo/main abc1234 [main]\n/repo/feature-x def5678 [feature/x]");
+        assert_eq!(
+            out,
+            "/repo/main abc1234 [main]\n/repo/feature-x def5678 [feature/x]"
+        );
     }
 }

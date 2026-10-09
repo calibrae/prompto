@@ -18,7 +18,6 @@ use crate::advisor::Advisor;
 use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::batch;
 use crate::claudemgr::{self, Scope};
-use crate::router::{self, Tier};
 use crate::diagnose;
 use crate::files;
 use crate::filters::FilterChain;
@@ -26,6 +25,7 @@ use crate::host;
 use crate::inventory::{Capability, InventoryStore};
 use crate::mcpprobe;
 use crate::portscan;
+use crate::router::{self, Tier};
 use crate::rsync;
 use crate::script;
 use crate::ssh::SshClient;
@@ -515,9 +515,7 @@ impl Prompto {
         }
     }
 
-    #[tool(
-        description = "Wake a host via WOL magic packet."
-    )]
+    #[tool(description = "Wake a host via WOL magic packet.")]
     async fn host_wake(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -537,9 +535,7 @@ impl Prompto {
         self.finish_tool("host_wake", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "TCP-probe a host's SSH port. Returns up | unreachable | off."
-    )]
+    #[tool(description = "TCP-probe a host's SSH port. Returns up | unreachable | off.")]
     async fn host_status(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -555,9 +551,7 @@ impl Prompto {
         self.finish_tool("host_status", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "Shutdown a host (`shutdown -h now` as root)."
-    )]
+    #[tool(description = "Shutdown a host (`shutdown -h now` as root).")]
     async fn host_sleep(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -574,9 +568,7 @@ impl Prompto {
         self.finish_tool("host_sleep", Some(&args.host), started, res)
     }
 
-    #[tool(
-        description = "List libvirt domains on a host (`virsh list --all`)."
-    )]
+    #[tool(description = "List libvirt domains on a host (`virsh list --all`).")]
     async fn vm_list(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -888,9 +880,7 @@ impl Prompto {
         self.finish_tool("node_exec", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "Run Ruby on a remote host. Script body via SSH stdin."
-    )]
+    #[tool(description = "Run Ruby on a remote host. Script body via SSH stdin.")]
     async fn ruby_exec(
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
@@ -898,9 +888,7 @@ impl Prompto {
         self.script_exec_simple("ruby_exec", "ruby", args).await
     }
 
-    #[tool(
-        description = "Run Perl on a remote host. Script body via SSH stdin."
-    )]
+    #[tool(description = "Run Perl on a remote host. Script body via SSH stdin.")]
     async fn perl_exec(
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
@@ -991,9 +979,7 @@ impl Prompto {
         self.finish_tool("file_stat", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "List inventory hosts with their capabilities. Read-only."
-    )]
+    #[tool(description = "List inventory hosts with their capabilities. Read-only.")]
     async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
         let res: anyhow::Result<_> = async {
@@ -1038,9 +1024,7 @@ impl Prompto {
         self.finish_tool("inventory_list", None, started, res)
     }
 
-    #[tool(
-        description = "Get one host's inventory config (ssh_key path elided)."
-    )]
+    #[tool(description = "Get one host's inventory config (ssh_key path elided).")]
     async fn inventory_get_host(
         &self,
         Parameters(args): Parameters<InventoryHostNameArgs>,
@@ -1311,9 +1295,7 @@ impl Prompto {
         self.finish_tool("file_write", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "Run Bash on a remote host. Script body via SSH stdin."
-    )]
+    #[tool(description = "Run Bash on a remote host. Script body via SSH stdin.")]
     async fn bash_exec(
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
@@ -1353,8 +1335,7 @@ impl Prompto {
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
-            let host =
-                inv.require_remote(&args.host, self.caller_ip, Capability::SudoExec)?;
+            let host = inv.require_remote(&args.host, self.caller_ip, Capability::SudoExec)?;
             let raw = self.ssh.exec(host, &args.cmd, to, true).await?;
             Ok(self.apply_filters(&args.cmd, raw))
         }
@@ -1362,9 +1343,7 @@ impl Prompto {
         self.finish_tool("ssh_sudo_exec", Some(&host_name), started, res)
     }
 
-    #[tool(
-        description = "List MCP servers registered on a client (`claude mcp list`)."
-    )]
+    #[tool(description = "List MCP servers registered on a client (`claude mcp list`).")]
     async fn mcp_list(
         &self,
         Parameters(args): Parameters<McpClientArgs>,
@@ -1381,9 +1360,7 @@ impl Prompto {
         self.finish_tool("mcp_list", Some(&client), started, res)
     }
 
-    #[tool(
-        description = "Show one MCP server's config on a client (`claude mcp get <name>`)."
-    )]
+    #[tool(description = "Show one MCP server's config on a client (`claude mcp get <name>`).")]
     async fn mcp_get(
         &self,
         Parameters(args): Parameters<McpGetArgs>,
@@ -1432,9 +1409,7 @@ impl Prompto {
         self.finish_tool("mcp_add", Some(&client), started, res)
     }
 
-    #[tool(
-        description = "Unregister an MCP server on a client."
-    )]
+    #[tool(description = "Unregister an MCP server on a client.")]
     async fn mcp_remove(
         &self,
         Parameters(args): Parameters<McpRemoveArgs>,

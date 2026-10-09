@@ -106,7 +106,11 @@ fn stateless_meta() -> serde_json::Value {
     })
 }
 
-fn tool_call_body(tool: &str, host_arg: &str, meta: Option<serde_json::Value>) -> serde_json::Value {
+fn tool_call_body(
+    tool: &str,
+    host_arg: &str,
+    meta: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut params = serde_json::json!({
         "name": tool,
         "arguments": { "host": host_arg, "cmd": "echo hello" }
@@ -133,7 +137,11 @@ async fn call_tool(server: &Server, host_arg: &str, extra_headers: &[(&str, &str
         req = req.header(*k, *v);
     }
     let resp = req
-        .json(&tool_call_body("ssh_exec", host_arg, Some(stateless_meta())))
+        .json(&tool_call_body(
+            "ssh_exec",
+            host_arg,
+            Some(stateless_meta()),
+        ))
         .send()
         .await
         .expect("request failed");
@@ -153,11 +161,7 @@ async fn call_tool_legacy(server: &Server, host_arg: &str) -> String {
 /// `require_session`: assert the server issued an `Mcp-Session-Id`. False
 /// when running sessionless, where legacy clients are served statelessly
 /// and no session id comes back.
-async fn call_tool_legacy_inner(
-    server: &Server,
-    host_arg: &str,
-    require_session: bool,
-) -> String {
+async fn call_tool_legacy_inner(server: &Server, host_arg: &str, require_session: bool) -> String {
     let client = reqwest::Client::new();
     let url = format!("http://{}/mcp", server.addr);
 

@@ -14,7 +14,7 @@ use std::borrow::Cow;
 /// Re-export of [`tier_parse`]'s structured-parsing primitives. Filters that
 /// produce typed output (rather than compacted text) should return a
 /// [`ParseResult<T>`] and surface its tier through [`CommandFilter::tier`].
-pub use tier_parse::{ParseResult, OutputParser, extract_json_object, truncate_output};
+pub use tier_parse::{OutputParser, ParseResult, extract_json_object, truncate_output};
 
 pub mod cargo;
 pub mod git;

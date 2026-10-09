@@ -174,7 +174,10 @@ mod tests {
     #[test]
     fn trusted_proxy_without_headers_falls_back_to_peer() {
         let peer = ip("127.0.0.1");
-        assert_eq!(resolve_client_ip(peer, DEFAULT_TRUSTED_PROXIES, None, None), peer);
+        assert_eq!(
+            resolve_client_ip(peer, DEFAULT_TRUSTED_PROXIES, None, None),
+            peer
+        );
     }
 
     #[test]

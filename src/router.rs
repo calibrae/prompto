@@ -13,7 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// Triage / verify / one-line answers. Cheap, fast, low context.
