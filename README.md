@@ -4,6 +4,8 @@ MCP server for homelab power & lifecycle (Wake-on-LAN, libvirt), typed SSH exec,
 
 > *"prompto"* — Italian for *ready / at your prompt*. Ready when called (wake), at your prompt (exec).
 
+**What's new in v0.12.0** (request IDs, one authorization gate, agent tokens, policy, audit log, error classes, kill switches) and the **upgrade note for existing deployments**: [CHANGELOG.md](CHANGELOG.md).
+
 ## Why
 
 A homelab tends to grow three loosely-related control surfaces:
