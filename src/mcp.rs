@@ -19,6 +19,7 @@ use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::batch;
 use crate::claudemgr::{self, Scope};
 use crate::diagnose;
+use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
@@ -510,7 +511,19 @@ impl Prompto {
                 let msg = e.to_string();
                 self.tracker
                     .record(tool, host, false, exec_ms, msg.len() as u64);
-                Err(McpError::internal_error(msg, None))
+                // mcp-gain's Event has no room for a class, so a
+                // classified failure is also logged here, for journald.
+                let data = e.downcast_ref::<ClassifiedError>().map(|c| {
+                    tracing::warn!(
+                        tool,
+                        host,
+                        error_class = c.class.as_str(),
+                        exit_code = c.exit_code,
+                        "tool call failed"
+                    );
+                    c.data()
+                });
+                Err(McpError::internal_error(msg, data))
             }
         }
     }
@@ -1059,7 +1072,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). PRECONDITION: the rsync runs ON source_host, so source_host must already be able to SSH to dest_host as its inventory ssh_user — prompto's own keys are not available there. Optional dest_key names an identity file on source_host. Trailing `/` on paths matters. Output is the --stats block."
+        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). PRECONDITION: the rsync runs ON source_host, so source_host must already be able to SSH to dest_host as its inventory ssh_user — prompto's own keys are not available there. Optional dest_key names an identity file on source_host. Trailing `/` on paths matters. Output is the --stats block. A failure names its cause as `[error_class=…]` (e.g. dest_ssh_auth = source_host can't log into dest_host) with rsync's exit code and stderr tail."
     )]
     async fn rsync_sync(
         &self,
@@ -1070,8 +1083,18 @@ impl Prompto {
         let to = args.timeout_secs.map(Duration::from_secs);
         let res: anyhow::Result<_> = async {
             let inv = self.inv.snapshot();
-            let source_host = inv.require(&args.source_host, Capability::Exec)?;
-            let dest_host = inv.require(&args.dest_host, Capability::Exec)?;
+            let require = |name: &str| {
+                inv.require(name, Capability::Exec).map_err(|e| {
+                    let class = if inv.get(name).is_err() {
+                        ErrorClass::UnknownHost
+                    } else {
+                        ErrorClass::RefusedCapability
+                    };
+                    ClassifiedError::refused(class, e)
+                })
+            };
+            let source_host = require(&args.source_host)?;
+            let dest_host = require(&args.dest_host)?;
             let opts = rsync::RsyncOptions {
                 archive: args.archive.unwrap_or(true),
                 delete: args.delete.unwrap_or(false),
@@ -1099,6 +1122,7 @@ impl Prompto {
                 "stdout": stdout,
                 "stderr": raw.stderr,
                 "exit_code": raw.exit_code,
+                "error_class": None::<ErrorClass>,
                 "filter": report.applied,
                 "original_bytes": report.original_bytes,
                 "filtered_bytes": report.filtered_bytes,
