@@ -7,11 +7,11 @@ use prompto::baselines::BASELINES;
 use prompto::caller;
 use prompto::inventory::InventoryStore;
 use prompto::mcp::Prompto;
+use prompto::server::{AllowedHosts, HttpParams, build_router};
 use prompto::ssh::SshClient;
 use prompto::vault::VaultClient;
-use std::net::SocketAddr;
-use prompto::server::{AllowedHosts, HttpParams, build_router};
 use rmcp::{ServiceExt, transport::stdio};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
         .filter(|(_, h)| h.sudo_password_vault_path.is_some())
         .map(|(n, _)| n.clone())
         .collect();
-    match VaultClient::from_env() {
+    match VaultClient::from_env()? {
         Some(vault) => {
             let vault = Arc::new(vault);
             tracing::info!(addr = %vault.addr(), hosts = ?needs_vault, "vault-backed sudo enabled");

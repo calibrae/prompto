@@ -11,6 +11,7 @@
 //! the field and Vault's own error text, never a value.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::path::Path;
 use std::time::Duration;
 
 pub struct VaultClient {
@@ -32,30 +33,78 @@ impl std::fmt::Debug for VaultClient {
 }
 
 impl VaultClient {
-    pub fn new(addr: impl Into<String>, mount: impl Into<String>, token: impl Into<String>) -> Self {
+    /// Client trusting only the bundled webpki roots.
+    pub fn new(
+        addr: impl Into<String>,
+        mount: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        let http = http_client(&[]).expect("reqwest client");
+        Self::with_http(addr, mount, token, http)
+    }
+
+    /// Client that additionally trusts every certificate in the PEM file
+    /// at `cacert` — for a Vault behind a private CA. An unreadable file,
+    /// or one holding no usable certificate, is an error: falling back to
+    /// the bundled roots would only fail later as "vault unreachable".
+    pub fn with_cacert(
+        addr: impl Into<String>,
+        mount: impl Into<String>,
+        token: impl Into<String>,
+        cacert: &Path,
+    ) -> Result<Self> {
+        let pem = std::fs::read(cacert)
+            .with_context(|| format!("cannot read vault CA file {}", cacert.display()))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("invalid PEM in vault CA file {}", cacert.display()))?;
+        if certs.is_empty() {
+            bail!(
+                "vault CA file {} contains no PEM certificate",
+                cacert.display()
+            );
+        }
+        let http = http_client(&certs)
+            .with_context(|| format!("vault CA file {} rejected", cacert.display()))?;
+        Ok(Self::with_http(addr, mount, token, http))
+    }
+
+    fn with_http(
+        addr: impl Into<String>,
+        mount: impl Into<String>,
+        token: impl Into<String>,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
             addr: addr.into().trim_end_matches('/').to_string(),
             mount: mount.into().trim_matches('/').to_string(),
             token: token.into(),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client"),
+            http,
         }
     }
 
     /// Build from `PROMPTO_VAULT_TOKEN` (required), `PROMPTO_VAULT_ADDR`
-    /// (default `http://127.0.0.1:8200`) and `PROMPTO_VAULT_MOUNT`
-    /// (default `secret`). `None` when no token is configured.
-    pub fn from_env() -> Option<Self> {
-        let token = std::env::var("PROMPTO_VAULT_TOKEN").ok()?;
+    /// (default `http://127.0.0.1:8200`), `PROMPTO_VAULT_MOUNT` (default
+    /// `secret`) and `PROMPTO_VAULT_CACERT` (optional extra PEM roots).
+    /// `Ok(None)` when no token is configured; `Err` when the CA file is
+    /// set but unusable.
+    pub fn from_env() -> Result<Option<Self>> {
+        let Ok(token) = std::env::var("PROMPTO_VAULT_TOKEN") else {
+            return Ok(None);
+        };
         if token.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
         let addr = std::env::var("PROMPTO_VAULT_ADDR")
             .unwrap_or_else(|_| "http://127.0.0.1:8200".to_string());
         let mount = std::env::var("PROMPTO_VAULT_MOUNT").unwrap_or_else(|_| "secret".to_string());
-        Some(Self::new(addr, mount, token.trim()))
+        match std::env::var("PROMPTO_VAULT_CACERT") {
+            Ok(ca) if !ca.trim().is_empty() => {
+                Self::with_cacert(addr, mount, token.trim(), Path::new(ca.trim()))
+                    .context("PROMPTO_VAULT_CACERT")
+                    .map(Some)
+            }
+            _ => Ok(Some(Self::new(addr, mount, token.trim()))),
+        }
     }
 
     pub fn addr(&self) -> &str {
@@ -123,6 +172,16 @@ impl VaultClient {
     }
 }
 
+fn http_client(extra_roots: &[reqwest::Certificate]) -> reqwest::Result<reqwest::Client> {
+    extra_roots
+        .iter()
+        .fold(
+            reqwest::Client::builder().timeout(Duration::from_secs(5)),
+            |b, c| b.add_root_certificate(c.clone()),
+        )
+        .build()
+}
+
 /// Shape check for a KV path from the inventory. Rejects anything that
 /// could walk out of the mount or smuggle a query string.
 pub fn validate_kv_path(p: &str) -> Result<()> {
@@ -132,7 +191,9 @@ pub fn validate_kv_path(p: &str) -> Result<()> {
     if p.starts_with('/') || p.ends_with('/') {
         bail!("vault path {p:?} must not start or end with '/' (no mount prefix either)");
     }
-    if p.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+    if p.split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
         bail!("vault path {p:?} has an empty, '.' or '..' segment");
     }
     if !p
@@ -148,6 +209,7 @@ pub fn validate_kv_path(p: &str) -> Result<()> {
 mod tests {
     use super::*;
     use axum::{Json, Router, http::StatusCode, routing::get};
+    use std::sync::Arc;
 
     const SECRET: &str = "hunter2-do-not-leak";
 
@@ -180,7 +242,10 @@ mod tests {
     #[tokio::test]
     async fn reads_a_field() {
         let v = VaultClient::new(spawn_fake_vault().await, "secret", "tok");
-        assert_eq!(v.kv2_field("infra/default", "password").await.unwrap(), SECRET);
+        assert_eq!(
+            v.kv2_field("infra/default", "password").await.unwrap(),
+            SECRET
+        );
     }
 
     /// No error path may carry a secret value — including the case where
@@ -197,8 +262,137 @@ mod tests {
             let err = format!("{:#}", v.kv2_field(path, field).await.unwrap_err());
             assert!(!err.contains(SECRET), "secret leaked into error: {err}");
         }
-        let denied = format!("{:#}", v.kv2_field("infra/forbidden", "password").await.unwrap_err());
+        let denied = format!(
+            "{:#}",
+            v.kv2_field("infra/forbidden", "password")
+                .await
+                .unwrap_err()
+        );
         assert!(denied.contains("permission denied"), "{denied}");
+    }
+
+    /// TLS listener for axum: handshakes each connection before handing
+    /// it over. Failed handshakes (an untrusting client) are dropped.
+    struct TlsListener {
+        tcp: tokio::net::TcpListener,
+        tls: tokio_rustls::TlsAcceptor,
+    }
+
+    impl axum::serve::Listener for TlsListener {
+        type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+        type Addr = std::net::SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                let Ok((tcp, addr)) = self.tcp.accept().await else {
+                    continue;
+                };
+                if let Ok(tls) = self.tls.accept(tcp).await {
+                    return (tls, addr);
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            self.tcp.local_addr()
+        }
+    }
+
+    /// Fake Vault over HTTPS with a leaf signed by a freshly generated
+    /// throwaway test CA. Returns the address and the CA as PEM.
+    async fn spawn_tls_fake_vault() -> (String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use tokio_rustls::rustls::{self, pki_types::PrivateKeyDer};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca)
+            .unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let app = Router::new().route(
+            "/v1/secret/data/infra/default",
+            get(|| async {
+                Json(serde_json::json!({ "data": { "data": { "password": SECRET } } }))
+            }),
+        );
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let listener = TlsListener {
+            tcp,
+            tls: tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+        };
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        (format!("https://{addr}"), ca.pem())
+    }
+
+    /// A Vault on a private CA is unreachable with the bundled roots and
+    /// reachable once that CA is supplied via a CA file.
+    #[tokio::test]
+    async fn private_ca_needs_cacert() {
+        let (addr, ca_pem) = spawn_tls_fake_vault().await;
+
+        let plain = VaultClient::new(&addr, "secret", "tok");
+        let err = format!(
+            "{:#}",
+            plain
+                .kv2_field("infra/default", "password")
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("UnknownIssuer"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join("test-only-throwaway-ca.pem");
+        std::fs::write(&ca_file, ca_pem).unwrap();
+        let trusting = VaultClient::with_cacert(&addr, "secret", "tok", &ca_file).unwrap();
+        assert_eq!(
+            trusting
+                .kv2_field("infra/default", "password")
+                .await
+                .unwrap(),
+            SECRET
+        );
+    }
+
+    #[test]
+    fn bad_cacert_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.pem");
+        let err = format!(
+            "{:#}",
+            VaultClient::with_cacert("https://x", "secret", "tok", &missing).unwrap_err()
+        );
+        assert!(err.contains("cannot read vault CA file"), "{err}");
+
+        let garbage = dir.path().join("garbage.pem");
+        std::fs::write(&garbage, "not a certificate\n").unwrap();
+        let err = format!(
+            "{:#}",
+            VaultClient::with_cacert("https://x", "secret", "tok", &garbage).unwrap_err()
+        );
+        assert!(err.contains("no PEM certificate"), "{err}");
+
+        let corrupt = dir.path().join("corrupt.pem");
+        std::fs::write(
+            &corrupt,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(VaultClient::with_cacert("https://x", "secret", "tok", &corrupt).is_err());
     }
 
     #[test]
@@ -211,7 +405,15 @@ mod tests {
     fn kv_path_validation() {
         validate_kv_path("infra/default").unwrap();
         validate_kv_path("infra/router/sudo").unwrap();
-        for bad in ["", "/infra/default", "infra/", "infra/../root", "infra//x", "a?b=c", "a b"] {
+        for bad in [
+            "",
+            "/infra/default",
+            "infra/",
+            "infra/../root",
+            "infra//x",
+            "a?b=c",
+            "a b",
+        ] {
             assert!(validate_kv_path(bad).is_err(), "accepted {bad:?}");
         }
     }
