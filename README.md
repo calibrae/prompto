@@ -37,6 +37,7 @@ Every call is **capability-gated** by the per-host allowlist in the inventory. A
 - On success it is a field of the JSON result (`vm_list`, which returns an array, gets it in a second `[request_id=…]` text block instead).
 - On error it is in `error.data.request_id` and leads the message: `[request_id=… error_class=…] …`.
 - `GET /log` returns it in the `X-Prompto-Request-Id` header.
+- The [audit record](#audit-log) of the call carries the same ID.
 - Classified failures are logged to journald with it.
 - The remote command sees it as `PROMPTO_REQUEST_ID`, so host-side logs can be joined with prompto's:
   - On `linux` and `macos` hosts the remote command is prefixed with `export PROMPTO_REQUEST_ID=…;`.
@@ -166,8 +167,8 @@ disabled = false
 - The stdio transport is always agent `local`.
 - Any other `PROMPTO_AUTH` value stops the server at startup, so a typo can't silently mean `off`.
 - Tokens are hashed, then compared in constant time against every entry.
-- Agent names use `[a-z0-9_-]`; `anonymous` and `local` are reserved. Names and groups are what [policy](#policy-policytoml) keys on, and the audit log (E4) will.
-- Until those land, the agent and session appear in the journald line of every failed call: `tool call failed request_id=… agent="builder" session_id="…"`.
+- Agent names use `[a-z0-9_-]`; `anonymous` and `local` are reserved. Names and groups are what [policy](#policy-policytoml) keys on, and what the [audit log](#audit-log) records.
+- Every call is attributed in the audit log; failed calls also get a journald line: `tool call failed request_id=… agent="builder" session_id="…"`.
 - Tool results don't echo the agent. The caller knows who it is, and an unchanged result shape keeps `off` byte-identical.
 
 **Session context.** A client may send `X-Prompto-Session: <id>` (the Claude session ID). It is context for the logs, never proof of identity: any holder of a role token can claim any session. Values over 128 characters or outside `A-Za-z0-9._:-` are dropped with a warning; the call itself proceeds. With `off` the header is ignored entirely.
@@ -230,7 +231,7 @@ approval = "human"                 # none (default) | ticket | human
 - **tools**: an entry matches the tool name (`*`, `?`).
 - **sudo**: root-capable calls are a **separate grant**. They match only rules with `sudo = true`, and those rules match only them. So `tools = ["*"]` grants every ordinary tool and nothing that runs as root. Root-capable: `ssh_sudo_exec`, `file_write` with `sudo = true`, `service_control`, `host_sleep`, `service_logs` / `mcp_logs` / `GET /log` (journal via sudo), and `vm_stop`.
 
-**`sudo = false` is not "no root".** `sudo = true` gates prompto's *own* root paths, nothing more. The exec tools (`ssh_exec`, `ssh_batch`, `bash_exec`, `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `claude_exec`, and `mcp_add`, whose stdio command runs on the client) run whatever the agent sends, as the host's `ssh_user`. So an exec grant on a host is a shell as that user, and that is root wherever the user is `root` or can `sudo` without a password: `ssh_exec "sudo -n …"` needs no `sudo = true` rule there. prompto does not try to police command strings (`sh -c`, quoting and aliases make that unreliable). Grant exec tools only where that shell is acceptable, and mark each host's `nopasswd_sudo` in the inventory so `policy lint` can tell you where it isn't. The list of exec tools lives in one place in the code (`authz::ARBITRARY_EXEC_TOOLS`); every tool is classified as root-capable, exec or ordinary, and a test fails on one that isn't.
+**`sudo = false` is not "no root".** `sudo = true` gates prompto's *own* root paths, nothing more. The exec tools (`ssh_exec`, `ssh_batch`, `bash_exec`, `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `claude_exec`, `mcp_add`, whose stdio command runs on the client, and `file_write` without `sudo` and `rsync_sync`, because writing `~/.bashrc`, a crontab or a user unit is code execution) run whatever the agent sends, as the host's `ssh_user`. So an exec grant on a host is a shell as that user, and that is root wherever the user is `root` or can `sudo` without a password: `ssh_exec "sudo -n …"` needs no `sudo = true` rule there. prompto does not try to police command strings (`sh -c`, quoting and aliases make that unreliable). Grant exec tools only where that shell is acceptable, and mark each host's `nopasswd_sudo` in the inventory so `policy lint` can tell you where it isn't. The list of exec tools lives in one place in the code (`authz::ARBITRARY_EXEC_TOOLS`); every tool is classified as root-capable, exec or ordinary, and a test fails on one that isn't.
 
 **Approval.** A rule with `approval = "ticket"` or `"human"` refuses what it matches with `approval_required`: tickets and human approval are not implemented yet, so such a rule fails closed rather than allowing anything.
 
@@ -248,7 +249,7 @@ build-2 but without sudo). Ask the operator for a policy.toml rule if you need i
 
 Allowed calls log `policy allow request_id=… agent=… tool=… host=… root=… rule=…` at info level. `GET /log` answers a policy refusal with 403.
 
-**Loading.** Reloaded on SIGHUP, independently of the inventory and `agents.toml`. A malformed file at startup stops the server. On reload it **fails closed**: the previous policy is dropped (it may be broader than the one being written), every call is denied with `policy file invalid since <time>: <error>` in the refusal, and an error is logged (`POLICY FILE INVALID`), until a valid file is loaded with another SIGHUP. A **missing** file also means *deny every call*, with a loud warning at startup and on each reload. The server lints the policy at startup and after every reload, and logs the findings. They never block loading: a rule naming something that doesn't exist simply grants nothing.
+**Loading.** Reloaded on SIGHUP, independently of the inventory and `agents.toml`. A malformed file at startup stops the server. On reload it **fails closed**: the previous policy is dropped (it may be broader than the one being written), every call is denied with `policy file invalid since <time>` in the refusal (the parser's error and the file's path go to the journal only, not to agents), and an error is logged (`POLICY FILE INVALID`), until a valid file is loaded with another SIGHUP. A **missing** file also means *deny every call*, with a loud warning at startup and on each reload. The server lints the policy at startup and after every reload, and logs the findings. They never block loading: a rule naming something that doesn't exist simply grants nothing.
 
 **Checking a policy:**
 
@@ -275,6 +276,44 @@ Plain-text journal tail for scripts and dashboards. It has the same gate as `ser
 
 - With `PROMPTO_AUTH` `off` or `optional` it is **unauthenticated**: anyone who can reach the listener can read journals on any `sudo_exec` host. Keep the listener behind a trusted proxy or firewall.
 - With `required`, send `Authorization: Bearer <token>`.
+
+## Audit log
+
+Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (default `/var/lib/prompto/audit.jsonl`), whatever `PROMPTO_AUTH` says. That includes refusals (`unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`), calls whose arguments don't parse, `GET /log` (recorded as `service_logs`), and every 401. It is separate from the token-savings usage log.
+
+```json
+{"ts":"2026-10-09T11:50:02.113Z","type":"tool","request_id":"01M4G…","agent":"builder","agent_groups":["ops"],
+ "session_id":"…","client_ip":"192.0.2.10","user_agent":"claude-code/2.1.289","tool":"ssh_exec","host":"build-1",
+ "queried_as":"b1","args":{"host":"b1","cmd":"systemctl is-active nginx"},"decision":"allow",
+ "rule":"policy.toml:2 (builder-exec)","approval":"none","approved_by":null,"exit_code":0,"ok":true,
+ "error_class":null,"duration_ms":212,"bytes":187}
+```
+
+- **Who:** `agent` (`anonymous`, `local` for stdio, `-` with auth off), its `agent_groups`, the client's `session_id`, `client_ip` and `user_agent`.
+- **What, where:** `tool`; `host` is the inventory name the call resolved to and `queried_as` what the caller typed when that differs (an alias, or an unknown name, with `host` then `null`). `rsync_sync` adds `dest_host` / `dest_queried_as`. `ssh_batch` is one record with the whole `commands` list.
+- **`args`:** commands are recorded **in full** (`cmd`, `commands`, `bash_exec`'s `script`, `claude_exec`'s `task`). File contents (`file_write`'s `content`) and code bodies (`python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`) become `{"sha256": …, "len": …}`. Any field whose name contains `password`, `passwd`, `passphrase`, `token`, `secret`, `key` or `credential` becomes `"[redacted]"` (so `rsync_sync`'s `dest_key` path does too). The vault sudo password is never an argument: it is fetched inside the SSH layer, after the record's arguments were taken from the request.
+- **Decision:** `decision` is `allow` (authorization passed), `deny` (refused before anything ran) or `null` (the arguments were invalid before authorization). `rule` is the deciding policy rule, `approval` its approval mode; `approved_by` is always `null` until approvals ship.
+- **Outcome:** `ok` means the call did what was asked: no error *and* any remote command exited 0 without timing out. It is stricter than the gain log's notion of success, since `ssh_exec` returns a non-zero exit as a result, not an error. When `ok` is false, `error_class` says why (below) and `exit_code` carries the exit status when there is one. `bytes` is the size of the response.
+- **401s** have no tool call; they are `"type":"auth"` records with `reason` (`missing bearer token`, `invalid bearer token`, `revoked token`, `session belongs to another agent`) and `path`. They come from unauthenticated peers, so they are rate-limited (a burst of 60, then one per second); the next one written says how many were dropped (`suppressed`). The journal keeps its own warning line for each.
+
+**`error_class`** is one enum for every failure of every tool, the same one MCP errors carry in `error.data.error_class`: `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`, `invalid_args`, `ssh_connect`, `ssh_auth`, `timeout`, `sudo_guard` (the vault sudo guard, exit 97: the host has a passwordless rule), `remote_nonzero`, `vault`, `upstream` (the apytti gateway behind `claude_exec`), `internal`, rsync's `rsync_*` / `dest_ssh_*`, and the reserved `killed` and `refused_ticket`. An error that reaches the end of a tool without a class is a bug: it is reported as `internal` and logged as `BUG: tool error without an error_class`; a test drives every tool into every failure it can force and fails on one.
+
+**journald.** The same record is a `tracing` event at target `prompto::audit`. Under systemd it goes to the journal as structured fields prefixed `AUDIT_` (`journalctl -u prompto AUDIT_AGENT=builder AUDIT_DECISION=deny`, `-o verbose` to see them; the record's `type` is `AUDIT_RECORD_TYPE`). Outside systemd it is a log line on stderr. It is emitted before the file is written, so the journal has the record even if the write fails.
+
+**Failure policy.** With `PROMPTO_AUTH` `optional` or `required`, no action goes unaudited: a log that can't be opened stops the server at startup, and a call is refused *before it runs* (`internal`, `refused: prompto cannot write its audit log…`, an error in the journal) unless the log is open and the last write succeeded. A write that fails after a call ran (the disk filled mid-call) can't undo it — its record is in the journal — and every later call is refused until a write succeeds again. With `off` the record is still written (agent `-`), but a failure only warns: production keeps working when its audit disk doesn't.
+
+**Querying:**
+
+```bash
+prompto audit --since 10m                       # table, oldest first
+prompto audit --agent builder --decision deny   # every refusal for one agent
+prompto audit --host build-1 --tool ssh_sudo_exec --since 2026-10-09T08:00:00Z
+prompto audit --request-id 01M4G… --json        # the raw record
+```
+
+Filters combine; `--host` matches `host`, `queried_as` or rsync's dest; `--since` takes `30s`/`10m`/`2h`/`7d`/`1w` or a time (RFC 3339, or `YYYY-MM-DD[THH:MM[:SS]]` in UTC). Rotated siblings (`audit.jsonl.1`, `audit.jsonl.2.gz`, …) are read too, oldest first, skipping those last written before `--since`.
+
+**Permissions and rotation.** prompto creates the file `0640`. The intended layout is `prompto:prompto-audit`, with readers in the `prompto-audit` group: `deploy/install.sh` creates the group and the file that way, and `deploy/logrotate.d/prompto-audit` keeps it so on rotation. Readers also need to traverse `/var/lib/prompto` (`0750 prompto:prompto`), e.g. `setfacl -m g:prompto-audit:x /var/lib/prompto`. If prompto has to create the file itself, `PROMPTO_AUDIT_GROUP` gives it that group (prompto must be a member). Rotation is rename-based and needs no signal: before each write prompto compares the path with the file it has open and reopens after a rename. Don't use `copytruncate`: lines written between its copy and its truncate are lost. The snippet uses `delaycompress`, so the file just rotated away is never compressed while a write may still land in it.
 
 ## Token-savings analytics
 
@@ -308,6 +347,8 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_AGENTS` | `/etc/prompto/agents.toml` | Agent token hashes. Missing file = no agents; unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto agent`. |
 | `PROMPTO_POLICY` | `/etc/prompto/policy.toml` | Policy rules. Missing file = deny every call (loud warning); unreadable or malformed = startup error. Not read at all with `PROMPTO_AUTH=off`. Also used by `prompto policy`. |
 | `PROMPTO_USAGE_LOG` | `/var/lib/prompto/usage.jsonl` | Append-only event log for `prompto_gain`. |
+| `PROMPTO_AUDIT_LOG` | `/var/lib/prompto/audit.jsonl` | The [audit log](#audit-log). Always written; with `PROMPTO_AUTH` on, a log that can't be opened is a startup error. Also used by `prompto audit`. |
+| `PROMPTO_AUDIT_GROUP` | unset | Group (name or gid) for an audit file prompto creates itself. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
@@ -319,6 +360,7 @@ CLI:
 - `gain` runs the analytics report and exits.
 - `agent add|list|revoke` manages agent tokens and exits.
 - `policy check|lint` dry-runs a call against the policy, or lints it, and exits.
+- `audit [filters]` queries the audit log and exits.
 
 ## Registering with Claude Code
 
@@ -356,7 +398,7 @@ Keep `token` at `0600`. Rotating then means replacing one file, and the token ne
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
 scp target/x86_64-unknown-linux-musl/release/prompto YOUR-HOST:/tmp/
-scp deploy/{install.sh,prompto.service,env.example,prompto.toml.example} YOUR-HOST:/tmp/
+scp -r deploy/{install.sh,prompto.service,env.example,prompto.toml.example,logrotate.d} YOUR-HOST:/tmp/
 ssh YOUR-HOST 'sudo /tmp/install.sh /tmp/prompto'
 ssh YOUR-HOST 'sudo systemctl enable --now prompto'
 ```

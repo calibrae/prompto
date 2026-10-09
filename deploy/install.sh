@@ -28,6 +28,17 @@ if ! id prompto >/dev/null 2>&1; then
 fi
 
 install -d -o prompto -g prompto -m 0750 /var/lib/prompto
+
+# Audit log: prompto:prompto-audit 0640, readable by the prompto-audit
+# group (add auditors to it; they also need to traverse /var/lib/prompto,
+# e.g. setfacl -m g:prompto-audit:x /var/lib/prompto).
+getent group prompto-audit >/dev/null || groupadd --system prompto-audit
+if [[ ! -e /var/lib/prompto/audit.jsonl ]]; then
+    install -m 0640 -o prompto -g prompto-audit /dev/null /var/lib/prompto/audit.jsonl
+fi
+if [[ -d /etc/logrotate.d && -f "$HERE/logrotate.d/prompto-audit" ]]; then
+    install -m 0644 "$HERE/logrotate.d/prompto-audit" /etc/logrotate.d/prompto-audit
+fi
 install -d -m 0755 /opt/prompto /opt/prompto/bin
 install -d -o root -g prompto -m 0750 /etc/prompto /etc/prompto/keys
 

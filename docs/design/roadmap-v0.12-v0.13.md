@@ -93,7 +93,7 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   - Root-capable is a **flag on the rule** (`sudo = true`), not a pseudo-tool name. A call is root-capable when it needs `sudo_exec`, or it is `vm_stop`. Rules match only calls of their own kind, so `tools = ["*"]` can't leak root, and a glob can't be written that does.
   - `approval = "ticket" | "human"` refuses with the new class `approval_required` until E6. Lint warns about it.
   - Errors carry `rule` in `error.data`. The journald `tool call failed` line has it too, and allows log `policy allow … rule=…`. The rule is `policy.toml:<line>`, with ` (<id>)` when set, or `default-deny`.
-  - Policy is loaded only in optional/required. With `off` it is never read, as with `agents.toml`. A missing file is deny-all with a loud warning; a malformed one is fatal at startup and, on SIGHUP, **fails closed**: deny-all, with `policy file invalid since <time>: <error>` in refusals, until a valid file is loaded (task 008; it used to keep the previous policy).
+  - Policy is loaded only in optional/required. With `off` it is never read, as with `agents.toml`. A missing file is deny-all with a loud warning; a malformed one is fatal at startup and, on SIGHUP, **fails closed**: deny-all, with `policy file invalid since <time>` in refusals (parser detail and path in the journal only, task 009), until a valid file is loaded (task 008; it used to keep the previous policy).
   - `sudo = true` gates prompto's own root paths only. An exec grant is a shell as `ssh_user`, which is root where that user is root or has passwordless sudo. Inventory `nopasswd_sudo` (optional) feeds a lint warning, and every tool is classified root-capable / arbitrary exec / ordinary, enforced by a test (task 008).
   - With policy on, `inventory_list` lists only hosts the agent has a grant on, and `sudo_password_vault_path` appears only with a `sudo = true` grant on that host (also in `inventory_get_host`). `off` output is unchanged. `tools/list` is not filtered (owner decision, task 008).
   - Lint: an agent group nobody is in is a warning, not an error (owner decision, task 008).
@@ -110,6 +110,15 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S4.4 `error_class` enum:** `refused_policy`, `refused_capability`, `refused_self_target`, `refused_ticket`, `killed`, `ssh_connect`, `timeout`, `sudo_guard`, `remote_nonzero`, `internal`.
 - **S4.5 Query CLI:** `prompto audit [--agent] [--host] [--tool] [--since] [--request-id] [--json]`.
 - **S4.6 Rotation:** a logrotate snippet in `deploy/`; README section.
+- **Done (task 009).** Decisions (details in the design note, §3):
+  - Default path `/var/lib/prompto/audit.jsonl` (`PROMPTO_AUDIT_LOG`), created `0640`; `PROMPTO_AUDIT_GROUP` for the group when prompto creates it; `deploy/install.sh` creates `prompto-audit` and the file.
+  - Written in every auth mode. Auth on: a call the log can't record is refused before it runs (`internal`), and a log that can't be opened stops startup. Auth off: agent `-`, write failures only warn.
+  - 401s are `type = auth` records, rate-limited. Calls whose arguments don't parse and unknown tools are recorded too.
+  - Redaction by field name; bash `script` kept whole like `cmd`, other interpreters' `script` hashed.
+  - `ok` = no error and exit 0 / no timeout; `decision` = `allow` / `deny` / `null` (invalid args before authorization).
+  - `ErrorClass` covers every error path (new `sudo_guard`, `vault`, `upstream`; reserved `killed`, `refused_ticket`); unclassified errors are counted and a sweep test over `tools/list` holds them at zero.
+  - Rotation by rename detection (stat before each write), not SIGHUP and never `copytruncate`.
+  - E3 leftovers: `file_write` (non-sudo) and `rsync_sync` are arbitrary exec for the lint; the invalid-policy refusal says only `policy file invalid since <time>`.
 
 ### E5 — Kill switches (v0.12.0)
 - **S5.1 Global kill file** `/etc/prompto/kill`, checked per call, no restart. Every call is refused with a fixed message and audited as `killed`.
