@@ -237,7 +237,21 @@ The migration runs end to end in the sandbox, under load, before it touches prod
 
   Every unexpected failure is fixed or the step redesigned.
 - **S12.5 Runbook.** Each step lists its precondition, command, verification, rollback and the continuity evidence from S12.4.
+- **S12.7 Decisions the runbook must record:** OpenBao unseal mode (manual vs auto-unseal from a key file); break-glass access that depends neither on the prompto host nor on the shared sudo password; backups of OpenBao data, the Kanidm DB and prompto's config (policy, agents, approvers) into the existing backup system; rotation of the shared sudo password as a planned step once vault-backed sudo runs on OpenBao.
 - **S12.6 (candidate, not scheduled) launchd backend for `service_*` on macOS.** `service_control` / `service_logs` are systemd-only and refuse a macOS host today. A backend would map the actions onto `launchctl` (`kickstart -k`, `bootout`/`bootstrap`, `enable`/`disable`, `print` for status) for `system/<label>` and `gui/<uid>/<label>` domains, and logs onto `log show --predicate 'subsystem == …'`. Raised by the macOS bench (task 016); decide scope (system vs user agents, plist installation out of scope) before building.
+
+### E13 — Critical infrastructure redundancy (after the migration)
+The control plane (prompto, OpenBao, Kanidm, the TLS front) lives in one VM, which runs on one physical host together with DNS and git. A replica on the same physical host covers software failure only, so the replicas go on other physical machines.
+- **S13.1 Topology.** Three physical machines:
+  - primary on the current host (UPS-backed);
+  - a replica Linux VM on a second always-on machine;
+  - a tiny OpenBao voter VM on a third.
+  The hosts can be macOS: Linux VMs under tart, as in the macOS bench.
+- **S13.2 OpenBao.** Raft integrated storage with 3 voters, one per physical machine, so one machine can be lost with automatic leader failover. TLS between nodes. The unseal mode follows S12.7's decision (auto-unseal changes the trade-off when nodes restart independently). Snapshot backups.
+- **S13.3 Kanidm.** Native replication between the primary and the replica. Clients and OIDC point at a name that fails over.
+- **S13.4 prompto.** Active/standby behind a floating IP (keepalived/VRRP) shared with the TLS front. Config (policy, agents, approvers, inventory) comes from one git source with SIGHUP/auto-reload on both. The audit is written locally and shipped, so no shared file is needed. Single-use ticket and TOTP state must not fork across nodes: either strictly active/standby, or state kept in OpenBao. Decide and justify.
+- **S13.5 Failover drill in the sandbox.** Kill the primary under the E12 load generator and count failed calls and recovery time, then fail back. Pass criteria are set beforehand.
+- **S13.6 Power.** Record which nodes are UPS-backed and verify auto-restart after power loss. A mains cut that takes the unprotected replicas down must leave the UPS-backed primary serving.
 
 ---
 
@@ -246,10 +260,11 @@ The migration runs end to end in the sandbox, under load, before it touches prod
 |---|---|
 | v0.12.0 ✅ | E0, E1, E2, E3, E4, E5 — attributable, policed, audited, killable (shipped 2026-10-09) |
 | v0.12.1 ✅ | E6, E7 — precheck, tickets, Claude Code plugin with approval pane |
-| v0.12.2 | S0.3 — 14 unused tools removed; advisor steers to the typed tools; plugin: one prompt per approval, no `token_file` |
+| v0.12.2 ✅ | S0.3 — 14 unused tools removed; advisor steers to the typed tools; plugin: one prompt per approval, no `token_file` |
 | v0.12.x | E9 — Kanidm OIDC; flip to `required` |
 | v0.13.0 | E8 — per-call SSH certificates, static key retired host by host |
 | (gate) | E11 + E12: continuity proven and the migration rehearsed in the sandbox. Production moves only after this |
+| after migration | E13 — critical infra redundancy across three physical machines |
 
 ## Critical files
 - `src/server.rs` — auth middleware, `/v1/precheck`, `/v1/approve`, `/log` gating
