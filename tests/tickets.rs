@@ -749,7 +749,7 @@ async fn precheck_agrees_with_every_tool_and_runs_nothing() {
             (name, args)
         })
         .collect();
-    assert!(tools.len() >= 24, "tools/list looks short");
+    assert!(tools.len() >= 21, "tools/list looks short");
     let mut sudo_write = args_for("file_write");
     sudo_write["sudo"] = true.into();
     tools.push(("file_write".into(), sudo_write));
@@ -800,7 +800,7 @@ async fn precheck_agrees_with_every_tool_and_runs_nothing() {
     );
     // Not vacuous: nearly every tool went through both paths.
     assert!(
-        ticketed >= 18 && asked >= 6,
+        ticketed >= 15 && asked >= 6,
         "ticketed {ticketed}, asked {asked}"
     );
 }

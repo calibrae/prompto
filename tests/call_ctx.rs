@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
 done
 [ "$1" = "--" ] && shift
 case "$target" in
-  127.0.0.20|127.0.0.21|127.0.0.23) umask 022; PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
+  127.0.0.20|127.0.0.21|127.0.0.23|127.0.0.26) umask 022; PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
   127.0.0.25) PATH="$dir" exec /bin/sh -c "$*" ;;
 esac
 exit 0
@@ -79,6 +79,24 @@ esac
 "#;
 
 const FAKE_ROOT_WHOAMI: &str = "#!/bin/sh\necho root\n";
+
+/// `virsh -c URI list --all` / `virsh -c URI domstate <vm>`: domains
+/// `web` (running) and `db` (shut off).
+const FAKE_VIRSH: &str = r#"#!/bin/sh
+shift 2
+case "$1" in
+  list) printf ' Id   Name   State\n---------------------\n 1    web    running\n -    db     shut off\n' ;;
+  domstate) case "$2" in
+    web) echo running ;;
+    db) echo 'shut off' ;;
+    *) echo "error: failed to get domain '$2'" >&2; exit 1 ;;
+  esac ;;
+esac
+"#;
+
+/// GNU `stat -c FORMAT -- path`, on any test machine.
+const FAKE_STAT: &str =
+    "#!/bin/sh\necho '640|12|admin|wheel|2026-10-10 12:00:00.5 +0200|regular file|/etc/x'\n";
 
 const INVENTORY: &str = r#"
 # The test client connects from 127.0.0.1: targeting `loopback` is
@@ -128,6 +146,13 @@ ip = "127.0.0.25"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 capabilities = ["exec"]
+
+# A hypervisor; `virsh` and `stat` are the fakes below.
+[host.hyper]
+ip = "127.0.0.26"
+ssh_user = "admin"
+ssh_key = "/dev/null"
+capabilities = ["exec", "virt"]
 
 [host.vaulted]
 ip = "127.0.0.21"
@@ -181,6 +206,8 @@ async fn spawn_server() -> Server {
     std::fs::create_dir(&rootbin).unwrap();
     write_exe(&rootbin.join("id"), FAKE_ROOT_ID);
     write_exe(&rootbin.join("whoami"), FAKE_ROOT_WHOAMI);
+    write_exe(&dir.path().join("virsh"), FAKE_VIRSH);
+    write_exe(&dir.path().join("stat"), FAKE_STAT);
 
     let vault = VaultClient::new(spawn_fake_vault().await, "secret", "tok");
     let cancel = CancellationToken::new();
@@ -354,7 +381,7 @@ async fn every_host_contacting_tool_refuses_self_targeting() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 24, "tools/list looks short: {tools:?}");
+    assert!(tools.len() >= 21, "tools/list looks short: {tools:?}");
 
     let mut wrong = Vec::new();
     for tool in &tools {
@@ -607,4 +634,72 @@ async fn ssh_batch_on_windows_is_refused() {
         "{resp}"
     );
     assert!(s.argv_log().is_empty(), "{}", s.argv_log());
+}
+
+/// v0.12.3 merged `vm_state` into `vm_list`: `vm` narrows the list to
+/// that domain, same row shape, and a domain that doesn't exist is an
+/// error, not an empty list.
+#[tokio::test]
+async fn vm_list_with_vm_is_that_domains_row() {
+    let s = spawn_server().await;
+    let resp = call(&s, "vm_list", json!({ "host": "hyper" })).await;
+    let all: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        all,
+        json!([{ "name": "web", "state": "running" }, { "name": "db", "state": "shut off" }])
+    );
+    let resp = call(&s, "vm_list", json!({ "host": "hyper", "vm": "db" })).await;
+    let one: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(one, json!([{ "name": "db", "state": "shut off" }]));
+    assert!(s.argv_log().contains("domstate db"), "{}", s.argv_log());
+    let resp = call(&s, "vm_list", json!({ "host": "hyper", "vm": "nope" })).await;
+    assert_eq!(
+        resp["error"]["data"]["error_class"], "remote_nonzero",
+        "{resp}"
+    );
+    // The name is checked before it reaches a shell.
+    let resp = call(&s, "vm_list", json!({ "host": "hyper", "vm": "a;b" })).await;
+    assert_eq!(
+        resp["error"]["data"]["error_class"], "invalid_args",
+        "{resp}"
+    );
+}
+
+/// v0.12.3 merged `file_stat` into `file_list`: `stat_only` returns what
+/// `file_stat` did (plus `path`), and runs `stat`, not `ls`.
+#[tokio::test]
+async fn file_list_stat_only_is_the_old_file_stat() {
+    let s = spawn_server().await;
+    let v = ok_payload(
+        &call(
+            &s,
+            "file_list",
+            json!({ "host": "hyper", "path": "/etc/x", "stat_only": true }),
+        )
+        .await,
+    );
+    assert_eq!(v["host"], "hyper", "{v}");
+    assert_eq!(v["path"], "/etc/x", "{v}");
+    assert_eq!(v["stat"]["mode"], "640", "{v}");
+    assert_eq!(v["stat"]["size"], 12, "{v}");
+    assert_eq!(v["stat"]["kind"], "regular file", "{v}");
+    assert!(v["raw"].as_str().unwrap().starts_with("640|"), "{v}");
+    let argv = s.argv_log();
+    assert!(
+        argv.contains("stat -c") && !argv.contains("ls -la"),
+        "{argv}"
+    );
+    // A bad path is refused before anything runs, as for a listing.
+    let resp = call(
+        &s,
+        "file_list",
+        json!({ "host": "hyper", "path": "/etc/x;id", "stat_only": true }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["data"]["error_class"], "invalid_args",
+        "{resp}"
+    );
 }

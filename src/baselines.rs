@@ -52,15 +52,12 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("host_status", 180),
     ("host_wake", 80),
     ("host_sleep", 120),
-    // Composite probe replacing ~5 round-trips of small commands
-    // (uptime/free/df/ss/systemctl --failed/uname). Observed 476 tok on
-    // the single recorded call.
-    ("host_diagnose", 1400),
     // ── vm_* ─────────────────────────────────────────────────────────
     // `virsh list --all` is a bordered table; the typed form is compact
-    // JSON. Observed median 59 tok. v3 numbers hold.
+    // JSON. Observed median 59 tok. v3 numbers hold. (`vm_list` with
+    // `vm`, the old `vm_state`, is credited the same: one baseline per
+    // tool.)
     ("vm_list", 280),
-    ("vm_state", 90),
     ("vm_start", 110),
     ("vm_stop", 360),
     ("vm_ensure_up", 420),
@@ -94,8 +91,9 @@ pub const BASELINES: &[(&str, u32)] = &[
     // Writes are the opposite shape: output is a fixed ack (~26 tok)
     // while the counterfactual is tee-over-ssh plus shell-quoting hell.
     ("file_write", 250),
+    // `file_list` with `stat_only` (the old `file_stat`, 150) is credited
+    // as a listing: one baseline per tool, so its few calls over-claim.
     ("file_list", 400),
-    ("file_stat", 150),
     ("port_scan", 200),
     ("service_control", 350),
     // ── inventory_* ──────────────────────────────────────────────────
@@ -141,24 +139,11 @@ mod tests {
     /// tool silently gives it baseline 0 — it would record as pure cost
     /// and quietly drag the reported gain down.
     ///
-    /// The advertised list is parsed from the same `Tools: …` sentence in
-    /// the server instructions that clients see, so the two cannot drift
-    /// apart unnoticed.
+    /// The advertised tools are the router's: what `tools/list` serves.
     #[test]
     fn baselines_cover_exactly_the_advertised_tools() {
-        let info = crate::mcp::instructions();
-        let list = info
-            .split("Tools: ")
-            .nth(1)
-            .expect("instructions must contain a `Tools: ` list")
-            .split('.')
-            .next()
-            .expect("tool list must end with a period");
-        let advertised: HashSet<&str> = list
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+        let names = crate::mcp::Prompto::tool_names();
+        let advertised: HashSet<&str> = names.iter().map(String::as_str).collect();
         let have: HashSet<&str> = BASELINES.iter().map(|(t, _)| *t).collect();
 
         let missing: Vec<_> = advertised.difference(&have).collect();

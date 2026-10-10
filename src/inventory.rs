@@ -474,7 +474,7 @@ impl Inventory {
                 format!(
                     "host {name}: {} removed in {} and ignored; delete it from the inventory",
                     h.removed.join(", "),
-                    crate::authz::REMOVED_IN
+                    crate::authz::CLAUDE_CAPS_REMOVED_IN
                 )
             })
             .collect();
@@ -492,7 +492,7 @@ impl Inventory {
                 hosts = %w.join("; "),
                 "inventory: the claude_admin / claude_exec capabilities and apytti_url belong \
                  to tools removed in {}; they are ignored (logged once)",
-                crate::authz::REMOVED_IN
+                crate::authz::CLAUDE_CAPS_REMOVED_IN
             );
         }
     }
@@ -627,7 +627,7 @@ capabilities = ["exec"]
             vec![format!(
                 "host mac: capability claude_admin, capability claude_exec, apytti_url removed \
                  in {} and ignored; delete it from the inventory",
-                crate::authz::REMOVED_IN
+                crate::authz::CLAUDE_CAPS_REMOVED_IN
             )]
         );
         assert!(inv.get("plain").unwrap().removed.is_empty());

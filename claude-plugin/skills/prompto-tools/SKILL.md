@@ -13,18 +13,31 @@ Use a typed tool where one exists. Its arguments are checked, its result is stru
 
 | To… | Use | Not |
 |---|---|---|
-| read or write a file | `file_read`, `file_write` (`sudo: true` for root-owned files), `file_list`, `file_stat` | `ssh_exec "cat …"`, heredocs |
+| read or write a file | `file_read`, `file_write` (`sudo: true` for root-owned files), `file_list` (`stat_only: true` for one path's own metadata) | `ssh_exec "cat …"`, `stat`, heredocs |
 | start, stop, restart or check a unit | `service_control` | `ssh_sudo_exec "systemctl …"` |
 | read a unit's journal | `service_logs` | `ssh_sudo_exec "journalctl …"` |
-| see whether a host is up | `host_status`, `host_diagnose` | `ssh_exec true` |
+| see whether a host is up | `host_status`; then `ssh_exec` for `uptime`, `df -h`, `systemctl --failed` | `ssh_exec true` |
 | copy a tree between hosts | `rsync_sync` | scp through a shell |
-| VMs | `vm_list`, `vm_state`, `vm_start`, `vm_stop`, `vm_ensure_up` | `virsh` in a shell |
+| VMs | `vm_list` (`vm: "<name>"` for one domain's state), `vm_start`, `vm_stop`, `vm_ensure_up` | `virsh` in a shell |
 | several commands in one go | `ssh_batch` | `a && b && c` in one `ssh_exec` |
 | a script | `bash_exec` (the body goes over stdin, no quoting); another language: `ssh_exec` with a heredoc, `python3 - <<'EOF'` | long `ssh_exec` one-liners |
 
 Use `ssh_exec` only for what no typed tool does. A result that ends with an `[advisor]` line names the typed tool for what you just did: use it next time. Use `ssh_sudo_exec` only when root is really needed. It is a separate grant, and it is the one most likely to need a human approval.
 
-`inventory_list` shows the hosts you have some grant on. Check it before guessing host names.
+`inventory_list` shows the hosts you have some grant on. Check it before guessing host names. The inventory is operator-managed: if a host is missing or lacks a capability, tell the user.
+
+## What the tools do that their one-line descriptions don't say
+
+- **`ssh_exec` / `ssh_sudo_exec`** run the command in the host's login shell. Known noisy output (cargo, git, journalctl, find, pkg, k8s, …) is compacted by a filter, named in the result's `filter`, with `original_bytes`; compound commands (`;`, `&&`, `||`, `&`, newlines) are never filtered. A command that exits non-zero is a result (`exit_code`, `error_class: remote_nonzero`), not an error.
+- **Sudo:** `ssh_sudo_exec` runs the **whole** command as root, every part of `a; b`, pipes and redirects included. A command of plain words goes through `sudo -n -- <cmd>` (so a narrow sudoers rule can match it); anything else through a root `sh` reading the command on stdin. On a host whose sudo needs a password, prompto fetches it from its vault: the password never reaches you. `file_write` with `sudo: true`, `service_control`, `service_logs` and `host_sleep` run as root too, and all need the host's `sudo_exec` capability and a `sudo = true` grant. `file_read` and `file_list` read as the ssh user only: for a root-only file, `ssh_sudo_exec "cat <path>"`.
+- **`ssh_batch`** runs the commands one after the other in one SSH session (`bash -c` each, `sh -c` on FreeBSD), and stops at the first failure unless `fail_fast: false` (skipped commands get `exit_code: null`). Its output is not filtered, so keep the commands tight. Use it for three or more commands on one host; the advisor says so after the fourth `ssh_exec`.
+- **`rsync_sync`** runs rsync **on `source_host`**, which logs into `dest_host` as dest's inventory `ssh_user` with its own SSH setup: prompto's keys are not there. If the two hosts don't already trust each other, it fails with `dest_ssh_auth`; `dest_key` names a key file **on the source host**, and is usually best left out. A trailing `/` on `source_path` copies the directory's contents, without it the directory itself. The result is rsync's `--stats` block. Use it rather than a series of `file_write` calls.
+- **`file_read`** returns at most `max_bytes` (64 KB by default, 1 MB at most); `truncated: true` means there is more. **`file_list`** follows a symlink to a directory; entries carry `mode`, `size`, `owner`, `group`, `mtime`, `is_dir`, `is_link` and, when set, `link_target`, ACLs and xattrs; a line it can't parse comes back in `unparsed`. `stat_only: true` returns `{ stat: { path, mode, size, owner, group, mtime, kind }, raw }` for the path itself. Paths take no whitespace or shell metacharacters.
+- **`file_write`** sends `content` over stdin, so nothing needs quoting; `mode` (octal, `"0644"`) is applied after the write.
+- **`service_control`** `status` drops the journal tail; read it with `service_logs` (`lines`, default 50). Both need systemd: on macOS or FreeBSD hosts use `ssh_exec` with `launchctl` / `service`.
+- **`vm_list`** with `vm` returns that domain's row (`[{name, state}]`), or an error if there is no such domain. **`vm_ensure_up`** wakes the hypervisor if it is down, waits for its SSH, then starts the VM if it isn't running: one call before VM work. **`vm_stop`** tries a suspend to disk, then a clean shutdown, then destroy, each step with `step_timeout_secs`.
+- **`host_sleep`** powers the host off; `host_wake` brings it back where the host has `wake`.
+- **A tool that no longer exists** (`host_diagnose`, `file_stat`, `vm_state` since v0.12.3; the interpreter runners and `mcp_*` since v0.12.2) is refused with what replaces it.
 
 ## Never call prompto against your own machine
 
@@ -66,7 +79,7 @@ Errors read `[request_id=… error_class=<class>] …`. Mention the `request_id`
 | `interpreter_missing` | `bash_exec`: bash isn't installed there (FreeBSD, OPNsense). | Use `ssh_exec`, which runs the host's own shell. |
 | `sudo_guard` | The vault sudo path refused a host that has a passwordless sudo rule (exit 97). | Tell the user; it is an inventory mismatch. |
 | `vault` | prompto couldn't get the host's sudo password from vault. | Tell the user. Don't retry in a loop. |
-| `rsync_*`, `dest_ssh_*` | `rsync_sync` failed in rsync, or on the destination's SSH. | Read the message: it says which end and why. |
+| `rsync_*`, `dest_ssh_*` | `rsync_sync` failed in rsync, or on the destination's SSH (`dest_ssh_auth`: the source host can't log into the destination). | Read the message: it says which end and why. For `dest_ssh_auth`, tell the user the two hosts don't trust each other. |
 | `internal` | prompto itself failed, for example its audit log can't be written. Calls are refused until it is fixed. | Stop and tell the user. |
 
 ## The user's commands

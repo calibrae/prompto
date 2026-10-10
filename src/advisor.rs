@@ -52,10 +52,11 @@ pub struct Hint {
     /// What the call did: `cat`, `head_tail`, `ls`, `stat`, `systemctl`,
     /// `journalctl`, `write`, `repeated_ssh_exec`, `repeated_file_write`.
     pub pattern: &'static str,
-    /// The typed tool suggested. One hint per tool: `cat` and `head_tail`
-    /// share `file_read`'s, and its cooldown.
+    /// The typed tool suggested.
     pub tool: &'static str,
-    /// The whole block, `[advisor] …`.
+    /// The whole block, `[advisor] …`. The cooldown is per text: `cat`
+    /// and `head_tail` share `file_read`'s hint, and its cooldown; `ls`
+    /// and `stat` both name `file_list`, with hints of their own.
     pub text: &'static str,
 }
 
@@ -70,7 +71,8 @@ const fn hint(pattern: &'static str, tool: &'static str, text: &'static str) -> 
 const FILE_READ: &str =
     "[advisor] file_read does this: typed, size-capped (max_bytes), policy-scoped.";
 const FILE_LIST: &str = "[advisor] file_list does this: typed entries (mode, size, owner, mtime).";
-const FILE_STAT: &str = "[advisor] file_stat does this: typed mode, size, owner, mtime, kind.";
+const FILE_STAT: &str =
+    "[advisor] file_list with stat_only=true does this: typed mode, size, owner, mtime, kind.";
 const SERVICE_CONTROL: &str = "[advisor] service_control does this (start/stop/restart/status/…).";
 const SERVICE_LOGS: &str = "[advisor] service_logs does this: journalctl -u <unit>, lines=N.";
 const FILE_WRITE: &str =
@@ -85,7 +87,7 @@ pub const HINTS: &[Hint] = &[
     hint("cat", "file_read", FILE_READ),
     hint("head_tail", "file_read", FILE_READ),
     hint("ls", "file_list", FILE_LIST),
-    hint("stat", "file_stat", FILE_STAT),
+    hint("stat", "file_list", FILE_STAT),
     hint("systemctl", "service_control", SERVICE_CONTROL),
     hint("journalctl", "service_logs", SERVICE_LOGS),
     hint("write", "file_write", FILE_WRITE),
@@ -210,7 +212,7 @@ impl Advisor {
             .then(|| by_pattern("repeated_file_write")),
         ];
         for h in fired.into_iter().flatten() {
-            if cooldown_passed(&mut g.last_hint, &call.who, h.tool, now) {
+            if cooldown_passed(&mut g.last_hint, &call.who, h.text, now) {
                 let s = &mut g.stats;
                 s.hints += 1;
                 s.bytes += h.text.len() as u64;
@@ -258,13 +260,13 @@ fn repeated(
 fn cooldown_passed(
     last: &mut HashMap<(String, &'static str), Instant>,
     who: &str,
-    tool: &'static str,
+    text: &'static str,
     now: Instant,
 ) -> bool {
     if last.len() > LAST_HINT_PRUNE {
         last.retain(|_, at| now.duration_since(*at) < COOLDOWN);
     }
-    let key = (who.to_owned(), tool);
+    let key = (who.to_owned(), text);
     match last.get(&key) {
         Some(prev) if now.duration_since(*prev) < COOLDOWN => false,
         _ => {
@@ -461,6 +463,34 @@ mod tests {
             );
             assert!(h.text.contains(h.tool), "{}", h.text);
         }
+    }
+
+    /// A hint never names a tool prompto no longer serves.
+    #[test]
+    fn hints_name_live_tools() {
+        let live = crate::mcp::Prompto::tool_names();
+        for h in HINTS {
+            assert!(live.iter().any(|t| t == h.tool), "{}", h.tool);
+            let words = h
+                .text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            for w in words {
+                assert!(crate::authz::removed_tool(w).is_none(), "{}", h.text);
+            }
+        }
+    }
+
+    /// `ls` and `stat` both point at `file_list`, but they are different
+    /// hints: one doesn't silence the other.
+    #[test]
+    fn hints_for_the_same_tool_have_their_own_cooldown() {
+        let a = Advisor::new();
+        let ls = a.record(&call("ssh_exec", Some("alpha"), Some("ls /etc"), "s1"));
+        let st = a.record(&call("ssh_exec", Some("alpha"), Some("stat /etc"), "s1"));
+        assert_eq!(ls.map(|h| h.pattern), Some("ls"));
+        assert_eq!(st.map(|h| h.pattern), Some("stat"));
+        let again = a.record(&call("ssh_exec", Some("alpha"), Some("stat /tmp"), "s1"));
+        assert_eq!(again, None);
     }
 
     #[test]

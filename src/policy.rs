@@ -1003,13 +1003,12 @@ pub fn lint(
                 // A tool removed from prompto: the rule still loads and
                 // grants nothing for it. An old policy file must not
                 // count as broken (`prompto policy lint` fails on errors).
-                (false, true) if authz::removed_tool(t.as_str()).is_some() => push(
+                (false, true) if let Some(r) = authz::removed_tool(t.as_str()) => push(
                     Level::Warning,
                     rule,
                     format!(
-                        "unknown tool {:?} (removed in {})",
-                        t.as_str(),
-                        authz::REMOVED_IN
+                        "unknown tool {:?} (removed in {}: {})",
+                        r.name, r.release, r.instead
                     ),
                 ),
                 (false, true) => push(Level::Error, rule, format!("unknown tool {:?}", t.as_str())),
@@ -1134,7 +1133,7 @@ pub fn prompto_host_findings(
 
 /// A plain (`sudo = false`) grant, on a `prompto_host`, of a tool that
 /// runs as `ssh_user` there with the `exec` capability — the shells,
-/// `bash_exec`, `file_*`, `rsync_sync` (either end), `host_diagnose` —
+/// `bash_exec`, `file_*`, `rsync_sync` (either end) —
 /// when that `ssh_user` is prompto's service user. That account reads the
 /// ticket key and TOTP files and `/etc/prompto/env` without any sudo.
 /// Silenced by `crown_jewel_ack` like [`root_on_prompto_host`].
@@ -1743,18 +1742,22 @@ approval = "ticket"
     /// An exec grant without `sudo = true` is a root shell wherever
     /// `ssh_user` is root or can sudo without a password: one warning per
     /// rule, naming the tools and each such host with its reason.
-    /// S0.3: a policy written before the tool removal still loads; the
+    /// A policy written before a tool removal still loads; the
     /// removed names are warnings, so `prompto policy lint` passes and
     /// approvals (blocked only by `prompto_host_errors`) stay on.
     #[test]
     fn lint_warns_on_removed_tools_and_they_block_nothing() {
         let src = "[[rule]]\nagents = [\"dev\"]\nhosts = [\"alpha\"]\n\
-                   tools = [\"claude_exec\", \"python_exec\", \"mcp_logs\", \"file_read\"]\n";
+                   tools = [\"claude_exec\", \"python_exec\", \"vm_state\", \"file_read\"]\n";
         let f = lint_of(src);
-        for t in ["claude_exec", "python_exec", "mcp_logs"] {
+        for (t, release) in [
+            ("claude_exec", "v0.12.2"),
+            ("python_exec", "v0.12.2"),
+            ("vm_state", "v0.12.3"),
+        ] {
+            let instead = authz::removed_tool(t).unwrap().instead;
             let want = format!(
-                "warning: policy.toml:1: unknown tool \"{t}\" (removed in {})",
-                authz::REMOVED_IN
+                "warning: policy.toml:1: unknown tool \"{t}\" (removed in {release}: {instead})"
             );
             assert!(f.contains(&want), "missing {want:?} in {f:#?}");
         }

@@ -1293,7 +1293,7 @@ async fn advisor_hints_once_and_is_recorded_and_counted() {
     assert_eq!(adv["by_pattern"]["cat"]["hints"], 1, "{gain}");
 }
 
-/// S0.3: a call to a removed tool (a client with a stale tool list) is
+/// A call to a removed tool (a client with a stale tool list) is
 /// refused with what replaces it, and recorded like any invalid call.
 #[tokio::test]
 async fn a_removed_tool_says_what_replaces_it() {
@@ -1317,5 +1317,18 @@ async fn a_removed_tool_says_what_replaces_it() {
         .unwrap();
     assert_eq!(r["error_class"], "invalid_args", "{r}");
     assert_eq!(r["decision"], Value::Null, "{r}");
+    // v0.12.3's merges name the tool that took them over.
+    for (tool, release, instead) in [
+        ("vm_state", "v0.12.3", "vm_list with vm="),
+        ("file_stat", "v0.12.3", "file_list with stat_only=true"),
+        ("host_diagnose", "v0.12.3", "host_status"),
+    ] {
+        let resp = call(&s, tool, json!({ "host": "run", "vm": "v", "path": "/x" })).await;
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&format!("{tool} was removed in {release}")) && msg.contains(instead),
+            "{resp}"
+        );
+    }
     assert!(s.argv_log().is_empty(), "{}", s.argv_log());
 }

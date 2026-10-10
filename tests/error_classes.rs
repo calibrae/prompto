@@ -227,7 +227,7 @@ async fn every_tool_failure_is_classified() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 24, "{tools:?}");
+    assert!(tools.len() >= 21, "{tools:?}");
 
     let mut missing = Vec::new();
     let mut check = |tool: &str, what: &str, resp: &Value| {
