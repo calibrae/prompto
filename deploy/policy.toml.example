@@ -64,7 +64,7 @@ sudo = true
 id = "build-exec"
 agents = ["group:build"]
 hosts = ["group:build"]
-tools = ["ssh_exec", "ssh_batch", "rsync_sync", "file_*", "host_status", "host_diagnose", "inventory_*"]
+tools = ["ssh_exec", "ssh_batch", "rsync_sync", "file_*", "host_status", "inventory_*"]
 
 # Web ops: drive and read services on the web hosts (root-capable tools).
 [[rule]]

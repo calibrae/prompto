@@ -13,7 +13,7 @@ approval = "ticket"
 id = "loadgen-exec"
 agents = ["group:loadgen"]
 hosts = ["sbx-t1", "sbx-t2"]
-tools = ["ssh_exec", "file_read", "file_write", "file_stat", "inventory_list"]
+tools = ["ssh_exec", "file_read", "file_write", "file_list", "inventory_list"]
 
 [[rule]]
 id = "loadgen-root"

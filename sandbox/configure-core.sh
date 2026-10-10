@@ -295,7 +295,7 @@ approval = "ticket"
 id = "dev-exec"
 agents = ["sbx-dev-agent"]
 hosts = ["group:lab"]
-tools = ["ssh_exec", "ssh_batch", "bash_exec", "file_*", "rsync_sync", "host_status", "host_diagnose", "port_scan", "inventory_*", "prompto_gain"]
+tools = ["ssh_exec", "ssh_batch", "bash_exec", "file_*", "rsync_sync", "host_status", "port_scan", "inventory_*", "prompto_gain"]
 
 [[rule]]
 id = "dev-root-t1"
@@ -308,7 +308,7 @@ sudo = true
 id = "ops-exec"
 agents = ["group:ops"]
 hosts = ["group:lab"]
-tools = ["ssh_exec", "ssh_batch", "bash_exec", "file_*", "rsync_sync", "host_status", "host_diagnose", "port_scan", "inventory_*", "prompto_gain"]
+tools = ["ssh_exec", "ssh_batch", "bash_exec", "file_*", "rsync_sync", "host_status", "port_scan", "inventory_*", "prompto_gain"]
 
 # Task 014: root on sbx-t2 needs a human approval (TOTP) for sbx-ops-agent.
 [[rule]]
