@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.12.2 — unreleased
+## v0.12.2 — 2026-10-10
 
 ### Breaking: 14 unused tools removed (roadmap S0.3)
 
