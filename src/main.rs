@@ -1464,6 +1464,8 @@ async fn run(inherited: Inherited) -> Result<()> {
 
     let ssh = Arc::new(ssh_client);
     let ssh_for_reap = ssh.clone();
+    let reap_audit = audit.clone();
+    let reap_store = store.clone();
     let tracker = Arc::new(Tracker::new(
         cfg.usage_log.clone(),
         cfg.gain_enabled,
@@ -1743,22 +1745,38 @@ async fn run(inherited: Inherited) -> Result<()> {
         if clean {
             tracing::info!("drained: every call finished");
         } else {
-            let remote = drain.abort();
+            // Reaped while their ssh connections are still up (the
+            // reaper tells the call's login shell by its sshd parent),
+            // then cut off.
+            let remote = drain.deadline();
             tracing::warn!(
                 calls = drain.calls(),
                 remote_commands = remote.len(),
-                "drain deadline: aborting the calls still running and reaping their remote side"
+                "drain deadline: reaping the remote side of the calls still running, then \
+                 aborting them"
             );
+            let inv = reap_store.snapshot();
             let mut reaps = tokio::task::JoinSet::new();
             for r in remote {
                 let ssh = ssh_for_reap.clone();
-                reaps.spawn(async move { prompto::drain::reap(&ssh, &r).await });
+                let audit = reap_audit.clone();
+                let name = inv
+                    .hosts
+                    .iter()
+                    .find(|(_, h)| {
+                        h.ip == r.host.ip
+                            && h.ssh_port == r.host.ssh_port
+                            && h.ssh_user == r.host.ssh_user
+                    })
+                    .map(|(n, _)| n.clone());
+                reaps.spawn(async move {
+                    prompto::drain::reap(&ssh, &audit, &r, name.as_deref()).await
+                });
             }
-            // The aborted answers go out on their connections meanwhile.
-            let flush = async {
-                let _ = tokio::time::timeout(Duration::from_secs(10), served.cancelled()).await;
-            };
-            tokio::join!(flush, async { while reaps.join_next().await.is_some() {} });
+            while reaps.join_next().await.is_some() {}
+            drain.abort();
+            // The aborted answers go out on their connections.
+            let _ = tokio::time::timeout(Duration::from_secs(10), served.cancelled()).await;
         }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), served.cancelled()).await;

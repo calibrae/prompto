@@ -5,8 +5,9 @@
 //! restart (S11.3).
 //!
 //! The fake `ssh` runs the remote command locally, in a session of its
-//! own (perl's `setsid`): like a real remote command, it survives when
-//! prompto kills its `ssh` process group, so only the reaper can stop it.
+//! own (perl's `setsid`) under a parent named like OpenSSH's
+//! `sshd-session`: like a real remote command, it survives when prompto
+//! kills its `ssh` process group, so only the reaper can stop it.
 
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -19,9 +20,13 @@ mod common;
 const BIN: &str = env!("CARGO_BIN_EXE_prompto");
 
 const FAKE_SSH: &str = r#"#!/bin/sh
-for a; do last=$a; done
+for a; do
+  case $a in SetEnv=*) export "${a#SetEnv=}" ;; esac
+  last=$a
+done
 case $last in *pgtest*) exec /bin/sh -c "$last" ;; esac
-exec perl -e 'use POSIX; my $p = fork; if (!$p) { POSIX::setsid(); exec "/bin/sh", "-c", $ARGV[0] }
+exec perl -e '$0 = "sshd-session: fake"; use POSIX; my $p = fork;
+if (!$p) { POSIX::setsid(); exec "/bin/sh", "-c", $ARGV[0] }
 waitpid($p, 0); exit($? >> 8)' "$last"
 "#;
 
@@ -38,6 +43,13 @@ ssh_user = "ops"
 ssh_key = "/dev/null"
 capabilities = ["exec"]
 request_id_env = "off"
+
+[host.t4]
+ip = "192.0.2.44"
+ssh_user = "ops"
+ssh_key = "/dev/null"
+capabilities = ["exec"]
+request_id_env = "setenv"
 "#;
 
 fn write_exe(path: &Path, body: &str) {
@@ -284,19 +296,49 @@ async fn sigterm_lets_the_calls_in_flight_finish() {
 
 /// The drain deadline: a call longer than `PROMPTO_DRAIN_SECS` is cut
 /// off — the client gets `aborted`, the audit log says `aborted`, and
-/// its remote process (detached from ssh's process group, as on a real
-/// host) is gone: the reaper killed it. Then the process exits.
+/// its remote session is gone: the reaper killed the foreground command
+/// and a `nohup` job (still in the call's session), and spared a job
+/// that left the session (`setsid`). The reap is audited under the
+/// call's request ID. Then the process exits. On `t1` (`export`) the
+/// session is recorded in `PROMPTO_CALL_SID`; on `t4` (`setenv`, as for a
+/// csh host) only the login shell's sshd parent tells it — so the reap
+/// must run before the call's ssh is cut.
 #[tokio::test]
 async fn the_drain_deadline_aborts_audits_and_reaps() {
+    for host in ["t1", "t4"] {
+        deadline_reaps(host).await;
+    }
+}
+
+async fn deadline_reaps(host: &'static str) {
     let dir = tempfile::tempdir().unwrap();
     let mut p = spawn(dir.path(), &[("PROMPTO_DRAIN_SECS", "1".into())]);
     let addr = p.addr();
     let n = unique_secs();
-    let pat = format!("^sleep {n}$");
-    let long =
-        tokio::spawn(async move { exec(addr, &format!("sleep {n}; echo never"), 600).await });
+    let (fg, nohup, gone) = (
+        format!("^sleep {n}$"),
+        format!("^sleep {}$", n + 1),
+        format!("^sleep {}$", n + 2),
+    );
+    let cmd = format!(
+        "perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' sleep {} >/dev/null 2>&1 & \
+         nohup sleep {} >/dev/null 2>&1 & sleep {n}; echo never",
+        n + 2,
+        n + 1
+    );
+    let long = tokio::spawn(async move {
+        call_at(
+            addr,
+            None,
+            "ssh_exec",
+            json!({ "host": host, "cmd": cmd, "timeout_secs": 600 }),
+        )
+        .await
+        .unwrap()
+        .1
+    });
     let t = Instant::now();
-    while pgrep(&pat).is_empty() {
+    while [&fg, &nohup, &gone].iter().any(|p| pgrep(p).is_empty()) {
         assert!(
             t.elapsed() < Duration::from_secs(5),
             "remote command never started"
@@ -317,18 +359,38 @@ async fn the_drain_deadline_aborts_audits_and_reaps() {
         "{}",
         p.stderr()
     );
+    let detached = pgrep(&gone);
+    for pid in detached.split_whitespace() {
+        let _ = Command::new("kill").arg(pid).status();
+    }
     assert!(
-        pgrep(&pat).is_empty(),
+        pgrep(&fg).is_empty(),
         "the remote process survived the abort: {}",
         p.stderr()
     );
+    assert!(pgrep(&nohup).is_empty(), "the nohup job survived");
+    assert!(!detached.is_empty(), "the setsid job was reaped");
     let recs = audit(dir.path());
     let r = recs
         .iter()
-        .find(|r| r["tool"] == "ssh_exec")
+        .find(|r| r["tool"] == "ssh_exec" && r["type"] == "tool")
         .expect("no record");
     assert_eq!(r["error_class"], "aborted", "{r}");
     assert_eq!(r["request_id"], v["error"]["data"]["request_id"], "{r}");
+    let reap = recs
+        .iter()
+        .find(|r| r["type"] == "reap")
+        .unwrap_or_else(|| panic!("no reap record: {recs:?}"));
+    assert_eq!(reap["request_id"], r["request_id"], "{reap}");
+    assert_eq!(reap["host"], host, "{reap}");
+    assert_eq!(reap["tool"], "ssh_exec", "{reap}");
+    assert_eq!(reap["as_root"], false, "{reap}");
+    assert_eq!(reap["ok"], true, "{reap}");
+    assert_eq!(reap["sessions"].as_array().map(Vec::len), Some(1), "{reap}");
+    assert!(
+        reap["terminated"].as_array().is_some_and(|a| a.len() >= 3),
+        "shell, nohup job and sleep: {reap}"
+    );
     assert!(
         p.stderr().contains("reaped the remote side"),
         "{}",

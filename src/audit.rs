@@ -28,7 +28,11 @@
 //!
 //! A call cut off before it recorded anything (prompto shutting down, a
 //! handler panic) is recorded as `aborted` by a drop guard in
-//! `Prompto::call_tool`.
+//! `Prompto::call_tool`. A call cut off at the drain deadline also gets
+//! a `"type": "reap"` record per remote command the reaper went after:
+//! the call's request ID and identity, the host, whether it ran as
+//! root, and the sessions and PIDs killed — or why not
+//! (`crate::drain::reap_record`).
 //!
 //! # Arguments and strings
 //!
@@ -1851,6 +1855,31 @@ pub fn table_row(r: &Value) -> [String; 8] {
     }
     let detail = if s("type") == "auth" {
         format!("{} {}", s("path"), s("reason"))
+    } else if s("type") == "reap" {
+        // The drain deadline's reaper (`crate::drain::reap`).
+        let ids = |k: &str| match r.get(k).and_then(Value::as_array) {
+            Some(a) => a
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            None => String::new(),
+        };
+        let who = if r.get("as_root") == Some(&Value::Bool(true)) {
+            "as root "
+        } else {
+            ""
+        };
+        match r.get("error").and_then(Value::as_str) {
+            Some(e) => format!("{who}failed: {e}"),
+            None => format!(
+                "{who}{}={} term={} kill={}",
+                s("key"),
+                ids("sessions"),
+                ids("terminated"),
+                ids("killed")
+            ),
+        }
     } else if s("type") == "audit_read" {
         // GET /v1/audit: what the agent asked for, and what it got.
         let q = |k: &str| match r.pointer(&format!("/query/{k}")) {
@@ -1908,7 +1937,7 @@ pub fn table_row(r: &Value) -> [String; 8] {
             "auth" => "(auth)".into(),
             "audit_read" => "(audit read)".into(),
             // Not a call that ran: say what it was.
-            t @ ("precheck" | "approve") => cell(&format!("{t}:{}", s("tool")), CELL_MAX),
+            t @ ("precheck" | "approve" | "reap") => cell(&format!("{t}:{}", s("tool")), CELL_MAX),
             _ => cell(s("tool"), CELL_MAX),
         },
         cell(&host, CELL_MAX),
@@ -2610,6 +2639,20 @@ mod tests {
         assert_eq!(table_row(&v)[3], "-");
         assert_eq!(table_row(&v)[7], "kill=global");
         assert!(!f("web1").matches(&v));
+    }
+
+    #[test]
+    fn a_reap_is_a_row_of_its_own() {
+        let r = json!({ "ts": "2026-10-10T12:00:00.000Z", "type": "reap", "agent": "alpha",
+            "tool": "ssh_exec", "host": "t1", "as_root": true, "ok": true, "key": "sid",
+            "sessions": [12], "terminated": [12, 13], "killed": [13] });
+        let row = table_row(&r);
+        assert_eq!(row[2], "reap:ssh_exec");
+        assert_eq!(row[3], "t1");
+        assert_eq!(row[7], "as root sid=12 term=12,13 kill=13");
+        let failed =
+            json!({ "type": "reap", "tool": "ssh_exec", "ok": false, "error": "timed out" });
+        assert_eq!(table_row(&failed)[7], "failed: timed out");
     }
 
     #[test]

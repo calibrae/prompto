@@ -144,7 +144,7 @@ impl Chassis {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestIdEnv {
-    /// `export PROMPTO_REQUEST_ID=…; ` in front of the remote command,
+    /// `export PROMPTO_REQUEST_ID=… PROMPTO_CALL_SID=$$; ` in front of the remote command,
     /// plus `-o SetEnv`. Needs a POSIX login shell that runs the command
     /// line as given. Default on `linux` and `macos`.
     Export,
