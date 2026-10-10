@@ -58,7 +58,13 @@ fn lint_policy(inv: &prompto::Inventory, policy: &std::path::Path, agents: &std:
     let a = prompto::agent::Agents::from_path(agents).unwrap_or_else(|e| fail("AGENTS", e));
     let tools = prompto::mcp::Prompto::tool_names();
     let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
-    let findings = prompto::policy::lint(&p, inv, &a, &tools);
+    let findings = prompto::policy::lint(
+        &p,
+        inv,
+        &a,
+        &tools,
+        &prompto::policy::service_user_from_env(),
+    );
     if p.missing.is_some() {
         println!("POLICY MISSING — every call would be denied");
     }
