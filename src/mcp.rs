@@ -145,7 +145,8 @@ pub struct ExecArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchArgs {
     pub host: String,
-    /// Shell commands to run in order. Each runs under `bash -c`.
+    /// Shell commands to run in order. Each runs under `bash -c`
+    /// (`sh -c` on FreeBSD hosts).
     pub commands: Vec<String>,
     /// Stop on first non-zero exit. Default true; skipped entries get exit_code=null.
     #[serde(default)]
@@ -1076,30 +1077,37 @@ impl Prompto {
             let target =
                 self.authorize(&ctx, "ssh_batch", &args.host, Need::Cap(Capability::Exec))?;
             let host = &target.host;
-            // The batch wire protocol runs each entry under `bash -c`.
-            // Without bash the remote shell mangles the script and the
-            // failure surfaces as "missing record for command 0 — remote
-            // bash may have crashed", which blames the protocol rather
+            // The batch wire protocol needs a POSIX shell: bash on Linux
+            // and macOS, /bin/sh on FreeBSD. Without one the remote shell
+            // mangles the script and the failure surfaces as "missing
+            // record for command 0", which blames the protocol rather
             // than the absent shell. Say the real thing instead.
-            if !host.platform.has_bash() {
+            let Some(driver) = batch::Driver::for_platform(host.platform) else {
                 crate::fail!(
                     RefusedCapability,
-                    "ssh_batch needs bash, and {:?} is {} (no bash — OPNsense ships csh/tcsh). \
+                    "ssh_batch needs a POSIX shell, and {:?} is {}. \
                      Use ssh_exec instead, one call per command.",
                     args.host,
                     host.platform.as_str()
                 );
-            }
+            };
             let fail_fast = args.fail_fast.unwrap_or(true);
             let n = args.commands.len() as u64;
             let to = args
                 .timeout_secs
                 .map(Duration::from_secs)
                 .or_else(|| Some(self.ssh.default_timeout * n.max(1) as u32));
-            let script = batch::build_script(&args.commands, fail_fast);
+            let script = driver.script(&args.commands, fail_fast);
             let raw = self
                 .ssh
-                .exec_stdin(&ctx, host, "bash", script.as_bytes(), to, false)
+                .exec_stdin(
+                    &ctx,
+                    host,
+                    driver.remote_cmd(),
+                    script.as_bytes(),
+                    to,
+                    false,
+                )
                 .await?;
             if raw.timed_out {
                 crate::fail!(Timeout, "batch timed out (>{:?})", to.unwrap_or_default());

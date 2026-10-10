@@ -443,6 +443,16 @@ pub fn parse_stat(stdout: &str) -> Option<FileStat> {
     })
 }
 
+/// `chmod` for a validated mode and path, on every platform.
+///
+/// `--` goes before the mode. BSD `chmod` (FreeBSD, macOS) stops option
+/// parsing at the first operand, so the GNU-only `chmod 640 -- /p` takes
+/// `--` as a file name there: `chmod: --: No such file or directory`,
+/// exit 1, after the file was already written.
+pub fn chmod_command(mode: &str, path: &str) -> String {
+    format!("chmod -- {mode} {path}")
+}
+
 /// Optional chmod after a write. No-op if `mode` is `None`.
 pub async fn chmod(
     ssh: &SshClient,
@@ -454,7 +464,7 @@ pub async fn chmod(
 ) -> Result<()> {
     validate_path(path)?;
     validate_mode(mode)?;
-    let cmd = format!("chmod {mode} -- {path}");
+    let cmd = chmod_command(mode, path);
     let res = ssh
         .exec(ctx, host, &cmd, Some(Duration::from_secs(10)), sudo)
         .await?;
@@ -790,6 +800,33 @@ mod tests {
     fn parse_stat_rejects_malformed() {
         assert!(parse_stat("nonsense\n").is_none());
         assert!(parse_stat("").is_none());
+    }
+
+    /// sbx-bsd (FreeBSD 14.5) and sbx-mac (macOS 26), task 017: every
+    /// `file_write` with `mode` failed with
+    /// `chmod 640 /tmp/x failed (exit=Some(1)): chmod: --: No such file or directory`.
+    #[test]
+    fn chmod_command_puts_double_dash_before_the_mode() {
+        assert_eq!(chmod_command("640", "/tmp/x"), "chmod -- 640 /tmp/x");
+    }
+
+    /// The command as built works with the local `chmod` too: GNU here,
+    /// BSD when the suite runs on macOS.
+    #[cfg(unix)]
+    #[test]
+    fn chmod_command_runs_with_the_local_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"x").unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(chmod_command("640", f.to_str().unwrap()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]
