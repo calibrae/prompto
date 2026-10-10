@@ -9,8 +9,11 @@ repository = "https://github.com/calibrae/prompto"
 [dependencies]
 rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "signal", "sync", "fs", "process", "net", "time"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 toml = "0.8"

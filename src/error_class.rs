@@ -18,8 +18,9 @@
 //! `rsync_sync` adds its own `rsync_*` and `dest_*` classes. An error that reaches `finish_tool` without a
 //! class is a bug: it is reported as `internal`, logged, and counted in
 //! [`unclassified_count`], which a test sweeping every tool holds at zero.
-//! `aborted` exists only in the audit log: a call cut off before it
-//! finished (shutdown, panic), recorded by a drop guard.
+//! `aborted` is a call cut off before it finished: recorded by a drop
+//! guard (client gone, panic), and also returned to the client when the
+//! drain deadline cuts it off (`crate::drain`).
 //! Names are stable `snake_case` strings.
 
 use crate::ssh::{ExecOutput, SUDO_GUARD_EXIT};
@@ -91,8 +92,9 @@ pub enum ErrorClass {
     /// prompto itself failed (spawning ssh, a signal, …).
     Internal,
     /// The call never finished: the client went away or cancelled, the
-    /// handler panicked, or prompto shut down while it ran. Whether the
-    /// action took effect is unknown.
+    /// handler panicked, or prompto shut down while it ran (the drain
+    /// deadline, `PROMPTO_DRAIN_SECS`). Whether the action took effect is
+    /// unknown.
     Aborted,
 }
 

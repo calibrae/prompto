@@ -19,7 +19,7 @@ use crate::sessions::{self, BoundSessionManager, SessionOwners};
 use crate::ssh::SshClient;
 use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use mcp_gain::Tracker;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -430,6 +430,8 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         ..
     } = p;
 
+    let drain = ssh.drain().clone();
+
     // Clones for the /log endpoint; the originals move into the factory.
     let store_for_log = store.clone();
     let owners = SessionOwners::default();
@@ -540,4 +542,134 @@ pub fn build_router(p: HttpParams) -> axum::Router {
                 async move { capture_caller_ip(trusted, conn, req, next).await }
             },
         ))
+        // Outermost: a server stopping for good turns new requests away
+        // before anything else looks at them.
+        .layer(middleware::from_fn(move |req, next| {
+            let drain = drain.clone();
+            async move { drain_gate(drain, req, next).await }
+        }))
+}
+
+/// How long a connection open when the server stops accepting may still
+/// send a request before it is closed (see [`serve`]).
+pub const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// Serve `app` on `listener` until `stop`, then drain: stop accepting
+/// at once, and close each open connection once its request in flight is
+/// answered — but not before it had [`CLOSE_GRACE`] to send one.
+///
+/// That grace is the difference with `axum::serve`'s graceful shutdown,
+/// which closes a connection with no request in flight at once — also
+/// one accepted a moment before, whose client is sending its first
+/// request: that client then sees a connection reset, a failed call.
+/// Here such a request is answered (`drain_gate`: served after a
+/// handover, a retryable 503 otherwise) with `Connection: close`, and the
+/// client reconnects — to the successor, or to the socket systemd keeps.
+/// Only a connection idle for the whole grace is closed unasked, the race
+/// any keep-alive timeout has. Returns once every connection is closed.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stop: CancellationToken,
+) -> std::io::Result<()> {
+    use hyper_util::rt::TokioIo;
+    let conns = tokio_util::task::TaskTracker::new();
+    loop {
+        let (sock, peer) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(c) => c,
+                // EMFILE and the like: back off, keep serving.
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            () = stop.cancelled() => break,
+        };
+        let _ = sock.set_nodelay(true);
+        let app = app.clone();
+        let svc =
+            hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(ConnectInfo(peer));
+                tower::ServiceExt::oneshot(app.clone(), req)
+            });
+        let stop = stop.clone();
+        conns.spawn(async move {
+            let conn = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(sock), svc)
+                .with_upgrades();
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                () = stop.cancelled() => {}
+            }
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                () = tokio::time::sleep(CLOSE_GRACE) => {}
+            }
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    conns.close();
+    conns.wait().await;
+    Ok(())
+}
+
+/// Seconds a client is told to wait before retrying while prompto stops.
+pub const DRAIN_RETRY_AFTER: &str = "2";
+
+/// axum middleware: while draining with no successor (SIGTERM, see
+/// `crate::drain`), a request that still arrives on an open connection is
+/// refused before anything runs — `503`, `Retry-After`, `Connection:
+/// close` — so the client retries on a new connection, which the next
+/// process (or systemd's socket) takes. After a handover the successor
+/// owns the socket, and what still reaches the old process is served.
+async fn drain_gate(
+    drain: crate::drain::Drain,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let http1 = req.version() <= axum::http::Version::HTTP_11;
+    match drain.phase() {
+        crate::drain::Phase::Serving => return next.run(req).await,
+        // Served, and the client told to reconnect: to the successor.
+        crate::drain::Phase::HandedOver => {
+            let mut res = next.run(req).await;
+            if http1 {
+                res.headers_mut().insert(
+                    axum::http::header::CONNECTION,
+                    axum::http::HeaderValue::from_static("close"),
+                );
+            }
+            return res;
+        }
+        crate::drain::Phase::Draining => {}
+    }
+    tracing::info!(path = %req.uri().path(), "request refused: prompto is shutting down (503, retryable)");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {
+            "code": -32000,
+            "message": "prompto is shutting down; nothing was run — retry in a few seconds",
+            "data": { "retryable": true },
+        },
+    });
+    let mut res = axum::Json(body).into_response();
+    *res.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+    let h = res.headers_mut();
+    h.insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static(DRAIN_RETRY_AFTER),
+    );
+    if http1 {
+        h.insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    res
 }

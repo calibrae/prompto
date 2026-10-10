@@ -744,6 +744,34 @@ impl Prompto {
         self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, bytes, None);
     }
 
+    /// A call cut off by the drain deadline: recorded `aborted` (unless
+    /// its handler recorded an outcome just before) and answered with an
+    /// `aborted` error.
+    fn cut_off(&self, call: &audit::CallScope) -> Result<CallToolResponse, McpError> {
+        let mut ctx = call.handler_ctx().unwrap_or_else(|| self.new_ctx());
+        ctx.call = Some(call.clone());
+        let err = anyhow::Error::new(crate::drain::aborted_error());
+        let request_id = ctx.request_id();
+        let (msg, data) = error_parts(&err, err.downcast_ref(), &request_id);
+        if !call.recorded() {
+            tracing::warn!(
+                request_id,
+                agent = ctx.agent_name(),
+                tool = %call.tool,
+                "tool call aborted at the drain deadline; recorded as aborted"
+            );
+            let verdict = audit::judge(
+                &call.tool,
+                &audit::Outcome::Failure(&err),
+                &ctx.notes(),
+                false,
+            );
+            let host = record_host(&call.args);
+            self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, 0, None);
+        }
+        Err(McpError::internal_error(msg, Some(data)))
+    }
+
     #[tool(description = "Wake a host via WOL magic packet.")]
     async fn host_wake(
         &self,
@@ -1739,7 +1767,15 @@ impl ServerHandler for Prompto {
             call: call.clone(),
         };
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let res = audit::scoped(call.clone(), self.tool_router.call(tcc)).await;
+        // Counted until it returns, for the drain; cut off at the drain
+        // deadline (`crate::drain`): dropping the handler kills its ssh,
+        // the reaper its remote side, and the client gets `aborted`.
+        let drain = self.ssh.drain();
+        let _inflight = drain.enter();
+        let res = tokio::select! {
+            res = audit::scoped(call.clone(), self.tool_router.call(tcc)) => res,
+            () = drain.aborted() => return self.cut_off(&call),
+        };
         if !call.recorded() {
             self.audit_unrouted(&call, Some(&res));
         }
