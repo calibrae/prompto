@@ -33,6 +33,65 @@ pub fn validate_interpreter(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The interpreter each interpreter tool runs.
+pub const INTERPRETER_TOOLS: &[(&str, &str)] = &[
+    ("python_exec", "python3"),
+    ("node_exec", "node"),
+    ("ruby_exec", "ruby"),
+    ("perl_exec", "perl"),
+    ("deno_exec", "deno"),
+    ("bash_exec", "bash"),
+];
+
+/// The interpreter `tool` runs, if it is an interpreter tool.
+pub fn interpreter_for_tool(tool: &str) -> Option<&'static str> {
+    INTERPRETER_TOOLS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map(|(_, i)| *i)
+}
+
+/// The remote shell could not find `interpreter`, so nothing of the
+/// script ran. Each shell words it its own way:
+///
+/// - bash: `bash: line 1: python3: command not found`, exit 127
+/// - dash, FreeBSD sh: `sh: 1: python3: not found`, exit 127
+/// - zsh: `zsh:1: command not found: python3`, exit 127
+/// - csh/tcsh (FreeBSD, OPNsense): `python3: Command not found.`, exit 1
+/// - `env` (the root side of the vault sudo path):
+///   `env: 'python3': No such file or directory`, exit 127
+///
+/// A script that fails on its own with one of these lines still needs
+/// the matching exit status, and the name must be the interpreter's.
+pub fn interpreter_missing(interpreter: &str, exit_code: Option<i32>, stderr: &str) -> bool {
+    let named = |l: &str, suffix: &str| {
+        [
+            format!("{interpreter}{suffix}"),
+            format!("'{interpreter}'{suffix}"),
+        ]
+        .iter()
+        .any(|pat| {
+            l.match_indices(pat.as_str()).any(|(i, _)| {
+                !l[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || "_-.".contains(c))
+            })
+        })
+    };
+    stderr.lines().any(|l| match exit_code {
+        Some(127) => {
+            named(l, ": command not found")
+                || named(l, ": not found")
+                || l.trim_end()
+                    .ends_with(&format!("command not found: {interpreter}"))
+                || (l.starts_with("env: ") && named(l, ": No such file or directory"))
+        }
+        Some(1) => named(l, ": Command not found."),
+        _ => false,
+    })
+}
+
 /// Validate one positional argument that will become argv[N] after the
 /// script. Permissive enough for paths, flags, and `--key=value` shapes;
 /// rejects shell metacharacters that would let the value break out.
@@ -208,6 +267,55 @@ pub fn compact_python_traceback(stderr: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpreter_missing_in_every_shells_wording() {
+        for (exit, stderr) in [
+            (127, "bash: line 1: python3: command not found\n"),
+            (127, "bash: python3: command not found\n"),
+            (127, "sh: 1: python3: not found\n"),
+            (127, "python3: not found\n"),
+            (127, "zsh:1: command not found: python3\n"),
+            (1, "python3: Command not found.\n"),
+            (127, "env: 'python3': No such file or directory\n"),
+            (127, "env: python3: No such file or directory\n"),
+        ] {
+            assert!(
+                interpreter_missing("python3", Some(exit), stderr),
+                "{exit} {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_missing_needs_the_interpreter_and_the_exit() {
+        for (interp, exit, stderr) in [
+            // Another program missing, as the script's own failure.
+            ("python3", 127, "sh: 1: foo: not found\n"),
+            ("node", 127, "bash: xnode: command not found\n"),
+            ("python", 127, "bash: python3: command not found\n"),
+            // Right words, wrong exit: the script printed them itself.
+            ("python3", 1, "python3: command not found\n"),
+            ("python3", 2, "python3: Command not found.\n"),
+            ("python3", 127, "python3: No such file or directory\n"),
+            ("perl", 1, "Traceback (most recent call last):\n"),
+        ] {
+            assert!(
+                !interpreter_missing(interp, Some(exit), stderr),
+                "{interp} {exit} {stderr:?}"
+            );
+        }
+        assert!(!interpreter_missing("python3", None, "python3: not found"));
+    }
+
+    #[test]
+    fn every_interpreter_tool_maps_to_an_allowed_interpreter() {
+        for (tool, i) in INTERPRETER_TOOLS {
+            assert!(ALLOWED_INTERPRETERS.contains(i), "{tool}");
+            assert_eq!(interpreter_for_tool(tool), Some(*i));
+        }
+        assert_eq!(interpreter_for_tool("ssh_exec"), None);
+    }
 
     #[test]
     fn validate_interpreter_accepts_allow_list() {

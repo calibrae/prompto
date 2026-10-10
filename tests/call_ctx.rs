@@ -42,14 +42,20 @@ while [ $# -gt 0 ]; do
 done
 [ "$1" = "--" ] && shift
 case "$target" in
-  127.0.0.20|127.0.0.21|127.0.0.23) PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
+  127.0.0.20|127.0.0.21|127.0.0.23) umask 022; PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
+  127.0.0.25) PATH="$dir" exec /bin/sh -c "$*" ;;
 esac
 exit 0
 "#;
 
 /// `sudo [-k] [-n] [-S] [-p prompt] -- cmd…`: with -S, consume the
 /// password line from stdin; then run cmd in an emptied environment.
+/// "Root" is `rootbin/` first on PATH (`id -u` → 0, `whoami` → root)
+/// and umask 077, so a file a redirect creates as root is mode 600
+/// (the ssh user's umask is 022).
 const FAKE_SUDO: &str = r#"#!/bin/sh
+dir="$(dirname "$0")"
+umask 077
 s=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -61,8 +67,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $s = 1 ] && IFS= read -r _pw
-exec env -i PATH=/usr/bin:/bin "$@"
+exec env -i PATH="$dir/rootbin:/usr/bin:/bin" "$@"
 "#;
+
+const FAKE_ROOT_ID: &str = r#"#!/bin/sh
+case "$1" in
+  -u) echo 0 ;;
+  -un|-nu) echo root ;;
+  *) echo 'uid=0(root) gid=0(root) groups=0(root)' ;;
+esac
+"#;
+
+const FAKE_ROOT_WHOAMI: &str = "#!/bin/sh\necho root\n";
 
 const INVENTORY: &str = r#"
 # The test client connects from 127.0.0.1: targeting `loopback` is
@@ -105,6 +121,13 @@ ip = "127.0.0.24"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 platform = "windows"
+capabilities = ["exec"]
+
+# Runs commands with no interpreter on PATH.
+[host.bare]
+ip = "127.0.0.25"
+ssh_user = "admin"
+ssh_key = "/dev/null"
 capabilities = ["exec"]
 
 [host.vaulted]
@@ -155,6 +178,10 @@ async fn spawn_server() -> Server {
     let ssh = dir.path().join("ssh");
     write_exe(&ssh, FAKE_SSH);
     write_exe(&dir.path().join("sudo"), FAKE_SUDO);
+    let rootbin = dir.path().join("rootbin");
+    std::fs::create_dir(&rootbin).unwrap();
+    write_exe(&rootbin.join("id"), FAKE_ROOT_ID);
+    write_exe(&rootbin.join("whoami"), FAKE_ROOT_WHOAMI);
 
     let vault = VaultClient::new(spawn_fake_vault().await, "secret", "tok");
     let cancel = CancellationToken::new();
@@ -451,6 +478,97 @@ async fn request_id_reaches_root_on_the_vault_sudo_path() {
         !argv.contains("echo rid="),
         "caller's command reached argv on the vault path: {argv}"
     );
+}
+
+/// `sudo -n` host, compound command: the whole of it runs as root, as on
+/// vault hosts. Before task 018 only `id -u` was elevated and `whoami`
+/// ran as the ssh user.
+#[tokio::test]
+async fn compound_command_runs_entirely_as_root_on_sudo_n_hosts() {
+    let s = spawn_server().await;
+    let resp = call(
+        &s,
+        "ssh_sudo_exec",
+        json!({ "host": "runner", "cmd": "id -u; whoami" }),
+    )
+    .await;
+    let out = ok_payload(&resp);
+    assert_eq!(out["stdout"], "0\nroot\n", "{out}");
+    let argv = s.argv_log();
+    assert!(
+        argv.lines().any(|l| l.ends_with("sudo -n -- sh -s")),
+        "{argv}"
+    );
+    assert!(!argv.contains("whoami"), "command belongs on stdin: {argv}");
+}
+
+/// A redirect is opened by root's shell, not the ssh user's, and the
+/// request ID reaches that shell although sudo reset the environment.
+#[tokio::test]
+async fn redirect_lands_as_root_on_sudo_n_hosts() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = spawn_server().await;
+    let target = s.dir.path().join("as-root");
+    let cmd = format!(
+        "sh -c 'echo rid=$PROMPTO_REQUEST_ID' > {}",
+        target.display()
+    );
+    let resp = call(&s, "ssh_sudo_exec", json!({ "host": "runner", "cmd": cmd })).await;
+    let out = ok_payload(&resp);
+    assert_eq!(out["exit_code"], 0, "{out}");
+    let rid = out["request_id"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        format!("rid={rid}\n")
+    );
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "created outside the root shell: {mode:o}");
+}
+
+/// A command of plain words keeps `sudo -n -- <cmd>`, so narrow sudoers
+/// rules (`NOPASSWD: /usr/bin/systemctl restart nginx`) still match.
+#[tokio::test]
+async fn simple_command_keeps_plain_sudo_n() {
+    let s = spawn_server().await;
+    let resp = call(
+        &s,
+        "ssh_sudo_exec",
+        json!({ "host": "runner", "cmd": "id -u" }),
+    )
+    .await;
+    assert_eq!(ok_payload(&resp)["stdout"], "0\n");
+    let argv = s.argv_log();
+    assert!(
+        argv.lines().any(|l| l.ends_with("sudo -n -- id -u")),
+        "{argv}"
+    );
+}
+
+/// No interpreter on the host: the result says so instead of the generic
+/// `remote_nonzero`.
+#[tokio::test]
+async fn missing_interpreter_is_classified() {
+    let s = spawn_server().await;
+    for tool in [
+        "python_exec",
+        "node_exec",
+        "ruby_exec",
+        "perl_exec",
+        "deno_exec",
+    ] {
+        let resp = call(&s, tool, json!({ "host": "bare", "script": "1" })).await;
+        let out = ok_payload(&resp);
+        assert_eq!(out["exit_code"], 127, "{tool}: {out}");
+        assert_eq!(out["error_class"], "interpreter_missing", "{tool}: {out}");
+    }
+    // A failing command that is not a missing interpreter keeps its class.
+    let resp = call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "bare", "cmd": "python3 -" }),
+    )
+    .await;
+    assert_eq!(ok_payload(&resp)["error_class"], "remote_nonzero");
 }
 
 /// `/log` goes through the same gate as service_logs, so it refuses the

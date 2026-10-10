@@ -1781,7 +1781,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command as root over SSH. Uses passwordless sudo, or a vault-held sudo password when the host declares one (the password never reaches the caller; the whole command then runs as root under sh). Same filter chain as ssh_exec."
+        description = "Run a command as root over SSH. The whole command runs as root, including every part of a compound command (`a; b`, pipes, redirects). Uses passwordless sudo (`sudo -n -- <cmd>` for a command of plain words, so narrow sudoers rules match; otherwise `sudo -n -- sh -s` with the command on stdin), or a vault-held sudo password when the host declares one (the password never reaches the caller; the command runs under a root sh). Same filter chain as ssh_exec."
     )]
     async fn ssh_sudo_exec(
         &self,

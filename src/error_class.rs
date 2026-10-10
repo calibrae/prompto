@@ -13,8 +13,9 @@
 //! `approval_required`); argument validation is `invalid_args`; a remote
 //! command that ran and failed is classified from its exit status and
 //! stderr by [`classify_exec`] (`ssh_connect`, `ssh_auth`, `timeout`,
-//! `sudo_guard`, `remote_nonzero`); `rsync_sync` adds its own `rsync_*`
-//! and `dest_*` classes. An error that reaches `finish_tool` without a
+//! `sudo_guard`, `remote_nonzero`); the interpreter tools refine
+//! `remote_nonzero` to `interpreter_missing` (`crate::script`), and
+//! `rsync_sync` adds its own `rsync_*` and `dest_*` classes. An error that reaches `finish_tool` without a
 //! class is a bug: it is reported as `internal`, logged, and counted in
 //! [`unclassified_count`], which a test sweeping every tool holds at zero.
 //! `aborted` exists only in the audit log: a call cut off before it
@@ -56,6 +57,11 @@ pub enum ErrorClass {
     DestSshAuth,
     /// `rsync` is not installed on one of the two hosts.
     RsyncMissing,
+    /// An interpreter tool's interpreter (`python3`, `node`, `ruby`,
+    /// `perl`, `deno`, `bash`) is not installed or not on the login
+    /// shell's PATH: the shell said "command not found" (exit 127, or 1
+    /// from csh). Nothing of the script ran.
+    InterpreterMissing,
     /// rsync exit 1/4: syntax or usage error, unsupported action.
     RsyncUsage,
     /// rsync exit 2/5/6/12/13: protocol incompatibility or a broken
@@ -108,6 +114,7 @@ impl ErrorClass {
             Self::DestSshConnect => "dest_ssh_connect",
             Self::DestSshAuth => "dest_ssh_auth",
             Self::RsyncMissing => "rsync_missing",
+            Self::InterpreterMissing => "interpreter_missing",
             Self::RsyncUsage => "rsync_usage",
             Self::RsyncProtocol => "rsync_protocol",
             Self::RsyncIo => "rsync_io",
@@ -140,6 +147,7 @@ impl ErrorClass {
         Self::DestSshConnect,
         Self::DestSshAuth,
         Self::RsyncMissing,
+        Self::InterpreterMissing,
         Self::RsyncUsage,
         Self::RsyncProtocol,
         Self::RsyncIo,
@@ -437,6 +445,7 @@ mod tests {
             | ErrorClass::DestSshConnect
             | ErrorClass::DestSshAuth
             | ErrorClass::RsyncMissing
+            | ErrorClass::InterpreterMissing
             | ErrorClass::RsyncUsage
             | ErrorClass::RsyncProtocol
             | ErrorClass::RsyncIo
@@ -452,7 +461,7 @@ mod tests {
             | ErrorClass::Internal
             | ErrorClass::Aborted => 1,
         };
-        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 25);
+        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 26);
     }
 
     fn out(code: Option<i32>, stderr: &str, timed_out: bool) -> ExecOutput {
