@@ -196,8 +196,9 @@ test('ask: no decision within 10 minutes refuses the call', { timeoutMs: 60_000 
 })
 
 test('ask in a non-interactive session: refused at once, no pane', async ($, on) => {
-  mock.clock(on)
-  const fake = install(on)
+  const clock = mock.clock(on)
+  // A pane would wait on this clock, which never moves here: the test would time out.
+  const fake = install(on, { clock })
   fake.precheck.ssh_sudo_exec = ASK
   await start($, false)
   const out = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'tu9', host: 'h2', cmd: 'id' })
@@ -379,10 +380,13 @@ test('the hook failing refuses the call (its .catch), it is not sent', async ($,
 
 test('Claude Code\'s permission settings still apply to calls the plugin sends', async ($, on) => {
   mock.clock(on)
-  const fake = install(on, { check: 'deny' })
+  // Were the verdict ignored and the person asked, they would allow it.
+  const asked: string[] = []
+  const fake = install(on, { check: 'deny', answer: 'Allow', asked })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__prompto__ssh_exec', tool_use_id: 'tu19', host: 'h1', cmd: 'id' })
-  expect(out.deny).toBeDefined()
+  expect(out.deny).toContain('permission settings')
+  expect(asked).toHaveLength(0)
   expect(fake.calls()).toHaveLength(0)
 })
 
