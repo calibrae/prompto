@@ -176,6 +176,61 @@ Rotation becomes a non-event: certificates expire in minutes; the CA key rotates
 | v0.13.0 | Per-call Vault SSH certificates; hosts trust the CA; static key retired host by host | |
 | v0.14.0 | Host groups in policy, argument-level allowlists for typed tools | |
 
+## 7. Beyond the homelab: what changes at scale
+
+The design is made of parts large operators already run: OIDC identities, short-lived SSH certificates, policy as code, append-only audit. This section records which homelab simplifications would break at fleet scale (thousands of hosts, many teams), so today's decisions stay on a path that can grow.
+
+### Carries over
+
+- **Per-call SSH certificates (§4).** This is how large operators run SSH: no static keys, a CA trusted fleet-wide, and an identity in each certificate's key ID that sshd logs.
+- **OIDC identities (§1).** Replace the homelab IdP with the corporate one. Agents become service accounts, and disabling an account cuts it off everywhere.
+- **The audit record (§3).** JSONL plus journald ships to any SIEM, and the request ID joins prompto's records to host logs.
+- **The concepts behind tickets, approvals and kill switches.** Their storage changes, as described below.
+
+### Must change
+
+| Homelab simplification | At scale |
+|---|---|
+| Hand-edited inventory TOML | Dynamic inventory from a CMDB or cloud API. Host groups come from labels (`env`, `team`, `tier`) |
+| One process, state in local flock'd files (nonces, TOTP steps, kill API) | Stateless prompto replicas behind a load balancer. Shared state goes in a consistent store (OpenBao, etcd). Kill switches propagate within seconds |
+| One `ssh` process per call | Connection pooling. **Fleet operations:** one call across N hosts with canary, batch size and stop-on-failure, audited as one parent record plus per-host children |
+| Raw shell is most calls | Typed tools plus argument-level policy (v0.14) as the default. Raw shell becomes a break-glass grant that needs approval |
+| One human approver with TOTP | Approval routing: on-call, change windows, two-person rule per environment, the change-ticket ID carried in the ticket claims |
+| Kill switches only | Also blast-radius limits: max hosts per call, rate per agent, change freezes per environment, automatic stop on anomaly |
+| Single tenant | Teams own policy slices reviewed in git. Central guardrails no slice can override, such as the self-target rule and root separation |
+
+### Against the hyperscalers' own controls
+
+Large clouds already offer the building blocks, and at their scale those win on several axes:
+
+| | AWS | GCP | Azure |
+|---|---|---|---|
+| Command execution with no SSH or inbound network path | SSM Run Command / Session Manager | OS Config, IAP-tunnelled SSH | Run Command, Bastion, Arc (hybrid) |
+| Identity-bound access | IAM with tag conditions, EC2 Instance Connect | OS Login (IAM-bound SSH, certificates, 2FA) | Entra ID VM login, JIT access |
+| Audit | CloudTrail, session logs | Cloud Audit Logs | Activity Log, Bastion recordings |
+| Argument-level policy for agent tools | AgentCore (Cedar over tool input) | — | — |
+
+The native controls win on four axes: no network path and no SSH at all, deep IAM integration, managed HA and scale, compliance certifications, and audit immutability.
+
+They don't give you any of these:
+- **One policy and audit plane across clouds, on-prem and edge.** Each cloud governs only itself.
+- **Typed tools as the unit of permission, with tickets bound to the exact arguments.** Cloud IAM gates the API action (`ssm:SendCommand`), not what the command does.
+- **Human approval inside the agent's own interface,** with the diff of what will change.
+- **Agent-specific guardrails** such as the self-target rule, per-session kill and per-agent attribution.
+
+So at hyperscale prompto should not speak SSH at all. It becomes a **policy, approval and audit broker in front of the native execution planes**:
+
+- **Transport adapters** per host type, replacing `ssh`: SSM Run Command, GCP OS Config/IAP, Azure Run Command/Arc. Same pattern as the relay transport in the satellite roadmap.
+- **Per-call cloud credentials instead of SSH certificates:** workload identity federation (prompto's OIDC identity → a short-lived cloud role per call). The session tags carry agent, session and request ID, so CloudTrail and its equivalents record who asked, not only prompto's role.
+- **The cloud's own audit becomes the second witness,** joined to prompto's records by request ID.
+- **Policy, tickets, approvals and kill switches stay in prompto,** the one layer that understands agents and tool arguments.
+
+**Decisions this implies today:**
+- Keep transports behind one interface (SSH now; relay and cloud executors later).
+- Keep shared state behind traits, so the flock'd files can be swapped for a consistent store.
+- Keep audit records self-contained and joinable by request ID.
+- Keep inventory loading pluggable.
+
 ## Open questions
 
 1. One token per agent *session* or per agent *role*? Per role is manageable; per session gives perfect attribution but needs automated minting (OIDC client credentials make this cheap).
