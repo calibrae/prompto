@@ -578,3 +578,31 @@ async fn precheck_says_whether_the_call_is_root_capable() {
     assert_eq!(v["decision"], "allow", "{v}");
     assert_eq!(v["root"], false, "{v}");
 }
+
+#[tokio::test]
+async fn anonymous_callers_get_no_records_and_kill_nothing() {
+    let s = spawn(AuthMode::Optional).await;
+    let anon = |path: &str, body: Option<Value>| {
+        let c = reqwest::Client::new();
+        let url = format!("http://{}/v1/{path}", s.addr);
+        let req = match body {
+            Some(b) => c.post(url).json(&b),
+            None => c.get(url),
+        };
+        async move {
+            let r = req.header("x-prompto-session", "sa").send().await.unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+    };
+    let (st, body) = anon("whoami", None).await;
+    assert_eq!(st, 200);
+    assert!(body.contains("anonymous"), "{body}");
+    let (st, body) = anon("audit", None).await;
+    assert_eq!(st, 403, "{body}");
+    let (st, body) = anon("kill", Some(json!({ "scope": "session" }))).await;
+    assert_eq!(st, 403, "{body}");
+    assert!(s.kill().list().unwrap().0.is_empty());
+    // A named agent is fine in the same mode.
+    let (st, v) = v1(&s, "audit", ALPHA, None, None).await;
+    assert_eq!(st, 200, "{v}");
+}
