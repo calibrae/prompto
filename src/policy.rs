@@ -611,7 +611,12 @@ pub struct PolicyStore {
     path: Option<PathBuf>,
     /// The file's metadata when it was last read.
     seen: Arc<std::sync::Mutex<Seen>>,
+    /// Run with the new policy after every read of the file
+    /// ([`Self::on_reload`]).
+    hook: Arc<std::sync::Mutex<Option<ReloadHook>>>,
 }
+
+type ReloadHook = Arc<dyn Fn(&Policy) + Send + Sync>;
 
 impl Default for PolicyStore {
     /// No rules: deny everything.
@@ -626,7 +631,15 @@ impl PolicyStore {
             inner: Arc::new(ArcSwap::from_pointee(policy)),
             path,
             seen: Default::default(),
+            hook: Default::default(),
         }
+    }
+
+    /// Run `f` with the new policy after every read of the file — SIGHUP
+    /// or a change seen by [`Self::refresh`], valid or not (an invalid
+    /// file is the deny-all policy).
+    pub fn on_reload(&self, f: impl Fn(&Policy) + Send + Sync + 'static) {
+        *self.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
     }
 
     pub fn load_from(path: PathBuf) -> Result<Self> {
@@ -701,6 +714,15 @@ impl PolicyStore {
     fn read_locked(&self, path: &Path, seen: &mut Seen) -> Result<usize> {
         let (stamp, read) = read_settled(path, Policy::from_path);
         seen.record(stamp);
+        let res = self.store_read(read);
+        let hook = self.hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(f) = hook {
+            f(&self.snapshot());
+        }
+        res
+    }
+
+    fn store_read(&self, read: Result<Policy>) -> Result<usize> {
         match read {
             Ok(new) => {
                 let n = new.rules.len();
@@ -898,7 +920,18 @@ impl std::fmt::Display for Finding {
 /// because an earlier rule always wins (shadowed) or because nothing
 /// matches them at all. Reachability is exact, not heuristic: every
 /// (agent, host, tool, root) combination the files allow is enumerated.
-pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -> Vec<Finding> {
+///
+/// `service_user` is the account prompto runs as (`PROMPTO_SERVICE_USER`,
+/// [`service_user_from_env`]): a grant that runs commands or touches files
+/// as that user on a `prompto_host` is an error too
+/// (`service_user_on_prompto_host`).
+pub fn lint(
+    policy: &Policy,
+    inv: &Inventory,
+    agents: &Agents,
+    tools: &[&str],
+    service_user: &str,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut push = |level, rule: &Rule, message: String| {
         out.push(Finding {
@@ -977,7 +1010,7 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
         if let Some(msg) = exec_as_root(rule, inv, tools) {
             push(Level::Warning, rule, msg)
         }
-        if let Some(msg) = root_on_prompto_host(rule, inv, tools) {
+        for msg in prompto_host_errors(rule, inv, tools, service_user) {
             push(Level::Error, rule, msg)
         }
     }
@@ -1035,6 +1068,117 @@ fn exec_as_root(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> 
         names.join(", "),
         hosts.join(", ")
     ))
+}
+
+/// `PROMPTO_SERVICE_USER` default: the account prompto runs as.
+pub const DEFAULT_SERVICE_USER: &str = "prompto";
+
+/// The account prompto runs as: `PROMPTO_SERVICE_USER`, default
+/// [`DEFAULT_SERVICE_USER`].
+pub fn service_user_from_env() -> String {
+    std::env::var("PROMPTO_SERVICE_USER")
+        .ok()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVICE_USER.into())
+}
+
+/// The lint errors about the host running prompto, per rule: root there
+/// (`root_on_prompto_host`) or its service user's shell or files
+/// (`service_user_on_prompto_host`). Either defeats the approval factors,
+/// so while the live policy has any, approvals are off
+/// (`crate::approval::Approvals::set_policy_block`).
+pub fn prompto_host_errors(
+    rule: &Rule,
+    inv: &Inventory,
+    tools: &[&str],
+    service_user: &str,
+) -> Vec<String> {
+    root_on_prompto_host(rule, inv, tools)
+        .into_iter()
+        .chain(service_user_on_prompto_host(rule, inv, tools, service_user))
+        .collect()
+}
+
+/// [`prompto_host_errors`] for every rule of `policy`, as
+/// `rule <name>: <message>`.
+pub fn prompto_host_findings(
+    policy: &Policy,
+    inv: &Inventory,
+    tools: &[&str],
+    service_user: &str,
+) -> Vec<String> {
+    policy
+        .rules
+        .iter()
+        .flat_map(|r| {
+            prompto_host_errors(r, inv, tools, service_user)
+                .into_iter()
+                .map(move |m| format!("policy rule {}: {m}", r.name()))
+        })
+        .collect()
+}
+
+/// A plain (`sudo = false`) grant, on a `prompto_host`, of a tool that
+/// runs as `ssh_user` there with the `exec` capability — the shells, the
+/// interpreters, `file_*`, `rsync_sync` (either end), `host_diagnose` —
+/// when that `ssh_user` is prompto's service user. That account reads the
+/// ticket key and TOTP files and `/etc/prompto/env` without any sudo.
+/// Silenced by `crown_jewel_ack` like [`root_on_prompto_host`].
+fn service_user_on_prompto_host(
+    rule: &Rule,
+    inv: &Inventory,
+    tools: &[&str],
+    service_user: &str,
+) -> Option<String> {
+    use crate::inventory::Capability;
+    if rule.crown_jewel_ack || rule.sudo {
+        return None;
+    }
+    let as_user: Vec<&str> = tools
+        .iter()
+        .copied()
+        .filter(|t| rule.matches_tool(t) && runs_as_ssh_user(t))
+        .collect();
+    if as_user.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<String> = inv
+        .hosts
+        .iter()
+        .filter(|(n, h)| {
+            h.prompto_host
+                && h.ssh_user == service_user
+                && h.has(Capability::Exec)
+                && rule.matches_host(&Target::of(n, h))
+        })
+        .map(|(n, _)| format!("{n} ({})", as_user.join(", ")))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort();
+    Some(format!(
+        "grants tools that run as ssh_user on the host running prompto, where ssh_user is \
+         prompto's own service user {service_user:?} (PROMPTO_SERVICE_USER): {}. That user \
+         reads /etc/prompto/env (prompto's vault token), the ticket key file and approvers' \
+         TOTP files without sudo: an agent with it can approve its own calls and forge any \
+         ticket. Give prompto a different ssh_user there, narrow the rule, or set \
+         crown_jewel_ack = true on it if that is really intended",
+        hits.join("; ")
+    ))
+}
+
+/// Does a non-root call to `tool` run as `ssh_user` on some host it
+/// names, by the `exec` capability?
+fn runs_as_ssh_user(tool: &str) -> bool {
+    use crate::inventory::Capability;
+    match authz::requirements(tool, &serde_json::json!({})) {
+        Some(authz::Requirements::Hosts(v)) => v
+            .iter()
+            .any(|(_, n)| *n == authz::Need::Cap(Capability::Exec)),
+        _ => false,
+    }
 }
 
 /// Root on a host marked `prompto_host`: whoever has it reads prompto's
@@ -1553,7 +1697,7 @@ approval = "ticket"
 
     fn lint_of(policy: &str) -> Vec<String> {
         let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
-        lint(&p, &inv(), &agents(), &tools())
+        lint(&p, &inv(), &agents(), &tools(), DEFAULT_SERVICE_USER)
             .iter()
             .map(|f| f.to_string())
             .collect()
@@ -1634,7 +1778,7 @@ capabilities = ["virt"]
         ];
         let lint_of = |policy: &str| -> Vec<String> {
             let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
-            lint(&p, &inv, &agents(), &tools)
+            lint(&p, &inv, &agents(), &tools, DEFAULT_SERVICE_USER)
                 .iter()
                 .map(|f| f.to_string())
                 .collect()
@@ -1704,7 +1848,7 @@ capabilities = ["exec", "sudo_exec"]
         let tools = ["ssh_exec", "ssh_sudo_exec", "file_read", "file_write"];
         let errors_of = |policy: &str| -> Vec<String> {
             let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
-            lint(&p, &inv, &agents(), &tools)
+            lint(&p, &inv, &agents(), &tools, DEFAULT_SERVICE_USER)
                 .iter()
                 .filter(|f| f.level == Level::Error)
                 .map(|f| f.to_string())
@@ -1746,6 +1890,92 @@ capabilities = ["exec", "sudo_exec"]
         );
     }
 
+    /// prompto's own service user reads the factor files without sudo:
+    /// a plain grant of anything that runs as `ssh_user` on the prompto
+    /// host — read-only file tools included — is an error when that
+    /// `ssh_user` is the service user, even where sudo needs a password.
+    #[test]
+    fn lint_errors_on_service_user_grants_on_the_prompto_host() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.core]
+ip = "192.0.2.1"
+ssh_user = "prompto"
+ssh_key = "/k"
+prompto_host = true
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.coreops]
+ip = "192.0.2.2"
+ssh_user = "ops"
+ssh_key = "/k"
+prompto_host = true
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.other]
+ip = "192.0.2.3"
+ssh_user = "prompto"
+ssh_key = "/k"
+nopasswd_sudo = false
+capabilities = ["exec"]
+"#,
+        )
+        .unwrap();
+        let tools = [
+            "ssh_exec",
+            "file_read",
+            "file_list",
+            "rsync_sync",
+            "inventory_list",
+            "host_status",
+        ];
+        let errors_of = |policy: &str, user: &str| -> Vec<String> {
+            let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
+            lint(&p, &inv, &agents(), &tools, user)
+                .iter()
+                .filter(|f| f.level == Level::Error)
+                .map(|f| f.to_string())
+                .collect()
+        };
+        let read = "[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"file_read\"]\n";
+        let f = errors_of(read, DEFAULT_SERVICE_USER);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("core (file_read)")
+                && !f[0].contains("coreops")
+                && !f[0].contains("other")
+                && f[0].contains("PROMPTO_SERVICE_USER"),
+            "{f:#?}"
+        );
+        // Every tool that runs as ssh_user there, none that doesn't.
+        let f = errors_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"*\"]\n",
+            DEFAULT_SERVICE_USER,
+        );
+        assert!(
+            f[0].contains("core (ssh_exec, file_read, file_list, rsync_sync)"),
+            "{f:#?}"
+        );
+        // PROMPTO_SERVICE_USER names the account.
+        assert!(errors_of(read, "svc").is_empty());
+        let f = errors_of(read, "ops");
+        assert!(
+            f.len() == 1 && f[0].contains("coreops (file_read)"),
+            "{f:#?}"
+        );
+        // Hostless and login-free tools, and an acknowledged rule: fine.
+        for ok in [
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"host_status\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"inventory_list\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"file_read\"]\n\
+             crown_jewel_ack = true\n",
+        ] {
+            assert!(errors_of(ok, DEFAULT_SERVICE_USER).is_empty(), "{ok}");
+        }
+    }
+
     /// Writing ~/.bashrc is code execution: a plain `file_write` grant and
     /// an `rsync_sync` grant warn like an exec grant does. `file_write`
     /// with `sudo = true` is a root grant and doesn't.
@@ -1758,7 +1988,7 @@ capabilities = ["exec", "sudo_exec"]
         let tools = ["file_write", "rsync_sync", "file_read"];
         let lint_of = |policy: &str| -> Vec<String> {
             let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
-            lint(&p, &inv, &agents(), &tools)
+            lint(&p, &inv, &agents(), &tools, DEFAULT_SERVICE_USER)
                 .iter()
                 .map(|f| f.to_string())
                 .collect()

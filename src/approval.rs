@@ -85,7 +85,7 @@ pub struct ApprovalConfig {
 /// `PROMPTO_PRIVATE_MOUNT` default.
 pub const DEFAULT_PRIVATE_MOUNT: &str = "prompto-private";
 /// `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` default.
-pub const DEFAULT_AGENT_READABLE: &str = "prompto/,infra/";
+pub const DEFAULT_AGENT_READABLE: &str = "prompto/,infra/,nxp/";
 
 /// A location in vault: a KV v2 mount and a path prefix in it (`""`: the
 /// whole mount). Matched like a vault policy glob `<mount>/<prefix>*`:
@@ -297,6 +297,10 @@ struct Inner {
     /// Approval secrets configured where agents can read them
     /// ([`PrivateVault::misplaced`]); while any is, approvals are off.
     misplaced: Mutex<Vec<String>>,
+    /// Policy lint errors on the host running prompto
+    /// (`policy::prompto_host_findings`): root or the service user's
+    /// shell there reads the factors. While any is, approvals are off.
+    policy_block: Mutex<Vec<String>>,
     state: Mutex<State>,
     guard: Mutex<Guard>,
 }
@@ -440,6 +444,7 @@ impl Approvals {
             keys: ArcSwapOption::empty(),
             key_error: Mutex::new(Some("no key loaded yet".into())),
             misplaced: Mutex::new(Vec::new()),
+            policy_block: Mutex::new(Vec::new()),
             state: Mutex::new(state),
             guard: Mutex::new(Guard::default()),
         })));
@@ -511,6 +516,58 @@ impl Approvals {
         }
         *held = found.clone();
         found
+    }
+
+    /// Record the live policy's lint errors on the host running prompto
+    /// (`policy::prompto_host_findings`); while there are any, every
+    /// ticket and approval is refused, as for a misplaced secret. Run at
+    /// startup, on SIGHUP and whenever `policy.toml` is re-read.
+    pub fn set_policy_block(&self, found: Vec<String>) {
+        let Some(i) = self.inner() else { return };
+        let mut held = i.policy_block.lock().unwrap_or_else(|e| e.into_inner());
+        if !found.is_empty() && *held != found {
+            for f in &found {
+                tracing::error!(
+                    "APPROVALS DISABLED — {f}. Every call that needs a ticket is refused until \
+                     this is fixed (checked on SIGHUP and when policy.toml changes)"
+                );
+            }
+        } else if found.is_empty() && !held.is_empty() {
+            tracing::info!(
+                "the policy no longer grants root or the service user on the prompto host; \
+                 approvals re-enabled"
+            );
+        }
+        *held = found;
+    }
+
+    /// Keep [`Self::set_policy_block`] in step with the policy: check
+    /// `policy` against the inventory live in `inv` now, and again after
+    /// every read of `policy.toml` (SIGHUP, or an edit seen on the next
+    /// call). `tools` is every tool name; `service_user` is
+    /// `PROMPTO_SERVICE_USER`. No-op when approvals aren't configured.
+    pub fn gate_on_policy(
+        &self,
+        policy: &crate::policy::PolicyStore,
+        inv: &crate::inventory::InventoryStore,
+        tools: Vec<String>,
+        service_user: String,
+    ) {
+        if !self.configured() {
+            return;
+        }
+        let (me, inv) = (self.clone(), inv.clone());
+        let check = move |p: &crate::policy::Policy| {
+            let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+            me.set_policy_block(crate::policy::prompto_host_findings(
+                p,
+                &inv.snapshot(),
+                &tools,
+                &service_user,
+            ));
+        };
+        check(&policy.snapshot());
+        policy.on_reload(check);
     }
 
     /// Read the keys from vault, else the file. On failure the keys in
@@ -589,6 +646,19 @@ impl Approvals {
             return Some(
                 "this prompto keeps an approval secret where agents can read it, so it issues \
                  and accepts no tickets until the operator moves it (see its journal)"
+                    .into(),
+            );
+        }
+        if !i
+            .policy_block
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return Some(
+                "this prompto's policy grants root or its service user's shell on the host it \
+                 runs on, which reads the approval secrets, so it issues and accepts no tickets \
+                 until the operator fixes the policy (see its journal)"
                     .into(),
             );
         }

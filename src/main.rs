@@ -191,7 +191,8 @@ struct PolicyReload {
 fn log_policy_lint(policy: &Policy, inv: &prompto::inventory::Inventory, agents: &Agents) {
     let tools = Prompto::tool_names();
     let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
-    for f in prompto::policy::lint(policy, inv, agents, &tools) {
+    let service_user = prompto::policy::service_user_from_env();
+    for f in prompto::policy::lint(policy, inv, agents, &tools, &service_user) {
         match f.level {
             prompto::policy::Level::Error => {
                 tracing::error!(rule = %f.rule, "policy lint: {}", f.message)
@@ -504,7 +505,7 @@ reads it approves its own calls):
       secrets live\", for the vault policy. Uses PROMPTO_VAULT_ADDR/_CACERT
       and a PROMPTO_VAULT_TOKEN that may write there (an operator token,
       not prompto's). Refused if the path is under
-      $PROMPTO_AGENT_READABLE_VAULT_PREFIXES (default prompto/,infra/ on
+      $PROMPTO_AGENT_READABLE_VAULT_PREFIXES (default prompto/,infra/,nxp/ on
       $PROMPTO_VAULT_MOUNT). Refused too if it shares a vault directory
       with a host's sudo_password_vault_path (policies written for those
       would likely cover it) unless --i-know.
@@ -1053,7 +1054,8 @@ fn run_policy_cli(cfg: &Config, args: &[String]) -> Result<i32> {
         Some("lint") if args.len() == 1 => {
             let (p, inv, agents) = load()?;
             let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
-            let findings = policy::lint(&p, &inv, &agents, &tools);
+            let service_user = policy::service_user_from_env();
+            let findings = policy::lint(&p, &inv, &agents, &tools, &service_user);
             if let Some(path) = &p.missing {
                 println!(
                     "warning: {} does not exist — every call is denied",
@@ -1374,6 +1376,16 @@ async fn main() -> Result<()> {
                  refused (approval_required)"
             );
         }
+    }
+    if let Some(p) = &policy {
+        // Root or the service user's shell on the prompto host reads the
+        // approval factors: approvals are off while the policy grants it.
+        approvals.gate_on_policy(
+            p,
+            &store,
+            Prompto::tool_names(),
+            prompto::policy::service_user_from_env(),
+        );
     }
     let reload = match (&agents, &policy) {
         (Some(a), Some(p)) => Some(PolicyReload {
