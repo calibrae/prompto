@@ -55,6 +55,13 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   - **Consequence:** a mod can silently redirect or alter calls. That's further proof enforcement must stay server-side, with the ticket bound to the exact arguments.
 - **S0.2 `rsync_sync` failure reason.** Classify its errors (precondition vs ssh vs rsync) and surface them in the tool result. It's the most-failed tool (26–72%/month).
 - **S0.3 Decide the 7 never-called tools:** `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `mcp_add`, `mcp_remove`, `mcp_restart_claudecli`. Keep or remove; every tool is surface that policy must cover.
+  - **Done (task 020, v0.12.2).** Owner decision, from 10,005 production calls since 2026-04-26: remove 14 tools.
+    - **Removed:** `claude_exec` (apytti is being retired) and its client; `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`; the whole `mcp_*` family (`mcp_list`/`get`/`add`/`remove`/`status`/`restart_claudecli`/`reconnect_hint`, and the `mcp_logs` alias of `service_logs`).
+    - **Kept:** `bash_exec`; `ssh_exec` with a quoted heredoc replaces the other interpreters.
+    - **Size:** `tools/list` went from 38 tools / 20,976 bytes to 24 tools / 12,858 bytes.
+    - **Old config loads:** old inventories (`claude_admin`, `claude_exec`, `apytti_url`) load, with the removed items dropped and logged once. A policy rule naming a removed tool is a lint warning (`removed in v0.12.2`), not an error.
+    - **Error classes:** `interpreter_missing` now means bash missing (`bash_exec` on FreeBSD); `upstream` is gone.
+  - **Advisor** (same task): an `ssh_exec` that is a simple instance of a typed tool (`cat`/`head`/`tail` → `file_read`, `ls` → `file_list`, `stat` → `file_stat`, `systemctl` → `service_control`, `journalctl -u` → `service_logs`, heredoc writes → `file_write`) gets a one-line hint. Every hint fires at most once per hour per session (agent + IP without one). `prompto_gain` counts hints and bytes per pattern, and the audit record names the pattern.
 - **S0.4 nginx attribution:** add `$host` to the mista access log format. Decide what happens to direct `:6337` access once auth exists. Once auth is in prompto, both paths are equivalent.
 
 ### E1 — Call context & central authorization (refactor, no behaviour change)
@@ -168,7 +175,7 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S7.6 Tests** with `claude plugin test`: allow / deny / ask flows against a stubbed `$.http`; fail-closed path.
 - **S7.7 Deployment:** a local marketplace dir and managed settings with `prependPlugins` (+ `sec-default@builtin`) on agent machines. Document `--safe-mode` / crash behaviour: no mod → no ticket → refused where required.
 - **Done (task 019, Claude Code 2.1.295).** Decisions (details in the README's *Claude Code plugin*):
-  - Session context: Claude Code's MCP connection runs its `headersHelper` once, before the hooks module loads, and gives it no session ID. A nested `claude` would inherit the parent's `CLAUDE_CODE_SESSION_ID`, and a mod can't force a reconnect or add headers. So by default the mod sends prompto calls itself over HTTP (`transport = "mod"`) with `X-Prompto-Session`, honouring Claude Code's permission verdict (`$.tool.check`; an `ask` goes to the person). `transport = "engine"` keeps the native connection (settings hooks, classifier), without a session.
+  - Session context: Claude Code's MCP connection runs its `headersHelper` once, before the hooks module loads, and gives it no session ID. A nested `claude` would inherit the parent's `CLAUDE_CODE_SESSION_ID`, and a mod can't force a reconnect or add headers. So by default the mod sends prompto calls itself over HTTP (`transport = "mod"`) with `X-Prompto-Session`, honouring Claude Code's permission verdict (`$.tool.check`; an `ask` goes to the person, except that since task 020 the approval pane answers it for a call that goes there). `transport = "engine"` keeps the native connection (settings hooks, classifier), without a session.
   - Precheck unreachable → **fail open**: sent without a ticket, prompto decides, and an `approval_required` refusal says why no ticket was requested. Nothing can be sent (no token, hook failed) → refused (`.catch`).
   - The pane waits inside the `tool.call` hook: a hook's 10 s budget runs while it awaits its own promise and stops during a `$` call, so it polls with `$.process.run(["sleep", "0.25"])`. Up to 10 min, then refused.
   - The TOTP code lives in one module variable from keystroke to `POST /v1/approve`; never `$.state`/`$.store`/logs/transcript. Code-shaped text in the name or reason field is refused. `Input` has no masking in this version.
@@ -236,7 +243,8 @@ The migration runs end to end in the sandbox, under load, before it touches prod
 | Release | Epics |
 |---|---|
 | v0.12.0 ✅ | E0, E1, E2, E3, E4, E5 — attributable, policed, audited, killable (shipped 2026-10-09) |
-| v0.12.1 | E6, E7 — precheck, tickets, Claude Code plugin with approval pane |
+| v0.12.1 ✅ | E6, E7 — precheck, tickets, Claude Code plugin with approval pane |
+| v0.12.2 | S0.3 — 14 unused tools removed; advisor steers to the typed tools; plugin: one prompt per approval, no `token_file` |
 | v0.12.x | E9 — Kanidm OIDC; flip to `required` |
 | v0.13.0 | E8 — per-call SSH certificates, static key retired host by host |
 | (gate) | E11 + E12: continuity proven and the migration rehearsed in the sandbox. Production moves only after this |

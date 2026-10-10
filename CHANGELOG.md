@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.12.2 — unreleased
+
+### Breaking: 14 unused tools removed (roadmap S0.3)
+
+Production usage since 2026-04-26 (10,005 calls) shows them unused or obsolete. Every tool is surface an agent reads on every turn and policy must cover: `tools/list` goes from 38 tools / 20,976 bytes to 24 tools / 12,858 bytes (−39%), and the server's `instructions` from 1,283 to 803 bytes.
+
+| Removed | Calls | Use instead |
+|---|---|---|
+| `claude_exec` (and the apytti client) | 2 | Ask your own agent; for a remote look, `host_diagnose`, `service_logs`, `ssh_exec` |
+| `python_exec` | 2 | `ssh_exec "python3 - <<'EOF'\n…\nEOF"` (arguments: `python3 - arg1 arg2 <<'EOF'`) |
+| `node_exec` | 0 | `ssh_exec "node - <<'EOF'\n…\nEOF"` |
+| `ruby_exec` | 0 | `ssh_exec "ruby - <<'EOF'\n…\nEOF"` |
+| `perl_exec` | 0 | `ssh_exec "perl - <<'EOF'\n…\nEOF"` |
+| `deno_exec` | 0 | `ssh_exec "deno run - <<'EOF'\n…\nEOF"` |
+| `mcp_list`, `mcp_get`, `mcp_add`, `mcp_remove`, `mcp_status`, `mcp_restart_claudecli`, `mcp_reconnect_hint` | 10 in all (with `mcp_logs`) | `ssh_exec "claude mcp list"` (or `get`/`add`/`remove`) on the client; `service_control` / `ssh_exec "systemctl --user restart claudecli"` for the bridge |
+| `mcp_logs` (deprecated alias) | | `service_logs` (same arguments) |
+
+`bash_exec` (47 calls) stays, and with a quoted heredoc (`<<'EOF'`) `ssh_exec` passes any script through untouched. A call to a removed tool is refused as an unknown tool (`invalid_args`).
+
+**Old configuration keeps working:**
+
+- **Inventory:** the `claude_admin` and `claude_exec` capabilities and `apytti_url` still load. They are dropped at load and logged once (`inventory: the claude_admin / claude_exec capabilities and apytti_url belong to tools removed in v0.12.2; they are ignored`). `inventory_list` / `inventory_get_host` no longer show them. `inv_check` and `prompto policy lint` list them as warnings. `claude_exec` no longer needs `apytti_url`.
+- **Policy:** a rule naming a removed tool still loads and grants nothing for it. `policy lint` reports `warning: unknown tool "claude_exec" (removed in v0.12.2)`, not an error, so the policy lints clean and approvals stay on. Any other unknown tool name is still an error.
+- **Error classes:** `upstream` (only `claude_exec` produced it) is gone. `interpreter_missing` now means `bash_exec` on a host without bash (FreeBSD, OPNsense).
+- **Audit records** of tools that no longer exist keep their names; the `client` argument (the `mcp_*` tools' host) is no longer read as a host by kill switches.
+
+### Advisor: steer to the typed tools, and say less
+
+- **Typed-tool hints.** An `ssh_exec` that is a simple instance of a typed tool gets a one-line `[advisor]` hint naming it:
+  - `cat <path>`, `head` / `tail [-n N] <path>` → `file_read`;
+  - `ls [-la] <path>` → `file_list`;
+  - `stat <path>` → `file_stat`;
+  - `systemctl <action> <unit>` → `service_control`;
+  - `journalctl -u <unit> [-n N]` → `service_logs`;
+  - `cat > <path> <<EOF` / `tee <path> <<EOF` writes → `file_write`.
+
+  The last three apply to `ssh_sudo_exec` too; reads don't, because `file_read` can't read as root. Only simple commands match: a pipe, `&&`, `;`, a redirection, a substitution, a glob, a quote or an option the typed tool lacks (`tail -f`, `journalctl --since`) means no hint.
+- **Every hint is rarer:** each distinct hint, including the existing `ssh_batch` and `rsync_sync` ones, fires at most once per hour per caller (`X-Prompto-Session`, else agent + client IP; it was once per 5 minutes per host for everyone). There is at most one hint per call, at most 120 bytes, on one line. The `ssh_batch` / `rsync_sync` bursts are counted per caller, so different agents no longer add up to a burst.
+- **Measured:** `prompto_gain` has an `advisor` section: hints given and bytes added since the process started, in all and per pattern. The audit record of a hinted call names the pattern (`"advisor": "cat"`).
+
+### Claude Code plugin
+
+- **One prompt, not two:** in `mod` transport, a call that goes to the approval pane no longer gets Claude Code's "Allow prompto …?" question first. The TOTP approval is the answer to Claude Code's `ask`, as it already was in `engine`. A Claude Code `deny` still refuses before the pane.
+- **`token_file` option removed.** The token is always `~/.config/prompto/token` (mode 0600). Claude Code's MCP connection could never see another path anyway. A `token_file` left in `pluginConfigs` is ignored. When the plugin's MCP server doesn't connect, the plugin logs what is wrong with the token file at session start (missing, mode, owner, ACL).
+
+### Upgrade note
+
+No configuration change is needed. Visible changes:
+
+1. The 14 tools are gone from `tools/list` and the instructions.
+2. The removed capabilities vanish from inventory views, with one warning in the log.
+3. Lint warnings for policy rules naming removed tools.
+4. Results carry fewer advisor hints, but some new ones.
+5. `prompto_gain` has a new `advisor` key.
+6. Audit records may carry `advisor`.
+7. Plugin users see one prompt instead of two for pane approvals; a custom `token_file` must be moved to the default path.
+
 ## v0.12.1 — 2026-10-10
 
 Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"` now grants a call that carries a valid ticket, instead of always refusing it.

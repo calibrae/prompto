@@ -163,7 +163,7 @@ Rotation becomes a non-event: certificates expire in minutes; the CA key rotates
 
 ## 6. Housekeeping before policy
 
-- Decide on the seven never-called tools (`node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `mcp_add`, `mcp_remove`, `mcp_restart_claudecli`): every tool is surface an agent reads and policy must cover.
+- Decide on the seven never-called tools (`node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `mcp_add`, `mcp_remove`, `mcp_restart_claudecli`): every tool is surface an agent reads and policy must cover. *Done in v0.12.2 (S0.3): those and seven more (`claude_exec`, `python_exec`, the rest of `mcp_*`) were removed, leaving 24 tools.*
 - Make every call attributable: the reverse proxy's access log should include the vhost, and the direct listener should not be reachable around the proxy (or must enforce the same auth — it will, once auth is in prompto itself).
 - Add `error_class` to `rsync_sync` failures first; it's the most-failed tool.
 
