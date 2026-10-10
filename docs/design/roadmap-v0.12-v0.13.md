@@ -189,15 +189,40 @@ A market survey found nothing that combines typed machine tools, per-agent ident
   6. turn on `approval=human` for sudo on mista/git/abbacchio.
 - **S10.3** Update the `homelab-add-host` skill (groups, policy, cert auth).
 
+### E11 — Continuity of service
+Agents run CI/CD through prompto all day. No deploy, reload or migration step may drop a call that would otherwise have succeeded.
+- **S11.1 Graceful drain.** On SIGTERM, stop accepting new MCP sessions and calls. Let in-flight calls (long `ssh_exec` builds, `rsync_sync`) finish within `PROMPTO_DRAIN_SECS`, then exit. Calls still running at the deadline are cancelled and audited as `aborted`. Ship the systemd unit with a matching `TimeoutStopSec`.
+- **S11.2 Restart without a gap.** Options: socket activation, or a short overlap where the new binary binds before the old one drains (`SO_REUSEPORT`). Pick one and measure: a client calling in a tight loop sees no failed request across a restart.
+- **S11.3 Every config reloads live.** Inventory, agents, policy and kill files reload without a restart, which is already true. Add a test that guards this.
+
+### E12 — Sandbox rehearsal of the production migration
+The migration runs end to end in the sandbox, under load, before it touches production. The outcome is a runbook with a tested rollback for every step.
+- **S12.1 Host diversity.** Add a FreeBSD guest with a csh login shell (like OPNsense), next to the existing NOPASSWD and password-sudo Linux targets. macOS hosts can't be virtualised there, so they get a manual checklist.
+- **S12.2 Load generator.** Run N concurrent fake agents with their own role tokens, mixing exec, file, rsync, sudo and deliberately refused calls. Report each call's outcome against the outcome expected for it. Pass = zero unexpected failures.
+- **S12.3 Production stand-in.**
+  - Sandbox Vault 1.21 with production's KV layout and fake values.
+  - prompto v0.11.1 with no auth, the way production runs today.
+  - The load generator running in its no-auth mode.
+- **S12.4 Rehearse, with load running throughout:**
+  1. v0.11.1 → v0.12 (`off`);
+  2. tokens, then `optional`, then `required`;
+  3. Vault → OpenBao (KV export/import, policies, token reissue, consumers cut over one at a time);
+  4. CA trust and certificates host by host (E8);
+  5. Kanidm identities (E9).
+
+  Every unexpected failure is fixed or the step redesigned.
+- **S12.5 Runbook.** Each step lists its precondition, command, verification, rollback and the continuity evidence from S12.4.
+
 ---
 
 ## Release map
 | Release | Epics |
 |---|---|
-| v0.12.0 | E0, E1, E2, E3, E4, E5 — attributable, policed, audited, killable (auth `optional`) |
+| v0.12.0 ✅ | E0, E1, E2, E3, E4, E5 — attributable, policed, audited, killable (shipped 2026-10-09) |
 | v0.12.1 | E6, E7 — precheck, tickets, Claude Code plugin with approval pane |
 | v0.12.x | E9 — Kanidm OIDC; flip to `required` |
 | v0.13.0 | E8 — per-call SSH certificates, static key retired host by host |
+| (gate) | E11 + E12: continuity proven and the migration rehearsed in the sandbox. Production moves only after this |
 
 ## Critical files
 - `src/server.rs` — auth middleware, `/v1/precheck`, `/v1/approve`, `/log` gating
