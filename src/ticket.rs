@@ -30,7 +30,11 @@
 //! `/v1/approve` with `scope_minutes`, "approve similar calls" — has no
 //! arguments digest and may be used for any number of calls until it
 //! expires (at most [`MAX_SCOPE_MINUTES`]), by the same agent, session,
-//! tool and host(s). See the README for exactly what "similar" covers.
+//! tool and host(s) — and only for calls with the same root-capability
+//! and decided by the same policy rule(s) as the approved call
+//! ([`Scope`]): freeing the arguments must not free `sudo = true`, nor
+//! carry an approval across to a call another rule decides. See the
+//! README for exactly what "similar" covers.
 
 use crate::policy::Approval;
 use anyhow::{Context, Result, anyhow, bail};
@@ -87,6 +91,26 @@ pub struct Claims {
     /// Multi-use, arguments free (see the module docs).
     #[serde(default)]
     pub scoped: bool,
+    /// What a scoped ticket stays bound to once the arguments are free;
+    /// present exactly when `scoped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+}
+
+/// The dimensions a scoped ticket keeps from the approved call besides
+/// agent, session, tool and host(s).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scope {
+    /// Whether the approved call was root-capable
+    /// (`authz::is_root_capable`): a scope approved for plain
+    /// `file_write` never covers `file_write` with `sudo = true`, nor the
+    /// reverse.
+    pub root: bool,
+    /// The policy rules that demanded the approval (by name,
+    /// `policy.toml:<line> (<id>)`). A call decided by another rule —
+    /// including the same rule moved by an edit — needs a new approval.
+    pub rules: Vec<String>,
 }
 
 /// One HMAC key.
@@ -222,7 +246,7 @@ pub fn decode(keys: &KeySet, ticket: &str) -> Result<Claims, String> {
         serde_json::from_slice(&raw).map_err(|e| format!("ticket claims are malformed: {e}"))?;
     // Signed by us, so these hold unless minting has a bug; checked
     // anyway, since a scoped ticket is the one that frees the arguments.
-    if c.scoped != c.args_sha256.is_none() {
+    if c.scoped != c.args_sha256.is_none() || c.scoped != c.scope.is_some() {
         return Err("ticket claims are inconsistent (scope vs arguments digest)".into());
     }
     if c.approval == Approval::None {
@@ -242,6 +266,10 @@ pub struct Expect<'a> {
     pub args_sha256: &'a str,
     /// What the deciding rule demands.
     pub required: Approval,
+    /// The deciding rule, by name.
+    pub rule: &'a str,
+    /// Whether the call is root-capable.
+    pub root: bool,
     /// Unix seconds.
     pub now: u64,
 }
@@ -308,11 +336,40 @@ impl Expect<'_> {
                     .into(),
             );
         }
+        if let Some(scope) = &c.scope {
+            scope.check(self.rule, self.root)?;
+        }
         if !satisfies(c.approval, self.required) {
             return Err(format!(
                 "ticket carries approval {:?}, the rule requires {:?}",
                 c.approval.as_str(),
                 self.required.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Scope {
+    /// Does a call decided by `rule`, root-capable or not, fall in this
+    /// scope?
+    pub fn check(&self, rule: &str, root: bool) -> Result<(), String> {
+        if self.root != root {
+            return Err(if root {
+                "the scoped approval covers calls without root (sudo); this call is \
+                 root-capable and needs its own approval"
+                    .into()
+            } else {
+                "the scoped approval covers root-capable calls only; this call needs its own \
+                 approval"
+                    .into()
+            });
+        }
+        if !self.rules.iter().any(|r| r == rule) {
+            return Err(format!(
+                "the scoped approval was granted under {}, this call is decided by {rule} — it \
+                 needs its own approval",
+                self.rules.join(", ")
             ));
         }
         Ok(())
@@ -414,6 +471,21 @@ mod tests {
             exp: now + TTL_SECS,
             nonce: nonce().unwrap(),
             scoped: false,
+            scope: None,
+        }
+    }
+
+    fn scoped(now: u64) -> Claims {
+        Claims {
+            scoped: true,
+            args_sha256: None,
+            approval: Approval::Human,
+            exp: now + 60 * 60,
+            scope: Some(Scope {
+                root: false,
+                rules: vec!["policy.toml:7 (r)".into()],
+            }),
+            ..claims(now)
         }
     }
 
@@ -426,6 +498,8 @@ mod tests {
             dest_host: None,
             args_sha256: Box::leak("d".repeat(64).into_boxed_str()),
             required: Approval::Ticket,
+            rule: "policy.toml:7 (r)",
+            root: false,
             now,
         }
     }
@@ -535,8 +609,21 @@ mod tests {
                 .unwrap_err()
                 .contains("inconsistent")
         );
-        c.args_sha256 = None;
-        decode(&k, &mint(&k, &c)).unwrap();
+        c.args_sha256 = None; // and no scope binding
+        assert!(
+            decode(&k, &mint(&k, &c))
+                .unwrap_err()
+                .contains("inconsistent")
+        );
+        decode(&k, &mint(&k, &scoped(1_000_000))).unwrap();
+        // Unscoped with a scope binding.
+        let mut c = claims(1_000_000);
+        c.scope = scoped(1_000_000).scope;
+        assert!(
+            decode(&k, &mint(&k, &c))
+                .unwrap_err()
+                .contains("inconsistent")
+        );
         let mut c = claims(1_000_000);
         c.args_sha256 = None; // unscoped without a digest
         assert!(
@@ -551,17 +638,29 @@ mod tests {
     #[test]
     fn scope_frees_only_the_arguments() {
         let now = 1_000_000;
-        let mut c = claims(now);
-        c.scoped = true;
-        c.args_sha256 = None;
-        c.approval = Approval::Human;
-        c.exp = now + 60 * 60;
+        let c = scoped(now);
         let mut e = expect(now);
         e.args_sha256 = "anything";
         e.required = Approval::Human;
         e.check(&c).unwrap();
         e.host = Some("t2");
         assert!(e.check(&c).is_err());
+        // Not the root dimension, in either direction, nor the rule.
+        let mut e = expect(now);
+        e.args_sha256 = "anything";
+        e.required = Approval::Human;
+        e.root = true;
+        assert!(e.check(&c).unwrap_err().contains("root-capable"));
+        let mut root = scoped(now);
+        root.scope.as_mut().unwrap().root = true;
+        e.check(&root).unwrap();
+        e.root = false;
+        assert!(e.check(&root).unwrap_err().contains("root-capable"));
+        let mut e = expect(now);
+        e.args_sha256 = "anything";
+        e.required = Approval::Human;
+        e.rule = "policy.toml:9 (other)";
+        assert!(e.check(&c).unwrap_err().contains("decided by"));
         let mut c2 = claims(now);
         c2.exp = now + TTL_SECS + 1;
         assert!(expect(now).check(&c2).unwrap_err().contains("lifetime"));

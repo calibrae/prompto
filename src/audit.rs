@@ -113,6 +113,10 @@ pub struct Notes {
     pub kill: Option<crate::kill::Kill>,
     /// The call's ticket, once `authz` accepted it (E6).
     pub ticket: Option<crate::approval::TicketNote>,
+    /// Each authorization whose granting rule demanded an approval: the
+    /// rule and whether the call is root-capable there. A scoped ticket
+    /// is bound to these (`crate::ticket::Scope`).
+    pub demands: Vec<crate::approval::Demand>,
 }
 
 /// The raw call as the client sent it. Installed by `Prompto::call_tool`

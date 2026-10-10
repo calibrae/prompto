@@ -25,7 +25,10 @@
 //! `approval = "human"` ticket naming the approver: single-use for
 //! exactly this call, or with `scope_minutes` (1–60) a multi-use ticket
 //! for every call of the same agent, session, tool and host(s), whatever
-//! the other arguments.
+//! the other arguments — as long as the same policy rule(s) decide it
+//! and it is root-capable exactly when the approved call was. A scope
+//! for a root-capable call additionally needs `allow_root_scope: true`
+//! (`crate::approval::scope_of`).
 //!
 //! Both are audited (`type: precheck` / `type: approve`), refusals and
 //! wrong codes included. A minted ticket is recorded by its SHA-256,
@@ -81,6 +84,9 @@ pub struct ApproveRequest {
     pub totp_code: String,
     #[serde(default)]
     pub scope_minutes: Option<u32>,
+    /// Required for a scoped approval of a root-capable call.
+    #[serde(default)]
+    pub allow_root_scope: bool,
 }
 
 /// The outcome of authorizing a call without running it.
@@ -287,30 +293,32 @@ pub async fn precheck(
                         out["reason"] = "policy grants this call; no approval needed".into();
                         ("allow", None, None, rule)
                     }
-                    Approval::Ticket => match mint(&st, &ctx, Approval::Ticket, None, None) {
-                        Ok((t, exp)) => {
-                            out["reason"] = format!(
-                                "rule {} grants this call with a ticket: pass it as the call's \
+                    Approval::Ticket => {
+                        match mint(&st, &ctx, Approval::Ticket, None, None, false) {
+                            Ok((t, exp)) => {
+                                out["reason"] = format!(
+                                    "rule {} grants this call with a ticket: pass it as the call's \
                                  `ticket` argument (single-use, expires in {} s)",
-                                rule.as_deref().unwrap_or("-"),
-                                crate::ticket::TTL_SECS
-                            )
-                            .into();
-                            out["ticket"] = t.clone().into();
-                            out["expires_at"] = exp.into();
-                            ("allow", None, Some(t), rule)
+                                    rule.as_deref().unwrap_or("-"),
+                                    crate::ticket::TTL_SECS
+                                )
+                                .into();
+                                out["ticket"] = t.clone().into();
+                                out["expires_at"] = exp.into();
+                                ("allow", None, Some(t), rule)
+                            }
+                            Err(e) => {
+                                out["error_class"] = e.class.as_str().into();
+                                out["reason"] = e.message.clone().into();
+                                (
+                                    "deny",
+                                    Some(e.with_rule(rule.clone().unwrap_or_default())),
+                                    None,
+                                    None,
+                                )
+                            }
                         }
-                        Err(e) => {
-                            out["error_class"] = e.class.as_str().into();
-                            out["reason"] = e.message.clone().into();
-                            (
-                                "deny",
-                                Some(e.with_rule(rule.clone().unwrap_or_default())),
-                                None,
-                                None,
-                            )
-                        }
-                    },
+                    }
                     Approval::Human => {
                         out["reason"] = format!(
                             "rule {} requires a human approval: POST /v1/approve with this call, \
@@ -347,16 +355,28 @@ fn mint(
     approval: Approval,
     approved_by: Option<String>,
     scope: Option<u32>,
+    allow_root_scope: bool,
 ) -> Result<(String, u64), ClassifiedError> {
     let tool = ctx.call.as_ref().map_or("", |c| c.tool.as_str());
     st.audit.preflight(ctx, tool)?;
     let inv = st.store.snapshot();
     st.approvals
-        .mint(Some(&inv), ctx, approval, approved_by, scope)
+        .mint(
+            Some(&inv),
+            ctx,
+            approval,
+            approved_by,
+            scope,
+            allow_root_scope,
+        )
         .map(|(t, c)| (t, c.exp))
         .map_err(|e| {
             ClassifiedError::refused(ErrorClass::RefusedTicket, format!("refused_ticket: {e}"))
         })
+}
+
+fn notes_root(ctx: &CallCtx) -> bool {
+    ctx.notes().demands.iter().any(|d| d.root)
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -447,6 +467,14 @@ pub async fn approve(
         let e = refused(ErrorClass::InvalidArgs, msg.clone());
         return finish(StatusCode::BAD_REQUEST, "deny", Some(e), rule, None, msg);
     }
+    // Before the code is checked, so a scope that can't be granted
+    // doesn't spend it.
+    if req.scope_minutes.is_some()
+        && let Err(msg) = crate::approval::scope_of(&ctx, req.allow_root_scope)
+    {
+        let e = refused(ErrorClass::InvalidArgs, msg.clone());
+        return finish(StatusCode::BAD_REQUEST, "deny", Some(e), rule, None, msg);
+    }
     if let Some(why) = st.approvals.unavailable() {
         let e = refused(ErrorClass::RefusedTicket, why.clone());
         return finish(
@@ -485,12 +513,19 @@ pub async fn approve(
         Approval::Human,
         Some(approver.clone()),
         req.scope_minutes,
+        req.allow_root_scope,
     ) {
         Ok((t, exp)) => {
             let msg = match req.scope_minutes {
                 Some(m) => format!(
-                    "approved by {approver}: the ticket covers every {} call to the same \
-                     host(s) in this session for {m} min, whatever the other arguments",
+                    "approved by {approver}: the ticket covers every {}{} call to the same \
+                     host(s) in this session under the same policy rule for {m} min, whatever \
+                     the other arguments",
+                    if notes_root(&ctx) {
+                        "root-capable "
+                    } else {
+                        ""
+                    },
                     req.tool
                 ),
                 None => format!(

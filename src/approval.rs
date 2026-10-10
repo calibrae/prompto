@@ -34,7 +34,9 @@
 //!   no ticket are unaffected), refuses ticketed calls saying why, and
 //!   keeps trying.
 //! - **Used nonces and TOTP steps outlive the process too.** Each use is
-//!   appended to the state file before the call proceeds, and reloaded
+//!   appended to the state file and synced to disk (`fdatasync`) before
+//!   the call proceeds — so neither a restart nor a power loss forgets
+//!   it — and reloaded
 //!   (unexpired entries only) at startup. Resetting them on restart would
 //!   leave a window — up to the 120 s TTL for a ticket, 90 s for a TOTP
 //!   code — in which the exact call (or approval) could be replayed. That
@@ -50,7 +52,7 @@ use crate::ctx::CallCtx;
 use crate::error_class::{ClassifiedError, ErrorClass};
 use crate::inventory::Inventory;
 use crate::policy::Approval;
-use crate::ticket::{self, Claims, Expect, KeySet, Replay};
+use crate::ticket::{self, Claims, Expect, KeySet, Replay, Scope};
 use crate::vault::VaultClient;
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwapOption;
@@ -71,10 +73,166 @@ pub const KEY_REFRESH: Duration = Duration::from_secs(60);
 /// Where things are.
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalConfig {
+    /// On [`PrivateVault::mount`].
     pub key_vault_path: Option<String>,
     pub key_file: Option<PathBuf>,
     pub approvers_path: PathBuf,
     pub state_path: PathBuf,
+    /// Where vault-held approval factors live, and where they must not.
+    pub private: PrivateVault,
+}
+
+/// `PROMPTO_PRIVATE_MOUNT` default.
+pub const DEFAULT_PRIVATE_MOUNT: &str = "prompto-private";
+/// `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` default.
+pub const DEFAULT_AGENT_READABLE: &str = "prompto/,infra/";
+
+/// A location in vault: a KV v2 mount and a path prefix in it (`""`: the
+/// whole mount). Matched like a vault policy glob `<mount>/<prefix>*`:
+/// a plain string prefix, so `prompto` also covers `prompto-x/…`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultPrefix {
+    pub mount: String,
+    pub prefix: String,
+}
+
+impl VaultPrefix {
+    pub fn covers(&self, mount: &str, path: &str) -> bool {
+        self.mount == mount && path.starts_with(&self.prefix)
+    }
+
+    /// The prefix a vault policy granting `path` most likely covers: its
+    /// directory (`prompto/sudo-default` → `prompto/`), or the whole
+    /// mount for a top-level path.
+    pub fn dir_of(mount: &str, path: &str) -> Self {
+        let prefix = path.rfind('/').map_or("", |i| &path[..=i]);
+        Self {
+            mount: mount.to_string(),
+            prefix: prefix.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for VaultPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}*", self.mount, self.prefix)
+    }
+}
+
+/// **Nothing an agent can read may be an approval factor or a signing
+/// key.** An agent that reads an approver's TOTP secret approves itself;
+/// one that reads the ticket key forges any ticket. Agents commonly get
+/// read access to vault through a gateway whose policy covers a prefix
+/// such as `secret/data/prompto/*` — the very prefix the sudo passwords
+/// live under. So the ticket key and the TOTP secrets are read from
+/// their own KV v2 mount (`PROMPTO_PRIVATE_MOUNT`, default
+/// `prompto-private`) that only prompto's token may read, and prompto
+/// refuses any of them that sits under a location agents can read
+/// (`PROMPTO_AGENT_READABLE_VAULT_PREFIXES`).
+#[derive(Clone, Debug)]
+pub struct PrivateVault {
+    /// The KV v2 mount the ticket key and TOTP secrets are read from.
+    pub mount: String,
+    /// Locations agents can read.
+    pub agent_readable: Vec<VaultPrefix>,
+}
+
+impl Default for PrivateVault {
+    fn default() -> Self {
+        Self {
+            mount: DEFAULT_PRIVATE_MOUNT.into(),
+            agent_readable: parse_prefixes(DEFAULT_AGENT_READABLE, "secret"),
+        }
+    }
+}
+
+/// Parse `PROMPTO_AGENT_READABLE_VAULT_PREFIXES`: comma-separated; an
+/// entry is a path prefix in `shared_mount` (`PROMPTO_VAULT_MOUNT`, the
+/// mount sudo passwords are read from), or `<mount>:<prefix>` for
+/// another mount (`<mount>:` alone: all of it).
+pub fn parse_prefixes(list: &str, shared_mount: &str) -> Vec<VaultPrefix> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| match e.split_once(':') {
+            Some((m, p)) => VaultPrefix {
+                mount: m.trim_matches('/').to_string(),
+                prefix: p.trim_start_matches('/').to_string(),
+            },
+            None => VaultPrefix {
+                mount: shared_mount.trim_matches('/').to_string(),
+                prefix: e.trim_start_matches('/').to_string(),
+            },
+        })
+        .collect()
+}
+
+impl PrivateVault {
+    /// From `PROMPTO_PRIVATE_MOUNT`, `PROMPTO_AGENT_READABLE_VAULT_PREFIXES`
+    /// and `PROMPTO_VAULT_MOUNT`.
+    pub fn from_env() -> Self {
+        let shared = std::env::var("PROMPTO_VAULT_MOUNT").unwrap_or_else(|_| "secret".into());
+        let mount = std::env::var("PROMPTO_PRIVATE_MOUNT")
+            .ok()
+            .map(|m| m.trim().trim_matches('/').to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| DEFAULT_PRIVATE_MOUNT.into());
+        let list = std::env::var("PROMPTO_AGENT_READABLE_VAULT_PREFIXES")
+            .unwrap_or_else(|_| DEFAULT_AGENT_READABLE.into());
+        Self {
+            mount,
+            agent_readable: parse_prefixes(&list, shared.trim()),
+        }
+    }
+
+    /// Refuse `path` (on [`Self::mount`]) if agents can read it. `what`
+    /// names it in the error.
+    pub fn check_path(&self, what: &str, path: &str) -> Result<()> {
+        if let Some(p) = self
+            .agent_readable
+            .iter()
+            .find(|p| p.covers(&self.mount, path))
+        {
+            bail!(
+                "{what} is at vault {}/{path}, under {p}, which agents can read \
+                 (PROMPTO_AGENT_READABLE_VAULT_PREFIXES). An agent that reads it could approve \
+                 its own calls or forge tickets, so prompto refuses it. Move it to a mount only \
+                 prompto's token can read (PROMPTO_PRIVATE_MOUNT, default {DEFAULT_PRIVATE_MOUNT}; \
+                 see the README, \"Where the approval secrets live\")",
+                self.mount
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_path`] for an approver's factor; files can't be
+    /// checked this way (see the README).
+    pub fn check_factor(&self, f: &approvers::Factor) -> Result<()> {
+        match f {
+            approvers::Factor::TotpVault(p) => self.check_path("this approver's TOTP secret", p),
+            approvers::Factor::TotpFile(_) => Ok(()),
+        }
+    }
+
+    /// Everything configured now that agents could read: the ticket key
+    /// path and every active approver's vault path. Empty when all is
+    /// well.
+    pub fn misplaced(&self, key_vault_path: Option<&str>, list: &Approvers) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(p) = key_vault_path
+            && let Err(e) = self.check_path("the ticket key (PROMPTO_TICKET_KEY_VAULT_PATH)", p)
+        {
+            out.push(format!("{e:#}"));
+        }
+        for (name, e) in list.approvers.iter().filter(|(_, e)| !e.disabled) {
+            if let Ok(f) = e.factor()
+                && let Err(e) = self.check_factor(&f)
+            {
+                out.push(format!("approver {name}: {e:#}"));
+            }
+        }
+        out
+    }
 }
 
 impl ApprovalConfig {
@@ -94,6 +252,7 @@ impl ApprovalConfig {
         Some(Self {
             key_vault_path,
             key_file,
+            private: PrivateVault::from_env(),
             approvers_path: var("PROMPTO_APPROVERS")
                 .unwrap_or_else(|| DEFAULT_APPROVERS.into())
                 .into(),
@@ -112,6 +271,17 @@ pub struct TicketNote {
     pub approval: Approval,
     pub approved_by: Option<String>,
     pub scoped: bool,
+    /// A scoped ticket's binding, checked again by the call's other
+    /// authorizations.
+    pub scope: Option<ticket::Scope>,
+}
+
+/// One authorization that needs a ticket: the deciding rule, and whether
+/// the call is root-capable there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Demand {
+    pub rule: String,
+    pub root: bool,
 }
 
 /// Tickets and approvals; `Default` is "not configured".
@@ -124,6 +294,9 @@ struct Inner {
     keys: ArcSwapOption<KeySet>,
     /// Why the last key load failed, for refusals.
     key_error: Mutex<Option<String>>,
+    /// Approval secrets configured where agents can read them
+    /// ([`PrivateVault::misplaced`]); while any is, approvals are off.
+    misplaced: Mutex<Vec<String>>,
     state: Mutex<State>,
     guard: Mutex<Guard>,
 }
@@ -202,6 +375,11 @@ impl State {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
             std::fs::rename(&tmp, &self.path)?;
+            // The rename itself, durable before anything is appended
+            // (best effort: not every platform syncs a directory).
+            if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let _ = File::open(dir).and_then(|d| d.sync_all());
+            }
             OpenOptions::new().append(true).open(&self.path)
         };
         self.lines = self.replay.len() + self.steps.len();
@@ -214,7 +392,15 @@ impl State {
             self.file = self.compact(now);
         }
         let f = self.file.as_mut().map_err(|e| e.clone())?;
+        // Synced before the use it records takes effect: a power loss
+        // must not forget a spent nonce or TOTP step while it could
+        // still be replayed. `fdatasync` of one appended line measured
+        // ~1.7 ms (p99 ~2.5 ms) on the sandbox VMs' virtio disks, against
+        // calls that take an SSH round trip (and human approvals). It is
+        // done under the state lock, which caps ticketed calls at a few
+        // hundred a second — far above what approvals are for.
         f.write_all(format!("{line}\n").as_bytes())
+            .and_then(|()| f.sync_data())
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
         self.lines += 1;
         Ok(())
@@ -236,8 +422,9 @@ pub enum ApproveError {
 impl Approvals {
     /// Tickets and approvals with this configuration. Never fails: what
     /// can't be read is retried (keys) or refuses ticketed calls with the
-    /// reason (state file), so a broken approval setup can't stop calls
-    /// that need no approval.
+    /// reason (state file, misplaced secrets), so a broken approval setup
+    /// can't stop calls that need no approval. `vault` is the client for
+    /// the private mount ([`PrivateVault::mount`]).
     pub fn new(cfg: ApprovalConfig, vault: Option<Arc<VaultClient>>) -> Self {
         let state = State::open(&cfg.state_path, ticket::unix_now());
         if let Err(e) = &state.file {
@@ -247,14 +434,17 @@ impl Approvals {
                  be written (PROMPTO_APPROVAL_STATE)"
             );
         }
-        Self(Some(Arc::new(Inner {
+        let a = Self(Some(Arc::new(Inner {
             cfg,
             vault,
             keys: ArcSwapOption::empty(),
             key_error: Mutex::new(Some("no key loaded yet".into())),
+            misplaced: Mutex::new(Vec::new()),
             state: Mutex::new(state),
             guard: Mutex::new(Guard::default()),
-        })))
+        })));
+        a.check_placement();
+        a
     }
 
     /// Approvals with a fixed key set, for tests.
@@ -265,6 +455,13 @@ impl Approvals {
             *i.key_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         a
+    }
+
+    /// Approver names the lockout tracks individually (tests).
+    pub fn tracked_approver_names(&self) -> usize {
+        self.inner().map_or(0, |i| {
+            i.guard.lock().unwrap_or_else(|e| e.into_inner()).tracked()
+        })
     }
 
     /// Is a key source configured at all?
@@ -288,12 +485,41 @@ impl Approvals {
         self.0.as_deref()
     }
 
+    /// Check that no approval secret is configured where agents can
+    /// read it ([`PrivateVault`]); while one is, every ticket and
+    /// approval is refused. Run at startup, with every key refresh and on
+    /// SIGHUP. Returns what is misplaced.
+    pub fn check_placement(&self) -> Vec<String> {
+        let Some(i) = self.inner() else {
+            return Vec::new();
+        };
+        let list = Approvers::from_path(&i.cfg.approvers_path).unwrap_or_default();
+        let found = i
+            .cfg
+            .private
+            .misplaced(i.cfg.key_vault_path.as_deref(), &list);
+        let mut held = i.misplaced.lock().unwrap_or_else(|e| e.into_inner());
+        if !found.is_empty() && *held != found {
+            for f in &found {
+                tracing::error!(
+                    "APPROVALS DISABLED — {f}. Every call that needs a ticket is refused until \
+                     this is fixed (checked every minute and on SIGHUP)"
+                );
+            }
+        } else if found.is_empty() && !held.is_empty() {
+            tracing::info!("approval secrets are no longer agent-readable; approvals re-enabled");
+        }
+        *held = found.clone();
+        found
+    }
+
     /// Read the keys from vault, else the file. On failure the keys in
     /// hand are kept.
     pub async fn load_keys(&self) -> Result<()> {
         let Some(i) = self.inner() else {
             return Ok(());
         };
+        self.check_placement();
         let res = read_keys(&i.cfg, i.vault.as_deref()).await;
         let mut err = i.key_error.lock().unwrap_or_else(|e| e.into_inner());
         match res {
@@ -354,6 +580,18 @@ impl Approvals {
                     .into(),
             );
         };
+        if !i
+            .misplaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return Some(
+                "this prompto keeps an approval secret where agents can read it, so it issues \
+                 and accepts no tickets until the operator moves it (see its journal)"
+                    .into(),
+            );
+        }
         if i.keys.load().is_none() {
             let why = i
                 .key_error
@@ -374,20 +612,20 @@ impl Approvals {
         None
     }
 
-    /// S6.4: the deciding rule demands `required`; does the call carry a
-    /// ticket that fits it? Spends the ticket's nonce unless the call is
-    /// a dry run (precheck) or the ticket is scoped. `on` is the host for
-    /// messages.
-    #[allow(clippy::too_many_arguments)]
+    /// S6.4: the deciding rule (`demand`) demands `required`; does the
+    /// call carry a ticket that fits it? Spends the ticket's nonce unless
+    /// the call is a dry run (precheck) or the ticket is scoped. `on` is
+    /// the host for messages.
     pub fn require(
         &self,
         inv: Option<&Inventory>,
         ctx: &CallCtx,
         tool: &str,
-        rule: &str,
+        demand: &Demand,
         on: Option<&str>,
         required: Approval,
     ) -> Result<(), ClassifiedError> {
+        let rule = demand.rule.as_str();
         let refuse = |msg: String| {
             Err(ClassifiedError::refused(
                 ErrorClass::RefusedTicket,
@@ -398,6 +636,11 @@ impl Approvals {
         // A second authorization in the same call: the ticket was checked
         // (and spent) by the first.
         if let Some(t) = ctx.notes().ticket {
+            if let Some(scope) = &t.scope
+                && let Err(e) = scope.check(rule, demand.root)
+            {
+                return refuse(e);
+            }
             if ticket::satisfies(t.approval, required) {
                 return Ok(());
             }
@@ -444,6 +687,8 @@ impl Approvals {
             dest_host: dest_host.as_deref(),
             args_sha256: &digest,
             required,
+            rule,
+            root: demand.root,
             now,
         };
         if let Err(e) = expect.check(&claims) {
@@ -476,6 +721,7 @@ impl Approvals {
             approval: claims.approval,
             approved_by: claims.approved_by.clone(),
             scoped: claims.scoped,
+            scope: claims.scope.clone(),
         };
         ctx.note(|n| n.ticket = Some(note));
         tracing::info!(
@@ -492,7 +738,10 @@ impl Approvals {
     }
 
     /// Mint a ticket for the call in `ctx` (`ctx.call` holds its tool and
-    /// arguments). `scope_minutes`: an "approve similar calls" ticket.
+    /// arguments; its notes, the rules that demanded an approval, see
+    /// [`scope_of`]). `scope_minutes`: an "approve similar calls" ticket,
+    /// bound to those rules and to the call's root-capability.
+    /// `allow_root_scope` must be set for a root-capable call's scope.
     pub fn mint(
         &self,
         inv: Option<&Inventory>,
@@ -500,6 +749,7 @@ impl Approvals {
         approval: Approval,
         approved_by: Option<String>,
         scope_minutes: Option<u32>,
+        allow_root_scope: bool,
     ) -> Result<(String, Claims), String> {
         if let Some(why) = self.unavailable() {
             return Err(why);
@@ -523,6 +773,10 @@ impl Approvals {
                     .into(),
             );
         }
+        let scope = match scope_minutes {
+            None => None,
+            Some(_) => Some(scope_of(ctx, allow_root_scope)?),
+        };
         let (host, dest_host) = authz::bound_hosts(&call.tool, &call.args, inv);
         let now = ticket::unix_now();
         let claims = Claims {
@@ -541,6 +795,7 @@ impl Approvals {
             exp: now + scope_minutes.map_or(ticket::TTL_SECS, |m| u64::from(m) * 60),
             nonce: ticket::nonce().map_err(|e| e.to_string())?,
             scoped: scope_minutes.is_some(),
+            scope,
         };
         Ok((ticket::mint(&keys, &claims), claims))
     }
@@ -548,16 +803,37 @@ impl Approvals {
     /// Verify an approver's code (S6.3): known, not revoked, not locked
     /// out, a code for current ±1 step that is newer than the last one
     /// accepted. The accepted step is recorded before this returns.
+    ///
+    /// Unknown, revoked and malformed names fail exactly like a wrong
+    /// code — same message, and the same TOTP computation against a
+    /// dummy secret — so the answer doesn't say which names exist.
     pub async fn verify_approver(&self, name: &str, code: &str) -> Result<(), ApproveError> {
+        const INVALID: &str = "invalid approver or code";
         let i = self
             .inner()
             .ok_or_else(|| ApproveError::Unavailable(self.unavailable().unwrap_or_default()))?;
+        // Names come from callers: one that could not be an approver is
+        // refused before any lookup, and never tracked (the lockout map
+        // is keyed by name).
+        if crate::agent::validate_name("approver", name).is_err() {
+            tracing::warn!(
+                approver = %crate::audit::clamp(name, 64),
+                "approval refused: malformed approver name"
+            );
+            return Err(ApproveError::Refused(INVALID.into()));
+        }
         let now = ticket::unix_now();
+        let list = Approvers::from_path(&i.cfg.approvers_path).map_err(|e| {
+            tracing::error!(error = %format!("{e:#}"), "cannot read the approvers file");
+            ApproveError::Unavailable(UNVERIFIABLE.into())
+        })?;
+        let entry = list.approvers.get(name).filter(|e| !e.disabled);
+        let known = entry.is_some();
         if let Some(until) = i
             .guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .locked(name, now)
+            .locked(name, known, now)
         {
             return Err(ApproveError::Locked(name.to_string(), until));
         }
@@ -566,9 +842,10 @@ impl Approvals {
                 .guard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .fail(name, now);
+                .fail(name, known, now);
             tracing::warn!(
                 approver = name,
+                known,
                 why,
                 locked = locked.is_some(),
                 "approval refused"
@@ -578,28 +855,27 @@ impl Approvals {
                 None => ApproveError::Refused(why.to_string()),
             }
         };
-        let list = Approvers::from_path(&i.cfg.approvers_path).map_err(|e| {
-            tracing::error!(error = %format!("{e:#}"), "cannot read the approvers file");
-            ApproveError::Unavailable("cannot read the approvers file (see the journal)".into())
-        })?;
-        // Unknown and revoked approvers fail like a wrong code, so the
-        // answer doesn't say which names exist.
-        let Some(entry) = list.approvers.get(name).filter(|e| !e.disabled) else {
-            return Err(fail("invalid approver or code"));
+        let secret = match entry {
+            Some(entry) => {
+                let unavailable = |e: anyhow::Error| {
+                    tracing::error!(approver = name, error = %format!("{e:#}"), "cannot read an approver's TOTP secret");
+                    ApproveError::Unavailable(UNVERIFIABLE.into())
+                };
+                let factor = entry.factor().map_err(unavailable)?;
+                if let Err(e) = i.cfg.private.check_factor(&factor) {
+                    // Edited in since the last check: approvals off now.
+                    self.check_placement();
+                    return Err(unavailable(e));
+                }
+                approvers::secret(&factor, i.vault.as_deref())
+                    .await
+                    .map_err(unavailable)?
+            }
+            None => DUMMY_SECRET.to_vec(),
         };
-        let factor = entry
-            .factor()
-            .map_err(|e| ApproveError::Unavailable(e.to_string()))?;
-        let secret = approvers::secret(&factor, i.vault.as_deref())
-            .await
-            .map_err(|e| {
-                tracing::error!(approver = name, error = %format!("{e:#}"), "cannot read an approver's TOTP secret");
-                ApproveError::Unavailable(format!(
-                    "cannot read approver {name}'s TOTP secret (see the journal)"
-                ))
-            })?;
-        let Some(step) = crate::totp::matching_step(&secret, code, now) else {
-            return Err(fail("invalid approver or code"));
+        let step = crate::totp::matching_step(&secret, code, now);
+        let Some(step) = step.filter(|_| known) else {
+            return Err(fail(INVALID));
         };
         let mut st = i.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.steps.get(name).is_some_and(|&last| step <= last) {
@@ -618,6 +894,53 @@ impl Approvals {
             .succeed(name);
         Ok(())
     }
+}
+
+/// What `/v1/approve` says when an approver's factor can't be read —
+/// the same for every name (details in the journal).
+const UNVERIFIABLE: &str = "cannot verify approver codes right now (see the journal)";
+
+/// The secret an unknown approver's code is checked against, so that
+/// path does the same work as a known one. Never matches anything that
+/// counts: the result is discarded.
+const DUMMY_SECRET: [u8; crate::totp::SECRET_LEN] = [0x5a; crate::totp::SECRET_LEN];
+
+/// What a scoped ticket for the call in `ctx` is bound to: the rules
+/// that demanded an approval in its authorization (noted by `authz`),
+/// and whether it is root-capable.
+///
+/// A scope frees the arguments, so for a root-capable call it is "any
+/// root command on that host for N minutes" — a root shell in all but
+/// name. That is refused unless the approver asked for it explicitly
+/// (`allow_root_scope`); the ticket is then still bound to root calls
+/// under the same rule(s), never to plain ones, and the reverse.
+pub fn scope_of(ctx: &CallCtx, allow_root_scope: bool) -> Result<Scope, String> {
+    let demands = ctx.notes().demands;
+    if demands.is_empty() {
+        return Err("no policy rule demanded an approval for this call".into());
+    }
+    let root = demands.iter().any(|d| d.root);
+    if root && demands.iter().any(|d| !d.root) {
+        return Err(
+            "a scoped approval cannot cover a call that is root-capable on one host and not on \
+             the other"
+                .into(),
+        );
+    }
+    if root && !allow_root_scope {
+        return Err(
+            "this call is root-capable: a scoped approval would cover any root command for its \
+             duration. Approve it on its own, or have the approver set allow_root_scope = true"
+                .into(),
+        );
+    }
+    let mut rules: Vec<String> = Vec::new();
+    for d in demands {
+        if !rules.contains(&d.rule) {
+            rules.push(d.rule);
+        }
+    }
+    Ok(Scope { root, rules })
 }
 
 /// The refusal for a call that needs an approval and carries no ticket:
@@ -657,6 +980,13 @@ fn approval_required_message(
 async fn read_keys(cfg: &ApprovalConfig, vault: Option<&VaultClient>) -> Result<KeySet> {
     let mut errors = Vec::new();
     if let Some(path) = &cfg.key_vault_path {
+        // Never even read a key agents could read: it is no key.
+        if let Err(e) = cfg
+            .private
+            .check_path("the ticket key (PROMPTO_TICKET_KEY_VAULT_PATH)", path)
+        {
+            bail!("{e:#}");
+        }
         match vault {
             None => errors.push(format!(
                 "PROMPTO_TICKET_KEY_VAULT_PATH={path} but no vault is configured \
@@ -664,7 +994,11 @@ async fn read_keys(cfg: &ApprovalConfig, vault: Option<&VaultClient>) -> Result<
             )),
             Some(v) => match read_vault_keys(v, path).await {
                 Ok(k) => return Ok(k),
-                Err(e) => errors.push(format!("vault {path}: {e:#}")),
+                Err(e) => errors.push(format!(
+                    "vault {}/{path}: {e:#} (the ticket key is read from the private mount, \
+                     PROMPTO_PRIVATE_MOUNT)",
+                    v.mount()
+                )),
             },
         }
     }
@@ -697,6 +1031,6 @@ async fn read_vault_keys(v: &VaultClient, path: &str) -> Result<KeySet> {
     Ok(KeySet {
         current,
         previous,
-        source: format!("vault:{path}"),
+        source: format!("vault:{}/{path}", v.mount()),
     })
 }

@@ -111,6 +111,21 @@ impl VaultClient {
         &self.addr
     }
 
+    pub fn mount(&self) -> &str {
+        &self.mount
+    }
+
+    /// The same server and token on another KV v2 mount (the approval
+    /// secrets' private mount, `crate::approval::PrivateVault`).
+    pub fn with_mount(&self, mount: &str) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            mount: mount.trim_matches('/').to_string(),
+            token: self.token.clone(),
+            http: self.http.clone(),
+        }
+    }
+
     /// Read one string field from a KV v2 secret.
     pub async fn kv2_field(&self, path: &str, field: &str) -> Result<String> {
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);

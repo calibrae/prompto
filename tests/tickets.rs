@@ -11,7 +11,7 @@
 
 use mcp_gain::Tracker;
 use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode};
-use prompto::approval::{ApprovalConfig, Approvals};
+use prompto::approval::{ApprovalConfig, Approvals, Demand};
 use prompto::audit::{Audit, AuditLog};
 use prompto::inventory::{Inventory, InventoryStore};
 use prompto::policy::{Approval, Policy, PolicyStore};
@@ -183,6 +183,7 @@ async fn spawn_opts(o: Opts) -> Server {
         key_file: None,
         approvers_path: write_approvers(dir.path(), 12),
         state_path: dir.path().join("approval-state"),
+        ..Default::default()
     };
     let approvals = if o.tickets {
         Approvals::with_keys(cfg, keys.clone())
@@ -634,6 +635,7 @@ fn claims_for(s: &Server, tool: &str, args: &Value, approval: Approval) -> Claim
         exp: now + ticket::TTL_SECS,
         nonce: ticket::nonce().unwrap(),
         scoped: false,
+        scope: None,
     }
 }
 
@@ -1076,7 +1078,8 @@ async fn scoped_approval_covers_similar_calls_only() {
         Some(SESSION),
         json!({
             "tool": "ssh_sudo_exec", "arguments": exec("t1"),
-            "approver": "ap0", "totp_code": code(0), "scope_minutes": 10
+            "approver": "ap0", "totp_code": code(0), "scope_minutes": 10,
+            "allow_root_scope": true
         }),
     )
     .await;
@@ -1231,6 +1234,7 @@ async fn restart_keeps_tickets_valid_and_spent_ones_spent() {
         key_file: None,
         approvers_path: write_approvers(dir.path(), 1),
         state_path: dir.path().join("approval-state"),
+        ..Default::default()
     };
     let ctx_for = |args: Value| {
         let mut ctx = prompto::ctx::CallCtx::new(None).with_identity(prompto::agent::Identity {
@@ -1249,17 +1253,34 @@ async fn restart_keeps_tickets_valid_and_spent_ones_spent() {
     };
     let before = Approvals::with_keys(cfg.clone(), keyset(7));
     let (spent, _) = before
-        .mint(None, &ctx_for(exec("t1")), Approval::Ticket, None, None)
+        .mint(
+            None,
+            &ctx_for(exec("t1")),
+            Approval::Ticket,
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let (fresh, _) = before
-        .mint(None, &ctx_for(exec("t1")), Approval::Ticket, None, None)
+        .mint(
+            None,
+            &ctx_for(exec("t1")),
+            Approval::Ticket,
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let use_it = |a: &Approvals, t: &str| {
         a.require(
             None,
             &ctx_for(with_ticket(exec("t1"), t)),
             "ssh_exec",
-            "r",
+            &Demand {
+                rule: "r".into(),
+                root: false,
+            },
             Some("t1"),
             Approval::Ticket,
         )
@@ -1288,6 +1309,7 @@ async fn unwritable_state_refuses_only_ticketed_calls() {
         approvers_path: write_approvers(dir.path(), 1),
         // A directory can't be opened for appending.
         state_path: dir.path().to_path_buf(),
+        ..Default::default()
     };
     let a = Approvals::with_keys(cfg, keyset(7));
     let why = a.unavailable().expect("unavailable");
@@ -1344,6 +1366,7 @@ async fn mint_refuses_a_scope_without_a_session() {
         key_file: None,
         approvers_path: write_approvers(dir.path(), 1),
         state_path: dir.path().join("approval-state"),
+        ..Default::default()
     };
     let a = Approvals::with_keys(cfg, keyset(7));
     let mut ctx = prompto::ctx::CallCtx::new(None).with_identity(prompto::agent::Identity {
@@ -1359,17 +1382,406 @@ async fn mint_refuses_a_scope_without_a_session() {
         exec("t1").as_object().cloned(),
     ));
     let e = a
-        .mint(None, &ctx, Approval::Human, Some("ap0".into()), Some(5))
+        .mint(
+            None,
+            &ctx,
+            Approval::Human,
+            Some("ap0".into()),
+            Some(5),
+            false,
+        )
         .unwrap_err();
     assert!(e.contains("needs a session"), "{e}");
     for bad in [0, ticket::MAX_SCOPE_MINUTES + 1] {
         ctx.session_id = Some(SESSION.into());
         assert!(
-            a.mint(None, &ctx, Approval::Human, None, Some(bad))
+            a.mint(None, &ctx, Approval::Human, None, Some(bad), false)
                 .is_err()
         );
     }
-    a.mint(None, &ctx, Approval::Human, None, Some(5)).unwrap();
+    // No rule demanded an approval: nothing to bind a scope to.
+    let e = a
+        .mint(None, &ctx, Approval::Human, None, Some(5), false)
+        .unwrap_err();
+    assert!(e.contains("no policy rule"), "{e}");
+    ctx.note(|n| {
+        n.demands.push(Demand {
+            rule: "r".into(),
+            root: false,
+        })
+    });
+    let (_, c) = a
+        .mint(None, &ctx, Approval::Human, None, Some(5), false)
+        .unwrap();
+    assert_eq!(
+        c.scope,
+        Some(ticket::Scope {
+            root: false,
+            rules: vec!["r".into()]
+        })
+    );
+    // A root-capable call's scope needs allow_root_scope.
+    ctx.note(|n| n.demands[0].root = true);
+    let e = a
+        .mint(None, &ctx, Approval::Human, None, Some(5), false)
+        .unwrap_err();
+    assert!(e.contains("allow_root_scope"), "{e}");
+    let (_, c) = a
+        .mint(None, &ctx, Approval::Human, None, Some(5), true)
+        .unwrap();
+    assert!(c.scope.unwrap().root);
     ctx.session_id = None;
-    a.mint(None, &ctx, Approval::Ticket, None, None).unwrap();
+    a.mint(None, &ctx, Approval::Ticket, None, None, false)
+        .unwrap();
+}
+
+/// Review finding (E6 follow-up): a scope approved for plain `file_write`
+/// must not cover `file_write` with `sudo = true` — same agent, session,
+/// tool and host, and a human ticket satisfies the root rule's `human`.
+/// The scope is bound to the call's root-capability and deciding rule.
+#[tokio::test]
+async fn a_scope_for_a_plain_call_never_covers_a_root_one() {
+    let s = spawn().await;
+    let plain = json!({"host": "t1", "path": "/tmp/x", "content": "a"});
+    let (st, v) = post(
+        &s,
+        "approve",
+        ALPHA,
+        Some(SESSION),
+        json!({
+            "tool": "file_write", "arguments": plain,
+            "approver": "ap0", "totp_code": code(0), "scope_minutes": 10
+        }),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let t = v["ticket"].as_str().unwrap().to_string();
+    // Other plain writes: covered.
+    let r = call(
+        &s,
+        "file_write",
+        json!({"host": "t1", "path": "/tmp/y", "content": "b", "ticket": t}),
+    )
+    .await;
+    assert!(
+        !matches!(class(&r), Some("refused_ticket" | "approval_required")),
+        "{r}"
+    );
+    let ran = s.argv_log().lines().count();
+    // The same write as root: refused, nothing runs.
+    let r = call(
+        &s,
+        "file_write",
+        json!({"host": "t1", "path": "/etc/sudoers.d/x", "content": "b", "sudo": true, "ticket": t}),
+    )
+    .await;
+    assert_eq!(class(&r), Some("refused_ticket"), "{r}");
+    assert!(message(&r).contains("root-capable"), "{r}");
+    assert_eq!(s.argv_log().lines().count(), ran);
+    // Precheck agrees.
+    let v = precheck(
+        &s,
+        "file_write",
+        json!({"host": "t1", "path": "/etc/x", "content": "b", "sudo": true, "ticket": t}),
+    )
+    .await;
+    assert_eq!(v["decision"], "deny", "{v}");
+}
+
+/// A scope for a root-capable call is "any root command for N minutes":
+/// refused unless the approver asks for it with `allow_root_scope`, and
+/// the refusal comes before the code is checked, so it isn't spent.
+#[tokio::test]
+async fn a_root_scope_needs_allow_root_scope() {
+    let s = spawn().await;
+    settle().await;
+    let body = |allow: Option<bool>| {
+        let mut b = json!({
+            "tool": "ssh_sudo_exec", "arguments": exec("t1"),
+            "approver": "ap0", "totp_code": code(0), "scope_minutes": 5
+        });
+        if let Some(a) = allow {
+            b["allow_root_scope"] = a.into();
+        }
+        b
+    };
+    for allow in [None, Some(false)] {
+        let (st, v) = post(&s, "approve", ALPHA, Some(SESSION), body(allow)).await;
+        assert_eq!(st, 400, "{v}");
+        assert!(
+            v["reason"].as_str().unwrap().contains("allow_root_scope"),
+            "{v}"
+        );
+        assert!(v.get("ticket").is_none());
+    }
+    // The code wasn't spent: it still approves, scoped and explicit.
+    let (st, v) = post(&s, "approve", ALPHA, Some(SESSION), body(Some(true))).await;
+    assert_eq!(st, 200, "{v}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("root-capable"),
+        "{v}"
+    );
+}
+
+/// A scope over a call two rules decide (rsync_sync's source and dest)
+/// binds both, and still covers that call with other paths.
+#[tokio::test]
+async fn a_scope_binds_every_rule_that_demanded_it() {
+    let s = spawn_opts(Opts {
+        tickets: true,
+        policy: "[[rule]]\nagents = [\"alpha\"]\nhosts = [\"t1\"]\ntools = [\"rsync_sync\"]\napproval = \"ticket\"\n\
+                 [[rule]]\nagents = [\"alpha\"]\nhosts = [\"t2\"]\ntools = [\"rsync_sync\"]\napproval = \"human\"\n",
+    })
+    .await;
+    let args = |p: &str| json!({"source_host": "t1", "source_path": p, "dest_host": "t2", "dest_path": "/b/"});
+    let (st, v) = post(
+        &s,
+        "approve",
+        ALPHA,
+        Some(SESSION),
+        json!({
+            "tool": "rsync_sync", "arguments": args("/a/"),
+            "approver": "ap0", "totp_code": code(0), "scope_minutes": 5
+        }),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let r = call(
+        &s,
+        "rsync_sync",
+        with_ticket(args("/c/"), v["ticket"].as_str().unwrap()),
+    )
+    .await;
+    assert!(
+        !matches!(class(&r), Some("refused_ticket" | "approval_required")),
+        "{r}"
+    );
+}
+
+/// Approver names come from callers. Malformed ones (too long, wrong
+/// charset) are refused before any lookup, and many distinct unknown
+/// names never grow the lockout map past its bound nor lock out a real
+/// approver.
+#[tokio::test]
+async fn approver_names_are_validated_and_flooding_them_is_bounded() {
+    let s = spawn().await;
+    settle().await;
+    let invalid = |v: &Value| v["reason"] == "invalid approver or code";
+    for bad in ["A".repeat(10_000), "Ap0".into(), "ap0 ".into(), "".into()] {
+        let (st, v) = approve(&s, &bad, &code(0), "ssh_sudo_exec", exec("t1")).await;
+        assert_eq!(st, 403, "{v}");
+        assert!(invalid(&v), "{v}");
+    }
+    assert_eq!(s.approvals.tracked_approver_names(), 0);
+    let n = prompto::approvers::MAX_TRACKED + 200;
+    for i in 0..n {
+        let _ = s
+            .approvals
+            .verify_approver(&format!("nobody-{i}"), "000000")
+            .await;
+    }
+    assert_eq!(
+        s.approvals.tracked_approver_names(),
+        prompto::approvers::MAX_TRACKED
+    );
+    // A real approver is still tracked on their own, and not locked.
+    let (st, v) = approve(&s, "ap0", &code(0), "ssh_sudo_exec", exec("t1")).await;
+    assert_eq!(st, 200, "{v}");
+    // The overflow names, though, were locked together.
+    let (st, v) = approve(&s, "nobody-new", &code(0), "ssh_sudo_exec", exec("t1")).await;
+    assert_eq!(st, 429, "{v}");
+}
+
+/// Unknown, revoked and known approvers with a wrong code get the same
+/// answer, so it doesn't say which names exist.
+#[tokio::test]
+async fn unknown_revoked_and_wrong_code_answer_alike() {
+    let s = spawn().await;
+    let mut seen = Vec::new();
+    for name in ["ap1", "nosuch", "gone"] {
+        let (st, v) = approve(&s, name, "000000", "ssh_sudo_exec", exec("t1")).await;
+        seen.push((st, v["reason"].clone(), v["error_class"].clone()));
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    assert_eq!(seen[0].0, 403);
+}
+
+/// The ticket key or a TOTP secret where agents can read it (the
+/// production finding: `prompto/` on the shared mount, which the agents'
+/// vault gateway reads) turns approvals off — nothing is issued or
+/// accepted — with an error saying what to move where.
+#[tokio::test]
+async fn approval_secrets_agents_can_read_disable_approvals() {
+    use prompto::approval::{PrivateVault, parse_prefixes};
+    let dir = tempfile::tempdir().unwrap();
+    let shared = PrivateVault {
+        mount: "secret".into(),
+        agent_readable: parse_prefixes("prompto/,infra/", "secret"),
+    };
+    let base = ApprovalConfig {
+        approvers_path: write_approvers(dir.path(), 1),
+        state_path: dir.path().join("approval-state"),
+        ..Default::default()
+    };
+    // Defaults: private mount, nothing misplaced.
+    let ok = Approvals::with_keys(
+        ApprovalConfig {
+            key_vault_path: Some("prompto/ticket-key".into()),
+            ..base.clone()
+        },
+        keyset(7),
+    );
+    assert_eq!(ok.unavailable(), None);
+    assert!(ok.check_placement().is_empty());
+    // The ticket key on the shared mount under prompto/: off.
+    let bad = Approvals::with_keys(
+        ApprovalConfig {
+            key_vault_path: Some("prompto/ticket-key".into()),
+            private: shared.clone(),
+            ..base.clone()
+        },
+        keyset(7),
+    );
+    let why = bad.unavailable().expect("approvals off");
+    assert!(why.contains("agents can read"), "{why}");
+    let found = bad.check_placement();
+    assert!(
+        found[0].contains("secret/prompto/ticket-key")
+            && found[0].contains("PROMPTO_PRIVATE_MOUNT"),
+        "{found:?}"
+    );
+    // An `mount:prefix` entry names another mount.
+    let other = PrivateVault {
+        mount: "prompto-private".into(),
+        agent_readable: parse_prefixes("infra/,prompto-private:approvers/", "secret"),
+    };
+    let toml = "[approver.ap0]\ntotp_vault_path = \"approvers/ap0\"\n";
+    let path = dir.path().join("vault-approvers.toml");
+    std::fs::write(&path, toml).unwrap();
+    let bad = Approvals::with_keys(
+        ApprovalConfig {
+            approvers_path: path.clone(),
+            private: other,
+            ..base.clone()
+        },
+        keyset(7),
+    );
+    assert!(bad.unavailable().is_some());
+    assert!(bad.check_placement()[0].contains("approver ap0"));
+    // An approver edited into an agent-readable path is refused at its
+    // next approval, which turns approvals off without waiting for the
+    // periodic check.
+    std::fs::write(&path, toml).unwrap();
+    let a2 = Approvals::with_keys(
+        ApprovalConfig {
+            approvers_path: path.clone(),
+            private: shared.clone(),
+            ..base.clone()
+        },
+        keyset(7),
+    );
+    assert_eq!(a2.unavailable(), None, "approvers/ap0 is fine on any mount");
+    std::fs::write(&path, "[approver.ap0]\ntotp_vault_path = \"infra/ap0\"\n").unwrap();
+    let e = a2.verify_approver("ap0", &code(0)).await.unwrap_err();
+    assert!(
+        matches!(e, prompto::approval::ApproveError::Unavailable(_)),
+        "{e:?}"
+    );
+    assert!(a2.unavailable().is_some());
+}
+
+const BIN: &str = env!("CARGO_BIN_EXE_prompto");
+
+/// `prompto approver add --vault-path`: refused where agents can read,
+/// and — unless `--i-know` — in the same vault directory as a sudo
+/// password. Both refusals come before anything touches vault.
+#[test]
+fn approver_cli_refuses_agent_readable_and_sudo_prefixed_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let inv = dir.path().join("prompto.toml");
+    std::fs::write(
+        &inv,
+        "[host.edge]\nip = \"192.0.2.9\"\nssh_user = \"u\"\nssh_key = \"/k\"\n\
+         capabilities = [\"exec\", \"sudo_exec\"]\nsudo_password_vault_path = \"ops/sudo-edge\"\n",
+    )
+    .unwrap();
+    let run = |mount: &str, path: &str, extra: &[&str]| {
+        let out = std::process::Command::new(BIN)
+            .args(["approver", "add", "alice", "--vault-path", path])
+            .args(extra)
+            .env_clear()
+            .env("PROMPTO_INVENTORY", &inv)
+            .env("PROMPTO_APPROVERS", dir.path().join("approvers.toml"))
+            .env("PROMPTO_PRIVATE_MOUNT", mount)
+            .env("PROMPTO_VAULT_MOUNT", "secret")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    // The old default, prompto/approvers/<name> on the shared mount.
+    let e = run("secret", "prompto/approvers/alice", &["--i-know"]);
+    assert!(e.contains("agents can read"), "{e}");
+    // Next to a sudo password: refused, --i-know lets it through (to the
+    // missing token, here).
+    let e = run("secret", "ops/approvers-alice", &[]);
+    assert!(e.contains("sudo password") && e.contains("--i-know"), "{e}");
+    let e = run("secret", "ops/approvers-alice", &["--i-know"]);
+    assert!(e.contains("PROMPTO_VAULT_TOKEN"), "{e}");
+    // The private mount: straight to vault.
+    let e = run("prompto-private", "approvers/alice", &[]);
+    assert!(e.contains("PROMPTO_VAULT_TOKEN"), "{e}");
+    assert!(!dir.path().join("approvers.toml").exists());
+}
+
+/// A call's second authorization (`rsync_sync`'s dest) reuses the ticket
+/// the first one accepted — and re-checks a scoped ticket's binding, so
+/// a dest decided by a rule the approval never saw (a policy edit in the
+/// scope's lifetime) or root-capable is refused.
+#[tokio::test]
+async fn a_second_authorization_rechecks_the_scope() {
+    use prompto::approval::TicketNote;
+    let dir = tempfile::tempdir().unwrap();
+    let a = Approvals::with_keys(
+        ApprovalConfig {
+            approvers_path: write_approvers(dir.path(), 1),
+            state_path: dir.path().join("approval-state"),
+            ..Default::default()
+        },
+        keyset(7),
+    );
+    let ctx = prompto::ctx::CallCtx::new(None);
+    ctx.note(|n| {
+        n.ticket = Some(TicketNote {
+            approval: Approval::Human,
+            approved_by: Some("ap0".into()),
+            scoped: true,
+            scope: Some(ticket::Scope {
+                root: false,
+                rules: vec!["r1".into()],
+            }),
+        })
+    });
+    let demand = |rule: &str, root| Demand {
+        rule: rule.into(),
+        root,
+    };
+    a.require(
+        None,
+        &ctx,
+        "rsync_sync",
+        &demand("r1", false),
+        None,
+        Approval::Human,
+    )
+    .unwrap();
+    for (d, want) in [
+        (demand("r2", false), "decided by r2"),
+        (demand("r1", true), "root-capable"),
+    ] {
+        let e = a
+            .require(None, &ctx, "rsync_sync", &d, None, Approval::Human)
+            .unwrap_err();
+        assert!(e.message.contains(want), "{}", e.message);
+    }
 }

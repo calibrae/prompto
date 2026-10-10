@@ -55,7 +55,7 @@ pub const LOCKOUT_SECS: u64 = 15 * 60;
 pub const VAULT_FIELD: &str = "totp_secret";
 /// Most approvers [`Guard`] tracks failures for (names come from
 /// callers, so unknown ones count too, under a bound).
-const MAX_TRACKED: usize = 4096;
+pub const MAX_TRACKED: usize = 4096;
 
 /// One `[approver.<name>]`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,25 +159,54 @@ pub async fn secret(factor: &Factor, vault: Option<&VaultClient>) -> Result<Vec<
 }
 
 /// Failed attempts and lockouts, per approver name.
+///
+/// Names come from callers, so the map is bounded: an approver listed in
+/// `approvers.toml` (`known`) is always tracked, any other name only
+/// while fewer than [`MAX_TRACKED`] are. Past that, failures for names
+/// not yet tracked go to one shared bucket that locks them all together
+/// — guessing at many names costs the guesser, and never grows memory or
+/// touches the real approvers' counters. (Malformed names are refused
+/// before they get here, see `Approvals::verify_approver`.)
 #[derive(Debug, Default)]
 pub struct Guard {
     failures: HashMap<String, Vec<u64>>,
     locked_until: HashMap<String, u64>,
+    overflow: Vec<u64>,
+    overflow_until: u64,
 }
 
 impl Guard {
+    /// Would a failure for `name` go to the shared bucket?
+    fn overflows(&self, name: &str, known: bool) -> bool {
+        !known && !self.failures.contains_key(name) && self.failures.len() >= MAX_TRACKED
+    }
+
     /// Is `name` locked out at `now`? Returns the end of the lockout.
-    pub fn locked(&self, name: &str, now: u64) -> Option<u64> {
-        self.locked_until.get(name).copied().filter(|&t| t > now)
+    pub fn locked(&self, name: &str, known: bool, now: u64) -> Option<u64> {
+        if let Some(t) = self.locked_until.get(name).copied().filter(|&t| t > now) {
+            return Some(t);
+        }
+        (self.overflows(name, known) && self.overflow_until > now).then_some(self.overflow_until)
     }
 
     /// Count a failure; the [`MAX_FAILURES`]+1-th within the window
     /// locks the approver. Returns the lockout end when it does.
-    pub fn fail(&mut self, name: &str, now: u64) -> Option<u64> {
-        if self.failures.len() >= MAX_TRACKED && !self.failures.contains_key(name) {
+    pub fn fail(&mut self, name: &str, known: bool, now: u64) -> Option<u64> {
+        if self.overflows(name, known) {
             self.failures
                 .retain(|_, v| v.iter().any(|&t| t + FAILURE_WINDOW_SECS > now));
             self.locked_until.retain(|_, &mut t| t > now);
+        }
+        if self.overflows(name, known) {
+            let f = &mut self.overflow;
+            f.retain(|&t| t + FAILURE_WINDOW_SECS > now);
+            f.push(now);
+            if f.len() > MAX_FAILURES {
+                f.clear();
+                self.overflow_until = now + LOCKOUT_SECS;
+                return Some(self.overflow_until);
+            }
+            return None;
         }
         let f = self.failures.entry(name.to_string()).or_default();
         f.retain(|&t| t + FAILURE_WINDOW_SECS > now);
@@ -194,6 +223,11 @@ impl Guard {
     /// A correct code: the failure count starts over.
     pub fn succeed(&mut self, name: &str) {
         self.failures.remove(name);
+    }
+
+    /// Names tracked individually (tests).
+    pub fn tracked(&self) -> usize {
+        self.failures.len()
     }
 }
 
@@ -231,25 +265,51 @@ mod tests {
         let mut g = Guard::default();
         let t = 1_000_000;
         for i in 0..MAX_FAILURES as u64 {
-            assert_eq!(g.fail("alice", t + i), None);
+            assert_eq!(g.fail("alice", true, t + i), None);
         }
-        let until = g.fail("alice", t + 10).expect("locked");
+        let until = g.fail("alice", true, t + 10).expect("locked");
         assert_eq!(until, t + 10 + LOCKOUT_SECS);
-        assert_eq!(g.locked("alice", t + 11), Some(until));
-        assert_eq!(g.locked("alice", until), None);
-        assert_eq!(g.locked("bob", t), None);
+        assert_eq!(g.locked("alice", true, t + 11), Some(until));
+        assert_eq!(g.locked("alice", true, until), None);
+        assert_eq!(g.locked("bob", true, t), None);
         // Failures spread beyond the window never lock.
         let mut g = Guard::default();
         for i in 0..20 {
-            assert_eq!(g.fail("bob", t + i * FAILURE_WINDOW_SECS), None);
+            assert_eq!(g.fail("bob", true, t + i * FAILURE_WINDOW_SECS), None);
         }
         // A success resets the count.
         let mut g = Guard::default();
         for i in 0..MAX_FAILURES as u64 {
-            g.fail("c", t + i);
+            g.fail("c", true, t + i);
         }
         g.succeed("c");
-        assert_eq!(g.fail("c", t + 9), None);
+        assert_eq!(g.fail("c", true, t + 9), None);
+    }
+
+    /// Many distinct unknown names: the map stops growing at
+    /// MAX_TRACKED, the extra names share one bucket that locks them
+    /// together, and known approvers are tracked (and lock) on their own.
+    #[test]
+    fn unknown_names_cannot_grow_the_map() {
+        let mut g = Guard::default();
+        let t = 1_000_000;
+        for i in 0..MAX_TRACKED + 1000 {
+            g.fail(&format!("n{i}"), false, t);
+        }
+        assert_eq!(g.tracked(), MAX_TRACKED);
+        // The 1000 overflowing failures locked the shared bucket: any
+        // untracked unknown name is locked, a tracked one is not (yet).
+        assert!(g.locked("fresh", false, t + 1).is_some());
+        assert_eq!(g.locked("n0", false, t + 1), None);
+        // A known approver is tracked past the bound and unaffected.
+        assert_eq!(g.locked("alice", true, t + 1), None);
+        assert_eq!(g.fail("alice", true, t + 1), None);
+        assert_eq!(g.tracked(), MAX_TRACKED + 1);
+        // Once the window has passed, stale entries are pruned and new
+        // names are tracked again.
+        let later = t + FAILURE_WINDOW_SECS + LOCKOUT_SECS;
+        assert_eq!(g.fail("fresh", false, later), None);
+        assert!(g.tracked() <= 2, "{}", g.tracked());
     }
 
     #[test]

@@ -137,6 +137,8 @@ struct RawRule {
     sudo: bool,
     #[serde(default)]
     approval: Approval,
+    #[serde(default)]
+    crown_jewel_ack: bool,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +218,9 @@ pub struct Rule {
     pub tools: Vec<Glob>,
     pub sudo: bool,
     pub approval: Approval,
+    /// The operator knowingly grants root on a `prompto_host` (see
+    /// [`lint`]).
+    pub crown_jewel_ack: bool,
     /// `policy.toml:<line>`, plus ` (<id>)` when the rule has an id.
     name: String,
 }
@@ -478,6 +483,7 @@ impl Policy {
             tools,
             sudo: r.sudo,
             approval: r.approval,
+            crown_jewel_ack: r.crown_jewel_ack,
             name,
         })
     }
@@ -883,7 +889,9 @@ impl std::fmt::Display for Finding {
 /// Check `policy` against the inventory, the agents and the tool list.
 ///
 /// Errors: references to agents, hosts, host groups or tools that don't
-/// exist (a typo there silently grants nothing). Warnings: agent groups
+/// exist (a typo there silently grants nothing), and root granted on the
+/// host running prompto (inventory `prompto_host`, see
+/// `root_on_prompto_host`) without `crown_jewel_ack = true`. Warnings: agent groups
 /// nobody is in yet, globs that match nothing, disabled agents, exec grants without `sudo = true` on hosts
 /// where the shell is root anyway ([`authz::ARBITRARY_EXEC_TOOLS`]), and
 /// rules that can never decide a call —
@@ -969,6 +977,9 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
         if let Some(msg) = exec_as_root(rule, inv, tools) {
             push(Level::Warning, rule, msg)
         }
+        if let Some(msg) = root_on_prompto_host(rule, inv, tools) {
+            push(Level::Error, rule, msg)
+        }
     }
     reachability(policy, inv, agents, tools, &mut out);
     out.sort_by_key(|f| f.level);
@@ -1023,6 +1034,72 @@ fn exec_as_root(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> 
          a password",
         names.join(", "),
         hosts.join(", ")
+    ))
+}
+
+/// Root on a host marked `prompto_host`: whoever has it reads prompto's
+/// vault token (`/etc/prompto/env`), the ticket key and TOTP files, and
+/// can then approve anything or forge any ticket. An **error** for a rule
+/// that grants, on such a host, a root-capable tool (`sudo = true`; not
+/// `vm_stop`, which is not a shell) or an exec tool
+/// ([`authz::ARBITRARY_EXEC_TOOLS`]) where `ssh_user` can become root —
+/// is root, or sudo works without a password or isn't known not to
+/// (`nopasswd_sudo` true or unset), or prompto itself sudoes there
+/// (`sudo_exec`, `sudo_password_vault_path`). Hosts lacking the tools'
+/// capability are skipped. `crown_jewel_ack = true` on the rule silences
+/// it.
+fn root_on_prompto_host(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> {
+    use crate::inventory::Capability;
+    if rule.crown_jewel_ack {
+        return None;
+    }
+    let mut hits: Vec<String> = Vec::new();
+    for (n, h) in &inv.hosts {
+        if !h.prompto_host || !rule.matches_host(&Target::of(n, h)) {
+            continue;
+        }
+        let granted: Vec<&str> = if rule.sudo {
+            if !h.has(Capability::SudoExec) {
+                continue;
+            }
+            tools
+                .iter()
+                .copied()
+                .filter(|t| {
+                    *t != "vm_stop"
+                        && rule.matches_tool(t)
+                        && authz::root_variants(t).contains(&true)
+                })
+                .collect()
+        } else {
+            let can_sudo = h.ssh_user == "root"
+                || h.nopasswd_sudo != Some(false)
+                || h.has(Capability::SudoExec)
+                || h.sudo_password_vault_path.is_some();
+            if !can_sudo {
+                continue;
+            }
+            authz::ARBITRARY_EXEC_TOOLS
+                .iter()
+                .filter(|(t, cap)| tools.contains(t) && rule.matches_tool(t) && h.has(*cap))
+                .map(|(t, _)| *t)
+                .collect()
+        };
+        if !granted.is_empty() {
+            hits.push(format!("{n} ({})", granted.join(", ")));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort();
+    Some(format!(
+        "grants root on the host running prompto (prompto_host = true): {}. Root there reads \
+         /etc/prompto/env (prompto's vault token, which reads the approval secrets' private \
+         mount), the ticket key file and approvers' TOTP files: an agent with it can approve \
+         its own calls and forge any ticket. Narrow the rule's hosts or tools, or set \
+         crown_jewel_ack = true on it if that is really intended",
+        hits.join("; ")
     ))
 }
 
@@ -1593,6 +1670,82 @@ capabilities = ["virt"]
         assert!(f[0].contains("(ssh_exec)") && f[0].contains("unknown (nopasswd_sudo unset)"));
     }
 
+    /// Root on the host running prompto reads every approval factor: an
+    /// error (not a warning) for a sudo grant there, or an exec grant
+    /// where ssh_user can sudo — unless the rule acknowledges it.
+    #[test]
+    fn lint_errors_on_root_grants_on_the_prompto_host() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.core]
+ip = "192.0.2.1"
+ssh_user = "u"
+ssh_key = "/k"
+prompto_host = true
+capabilities = ["exec", "sudo_exec"]
+
+[host.corepw]
+ip = "192.0.2.2"
+ssh_user = "u"
+ssh_key = "/k"
+prompto_host = true
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.other]
+ip = "192.0.2.3"
+ssh_user = "u"
+ssh_key = "/k"
+nopasswd_sudo = false
+capabilities = ["exec", "sudo_exec"]
+"#,
+        )
+        .unwrap();
+        let tools = ["ssh_exec", "ssh_sudo_exec", "file_read", "file_write"];
+        let errors_of = |policy: &str| -> Vec<String> {
+            let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
+            lint(&p, &inv, &agents(), &tools)
+                .iter()
+                .filter(|f| f.level == Level::Error)
+                .map(|f| f.to_string())
+                .collect()
+        };
+        // sudo = true on the prompto host: error, naming host and tools.
+        let f = errors_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"*\"]\nsudo = true\n",
+        );
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("core (ssh_sudo_exec, file_write)") && f[0].contains("crown_jewel_ack"),
+            "{f:#?}"
+        );
+        // An exec grant where ssh_user can sudo: error too.
+        let f =
+            errors_of("[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"ssh_exec\"]\n");
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("core (ssh_exec)") && !f[0].contains("corepw"),
+            "{f:#?}"
+        );
+        // Not on a host whose sudo needs a password, not for read-only
+        // tools, not on other hosts.
+        for ok in [
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"corepw\"]\ntools = [\"ssh_exec\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"file_read\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"other\"]\ntools = [\"*\"]\nsudo = true\n",
+        ] {
+            assert!(errors_of(ok).is_empty(), "{ok}: {:#?}", errors_of(ok));
+        }
+        // Acknowledged: no error.
+        assert!(
+            errors_of(
+                "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"*\"]\nsudo = true\n\
+                 crown_jewel_ack = true\n"
+            )
+            .is_empty()
+        );
+    }
+
     /// Writing ~/.bashrc is code execution: a plain `file_write` grant and
     /// an `rsync_sync` grant warn like an exec grant does. `file_write`
     /// with `sudo = true` is a root grant and doesn't.
@@ -1939,7 +2092,7 @@ capabilities = ["virt"]
         let p = Policy::from_toml_str(include_str!("../deploy/policy.toml.example"), "policy.toml")
             .unwrap();
         assert_eq!(p.rules.len(), 6);
-        assert_eq!(p.rules[0].name(), "policy.toml:35 (infra-router-sudo)");
+        assert_eq!(p.rules[0].name(), "policy.toml:40 (infra-router-sudo)");
     }
 
     #[test]

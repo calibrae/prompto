@@ -326,7 +326,15 @@ pub fn authorize(
     if let Some(p) = policy {
         let root = is_root_capable(tool, need);
         let grant = p.check(ctx, tool, Some((&target.canonical, &target.host)), root)?;
-        approve(p, Some(inv), ctx, tool, &grant, Some(&target.canonical))?;
+        approve(
+            p,
+            Some(inv),
+            ctx,
+            tool,
+            &grant,
+            Some(&target.canonical),
+            root,
+        )?;
         target.rule = Some(grant.rule);
     }
 
@@ -348,7 +356,15 @@ pub fn lookup(
     let mut target = resolve(inv, host_name, Need::Exists)?;
     if let Some(p) = policy {
         let grant = p.check(ctx, tool, Some((&target.canonical, &target.host)), false)?;
-        approve(p, Some(inv), ctx, tool, &grant, Some(&target.canonical))?;
+        approve(
+            p,
+            Some(inv),
+            ctx,
+            tool,
+            &grant,
+            Some(&target.canonical),
+            false,
+        )?;
         target.rule = Some(grant.rule);
     }
     Ok(target)
@@ -364,11 +380,12 @@ pub fn authorize_tool(
 ) -> Result<Option<String>, ClassifiedError> {
     let Some(p) = policy else { return Ok(None) };
     let grant = p.check(ctx, tool, None, false)?;
-    approve(p, None, ctx, tool, &grant, None)?;
+    approve(p, None, ctx, tool, &grant, None, false)?;
     Ok(Some(grant.rule))
 }
 
 /// Step 5: the ticket, when the granting rule demands an approval.
+/// `root`: the call is root-capable (a scoped ticket is bound to it).
 fn approve(
     p: &Enforcer,
     inv: Option<&Inventory>,
@@ -376,12 +393,18 @@ fn approve(
     tool: &str,
     grant: &crate::policy::Grant,
     on: Option<&str>,
+    root: bool,
 ) -> Result<(), ClassifiedError> {
     if grant.approval == crate::policy::Approval::None {
         return Ok(());
     }
+    let demand = crate::approval::Demand {
+        rule: grant.rule.clone(),
+        root,
+    };
+    ctx.note(|n| n.demands.push(demand.clone()));
     p.approvals
-        .require(inv, ctx, tool, &grant.rule, on, grant.approval)
+        .require(inv, ctx, tool, &demand, on, grant.approval)
 }
 #[cfg(test)]
 mod tests {
