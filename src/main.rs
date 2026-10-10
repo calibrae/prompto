@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use mcp_gain::Tracker;
 use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode, Identity};
+use prompto::approval::{ApprovalConfig, Approvals};
 use prompto::audit::{self, Audit, AuditLog};
 use prompto::baselines::BASELINES;
 use prompto::caller;
@@ -180,6 +181,8 @@ fn open_audit(cfg: &Config, mode: AuthMode) -> Result<Audit> {
 struct PolicyReload {
     policy: PolicyStore,
     agents: AgentStore,
+    /// Ticket keys are re-read on SIGHUP too (and every minute).
+    approvals: Approvals,
 }
 
 /// Log `policy lint` findings against the live inventory and agents. A
@@ -260,11 +263,47 @@ fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mo
                     tracing::error!(error = %format!("{e:#}"), "policy reload failed — DENYING every call until a valid file is loaded")
                 }
             }
+            let approvals = p.approvals.clone();
+            tokio::spawn(async move {
+                if approvals.configured() && approvals.load_keys().await.is_ok() {
+                    tracing::info!("ticket keys re-read on SIGHUP");
+                }
+            });
             let live = p.policy.snapshot();
             warn_if_deny_all(&live, mode);
             log_policy_lint(&live, &store.snapshot(), &p.agents.snapshot());
         }
     });
+}
+
+/// Tickets and approvals (E6), when a ticket key source is configured
+/// and auth is on (with `off` there is no policy, so nothing to approve).
+/// Never fatal: a key that can't be read now is retried every minute,
+/// and only calls that need a ticket wait for it.
+async fn open_approvals(mode: AuthMode, vault: Option<Arc<VaultClient>>) -> Approvals {
+    let Some(cfg) = ApprovalConfig::from_env() else {
+        return Approvals::default();
+    };
+    if mode == AuthMode::Off {
+        tracing::info!("PROMPTO_AUTH=off — ticket key settings ignored (no policy, no approvals)");
+        return Approvals::default();
+    }
+    tracing::info!(
+        key_vault_path = cfg.key_vault_path.as_deref(),
+        key_file = cfg.key_file.as_ref().map(|p| p.display().to_string()),
+        approvers = %cfg.approvers_path.display(),
+        state = %cfg.state_path.display(),
+        "tickets and approvals enabled"
+    );
+    let approvals = Approvals::new(cfg, vault);
+    if approvals.load_keys().await.is_err() {
+        tracing::error!(
+            "NO TICKET KEY — calls whose policy rule demands an approval are refused until one \
+             can be read (retrying every minute, and on SIGHUP)"
+        );
+    }
+    approvals.spawn_key_refresh();
+    approvals
 }
 
 /// Keep prompto's vault token alive. A periodic token renewed inside its
@@ -387,6 +426,214 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
         _ => anyhow::bail!("{AGENT_USAGE}"),
     }
     Ok(())
+}
+
+const APPROVER_USAGE: &str = "\
+Usage: prompto approver add <name> [--vault-path <kv path> | --file <path>]
+                            [--issuer <label>] [--replace]
+       prompto approver list
+       prompto approver revoke <name>
+
+`add` mints a TOTP secret for a human approver, stores it (in vault KV v2
+at --vault-path, field totp_secret, using PROMPTO_VAULT_* with a token that
+may write; or in an owner-only file, by default approvers.d/<name>.totp next
+to the approvers file, a directory you create owned by the service user),
+records the reference in $PROMPTO_APPROVERS (default
+/etc/prompto/approvers.toml), and prints the otpauth:// URI and a QR code
+ONCE: scan it with an authenticator app now. --replace re-enrolls an
+existing approver (lost phone). The server reads the file on every
+approval; no reload needed.";
+
+fn approvers_path() -> PathBuf {
+    env_or("PROMPTO_APPROVERS", prompto::approval::DEFAULT_APPROVERS).into()
+}
+
+/// `prompto approver …`.
+async fn run_approver_cli(args: &[String]) -> Result<()> {
+    use prompto::approvers::{ApproverEntry, Approvers};
+    let path = approvers_path();
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let (mut name, mut vault_path, mut file, mut issuer, mut replace) =
+                (None, None, None, String::from("prompto"), false);
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                let mut val = |flag: &str| {
+                    it.next()
+                        .with_context(|| format!("{flag} needs a value"))
+                        .cloned()
+                };
+                match a.as_str() {
+                    "--vault-path" => vault_path = Some(val("--vault-path")?),
+                    "--file" => file = Some(PathBuf::from(val("--file")?)),
+                    "--issuer" => issuer = val("--issuer")?,
+                    "--replace" => replace = true,
+                    s if s.starts_with('-') || name.is_some() => {
+                        anyhow::bail!("unexpected argument {s:?}\n{APPROVER_USAGE}")
+                    }
+                    s => name = Some(s.to_string()),
+                }
+            }
+            let name =
+                name.with_context(|| format!("approver add needs a name\n{APPROVER_USAGE}"))?;
+            prompto::agent::validate_name("approver", &name)?;
+            if vault_path.is_some() && file.is_some() {
+                anyhow::bail!("--vault-path and --file are exclusive");
+            }
+            let mut list = Approvers::from_path(&path)?;
+            if list.approvers.contains_key(&name) && !replace {
+                anyhow::bail!(
+                    "approver {name:?} exists in {}; --replace re-enrolls it",
+                    path.display()
+                );
+            }
+            let secret = prompto::totp::mint_secret()?;
+            let b32 = prompto::totp::base32_encode(&secret);
+            let mut entry = ApproverEntry {
+                created: Some(
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                ..Default::default()
+            };
+            if let Some(vp) = vault_path {
+                prompto::vault::validate_kv_path(&vp)?;
+                let vault = VaultClient::from_env()?.context(
+                    "--vault-path needs PROMPTO_VAULT_TOKEN (a token that may write there) and \
+                     PROMPTO_VAULT_ADDR",
+                )?;
+                vault
+                    .kv2_put(
+                        &vp,
+                        serde_json::json!({ prompto::approvers::VAULT_FIELD: b32 }),
+                    )
+                    .await?;
+                entry.totp_vault_path = Some(vp);
+            } else {
+                let f = match file {
+                    Some(f) => f,
+                    None => path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("approvers.d")
+                        .join(format!("{name}.totp")),
+                };
+                write_secret_file(&f, &b32, replace)?;
+                entry.totp_file = Some(f);
+            }
+            list.approvers.insert(name.clone(), entry);
+            prompto::agent::write_atomic(&path, &list.to_toml_string()?)?;
+            let uri = prompto::totp::otpauth_uri(&issuer, &name, &secret);
+            if let Some(qr) = prompto::totp::qr_terminal(&uri) {
+                println!("{qr}");
+            }
+            println!("{uri}");
+            eprintln!(
+                "approver {name:?} enrolled in {}. The URI and QR code above were shown ONCE: \
+                 scan it with an authenticator app now. The secret is stored only where the \
+                 entry points.",
+                path.display()
+            );
+        }
+        Some("list") if args.len() == 1 => {
+            let list = Approvers::from_path(&path)?;
+            if list.approvers.is_empty() {
+                eprintln!("no approvers in {}", path.display());
+            }
+            println!("{:<24} {:<8} {:<21} FACTOR", "NAME", "STATUS", "CREATED");
+            for (name, e) in &list.approvers {
+                let factor = match (&e.totp_vault_path, &e.totp_file) {
+                    (Some(v), _) => format!("totp vault:{v}"),
+                    (_, Some(f)) => format!("totp file:{}", f.display()),
+                    _ => "-".into(),
+                };
+                println!(
+                    "{:<24} {:<8} {:<21} {factor}",
+                    name,
+                    if e.disabled { "revoked" } else { "active" },
+                    e.created.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+        Some("revoke") if args.len() == 2 => {
+            let name = &args[1];
+            let mut list = Approvers::from_path(&path)?;
+            let e = list
+                .approvers
+                .get_mut(name)
+                .with_context(|| format!("no approver {name:?} in {}", path.display()))?;
+            if e.disabled {
+                eprintln!("approver {name:?} was already revoked; nothing changed.");
+            } else {
+                e.disabled = true;
+                prompto::agent::write_atomic(&path, &list.to_toml_string()?)?;
+                eprintln!(
+                    "approver {name:?} revoked: their codes are refused from the next approval."
+                );
+            }
+        }
+        Some("--help" | "-h" | "help") => println!("{APPROVER_USAGE}"),
+        _ => anyhow::bail!("{APPROVER_USAGE}"),
+    }
+    Ok(())
+}
+
+/// Write a TOTP secret owner-only, owned like its directory (which the
+/// operator creates owned by the service user, as for `keys/`).
+fn write_secret_file(path: &std::path::Path, b32: &str, replace: bool) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let d = std::fs::metadata(dir).with_context(|| {
+        format!(
+            "{} does not exist: create it owned by the service user, e.g. \
+             install -d -o prompto -g prompto -m 0700 {}",
+            dir.display(),
+            dir.display()
+        )
+    })?;
+    if replace {
+        let _ = std::fs::remove_file(path);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(format!("{b32}\n").as_bytes())?;
+    f.sync_all()?;
+    if let Err(e) = std::os::unix::fs::fchown(&f, Some(d.uid()), Some(d.gid())) {
+        let m = f.metadata()?;
+        if (m.uid(), m.gid()) != (d.uid(), d.gid()) {
+            let _ = std::fs::remove_file(path);
+            return Err(e).context("give the secret file to its directory's owner");
+        }
+    }
+    Ok(())
+}
+
+const TICKET_USAGE: &str = "\
+Usage: prompto ticket keygen   print a fresh ticket key (base64, 32 bytes)
+
+Store it as PROMPTO_TICKET_KEY_VAULT_PATH's `current` field (vault KV v2) or
+the first line of PROMPTO_TICKET_KEY_FILE (mode 0600). To rotate: move the
+old key to `previous` (second line), put the new one in `current`, SIGHUP
+(or wait a minute); remove `previous` once outstanding tickets have expired
+(120 s; up to 60 min for scoped approvals).";
+
+/// `prompto ticket …`.
+fn run_ticket_cli(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("keygen") if args.len() == 1 => {
+            println!("{}", prompto::ticket::generate_key()?);
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("{TICKET_USAGE}");
+            Ok(())
+        }
+        _ => anyhow::bail!("{TICKET_USAGE}"),
+    }
 }
 
 /// Startup: where the kill switches are, and any that are already on.
@@ -885,6 +1132,12 @@ async fn main() -> Result<()> {
     if raw_args.len() >= 2 && raw_args[1] == "audit" {
         return run_audit_cli(&cfg, &raw_args[2..]);
     }
+    if raw_args.len() >= 2 && raw_args[1] == "approver" {
+        return run_approver_cli(&raw_args[2..]).await;
+    }
+    if raw_args.len() >= 2 && raw_args[1] == "ticket" {
+        return run_ticket_cli(&raw_args[2..]);
+    }
     if raw_args.len() >= 2 && raw_args[1] == "policy" {
         let code = run_policy_cli(&cfg, &raw_args[2..])?;
         std::process::exit(code);
@@ -958,17 +1211,8 @@ async fn main() -> Result<()> {
         log_policy_lint(&live, &store.snapshot(), &agents.snapshot());
         Some(policy)
     };
-    let reload = match (&agents, &policy) {
-        (Some(a), Some(p)) => Some(PolicyReload {
-            policy: p.clone(),
-            agents: a.clone(),
-        }),
-        _ => None,
-    };
-    spawn_sighup_reloader(store.clone(), reload, auth_mode);
-    let audit = open_audit(&cfg, auth_mode)?;
-
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
+    let mut vault_client = None;
     let needs_vault: Vec<String> = store
         .snapshot()
         .hosts
@@ -981,7 +1225,8 @@ async fn main() -> Result<()> {
             let vault = Arc::new(vault);
             tracing::info!(addr = %vault.addr(), hosts = ?needs_vault, "vault-backed sudo enabled");
             spawn_vault_renewal(vault.clone());
-            ssh_client = ssh_client.with_vault(vault);
+            ssh_client = ssh_client.with_vault(vault.clone());
+            vault_client = Some(vault);
         }
         None if !needs_vault.is_empty() => tracing::warn!(
             hosts = ?needs_vault,
@@ -990,6 +1235,35 @@ async fn main() -> Result<()> {
         ),
         None => {}
     }
+    let approvals = open_approvals(auth_mode, vault_client).await;
+    if let Some(p) = &policy {
+        let asking: Vec<String> = p
+            .snapshot()
+            .rules
+            .iter()
+            .filter(|r| r.approval != prompto::policy::Approval::None)
+            .map(|r| r.name().to_string())
+            .collect();
+        if !asking.is_empty() && !approvals.configured() {
+            tracing::warn!(
+                rules = ?asking,
+                "these policy rules demand an approval, and no ticket key is configured \
+                 (PROMPTO_TICKET_KEY_VAULT_PATH / PROMPTO_TICKET_KEY_FILE): their calls are \
+                 refused (approval_required)"
+            );
+        }
+    }
+    let reload = match (&agents, &policy) {
+        (Some(a), Some(p)) => Some(PolicyReload {
+            policy: p.clone(),
+            agents: a.clone(),
+            approvals: approvals.clone(),
+        }),
+        _ => None,
+    };
+    spawn_sighup_reloader(store.clone(), reload, auth_mode);
+    let audit = open_audit(&cfg, auth_mode)?;
+
     let ssh = Arc::new(ssh_client);
     let tracker = Arc::new(Tracker::new(
         cfg.usage_log.clone(),
@@ -1012,6 +1286,7 @@ async fn main() -> Result<()> {
         mode: auth_mode,
         store: agents.unwrap_or_default(),
         policy: policy.unwrap_or_default(),
+        approvals,
     };
 
     if stdio_mode {

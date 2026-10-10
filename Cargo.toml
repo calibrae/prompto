@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-
 tokio-util = "0.7"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 toml = "0.8"
 anyhow = "1"
 thiserror = "2"
@@ -33,6 +33,9 @@ futures-core = "0.3"
 tracing-journald = "0.3"
 regex = "1"
 libc = "0.2"
+hmac = "0.12"
+sha1 = "0.10"
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

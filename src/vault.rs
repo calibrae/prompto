@@ -144,6 +144,30 @@ impl VaultClient {
             .ok_or_else(|| anyhow!("vault field {path:?}/{field:?} is not a string"))
     }
 
+    /// Write a KV v2 secret (replacing every field at `path`). Used only
+    /// by the CLI (`prompto approver add --vault-path`), with an operator
+    /// token that may write; the server's token only reads.
+    pub async fn kv2_put(&self, path: &str, data: serde_json::Value) -> Result<()> {
+        let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(&serde_json::json!({ "data": data }))
+            .send()
+            .await
+            .with_context(|| format!("vault unreachable at {}", self.addr))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            bail!(
+                "vault write of {path:?} failed ({status}): {}",
+                body.get("errors").cloned().unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
     /// Renew our own token. Returns the new lease duration. A periodic
     /// token renewed inside its period never expires, which is what a
     /// long-running service needs.

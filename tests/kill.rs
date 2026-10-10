@@ -154,6 +154,7 @@ async fn spawn_with_audit(mode: AuthMode, audit: Option<Audit>) -> Server {
             mode,
             store: AgentStore::new(Agents::from_toml_str(&agents_toml()).unwrap(), None),
             policy: PolicyStore::new(Policy::from_toml_str(POLICY, "policy.toml").unwrap(), None),
+            approvals: Default::default(),
         },
         audit: audit.clone(),
         kill: kill.clone(),

@@ -12,16 +12,18 @@
 //! 3. it is not the caller's own machine (`refused_self_target`) —
 //!    **unconditionally**: no tool is exempt, and no policy (E3) or
 //!    ticket (E6) can grant it;
-//! 4. the agent's policy grants this tool on this host (`refused_policy`,
-//!    or `approval_required` when the matching rule wants an approval
-//!    prompto cannot take yet) — only when policy is on, i.e.
-//!    `PROMPTO_AUTH` is `optional` or `required` (see `crate::policy`);
-//! 5. *(E6)* a valid ticket accompanies the call where policy demands one.
+//! 4. the agent's policy grants this tool on this host (`refused_policy`)
+//!    — only when policy is on, i.e. `PROMPTO_AUTH` is `optional` or
+//!    `required` (see `crate::policy`);
+//! 5. where the granting rule has `approval = "ticket" | "human"`, the
+//!    call carries a valid ticket for exactly this call
+//!    (`crate::approval`): none is `approval_required`, a bad one
+//!    `refused_ticket`.
 //!
-//! Step 5 does not exist yet; the comment in [`authorize`] marks where it
-//! goes. Policy comes *after* step 3 on purpose: the self-target guard is
-//! not a policy dimension, so nothing a policy says can reach the code
-//! that would skip it.
+//! Policy and tickets come *after* step 3 on purpose: the self-target
+//! guard is not a policy dimension, so nothing a policy or a ticket says
+//! can reach the code that would skip it. A ticket only satisfies an
+//! approval a rule demands; it never grants anything policy doesn't.
 //!
 //! Root-capable calls ([`is_root_capable`]) are a separate policy grant
 //! from ordinary ones: a rule must say `sudo = true` to grant them. That
@@ -149,6 +151,93 @@ pub fn root_variants(tool: &str) -> &'static [bool] {
     }
 }
 
+/// The authorizations a call makes, read off its tool and arguments:
+/// what `POST /v1/precheck` evaluates without running anything, and
+/// which hosts a ticket binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Requirements {
+    /// Targets no host ([`HOSTLESS_TOOLS`]): [`authorize_tool`].
+    Hostless,
+    /// Reads the inventory entry named by this argument: [`lookup`].
+    Lookup(&'static str),
+    /// [`authorize`] against the host named by each argument, in order.
+    /// The first is the call's host, the second (`rsync_sync`) its
+    /// `dest_host`.
+    Hosts(Vec<(&'static str, Need)>),
+}
+
+/// The authorizations `tool` makes with `args`, exactly as its handler in
+/// `crate::mcp` makes them (a test drives every tool through both and
+/// fails on any difference). `None` for an unknown tool.
+///
+/// `vm_ensure_up` also needs `wake`, but only if the host turns out to be
+/// down, and its handler enforces that only then; precheck can't know, so
+/// it is not listed (policy for it is the same tool and host anyway).
+pub fn requirements(tool: &str, args: &serde_json::Value) -> Option<Requirements> {
+    use Capability::*;
+    let host = |need| Some(Requirements::Hosts(vec![("host", need)]));
+    match tool {
+        "inventory_list" | "prompto_gain" | "mcp_reconnect_hint" => Some(Requirements::Hostless),
+        "inventory_get_host" => Some(Requirements::Lookup("name")),
+        "host_status" | "port_scan" => host(Need::Exists),
+        "host_wake" => host(Need::Cap(Wake)),
+        "host_sleep" | "ssh_sudo_exec" | "service_control" | "service_logs" | "mcp_logs" => {
+            host(Need::Cap(SudoExec))
+        }
+        "vm_list" | "vm_state" | "vm_start" | "vm_stop" | "vm_ensure_up" => host(Need::Cap(Virt)),
+        "ssh_exec" | "ssh_batch" | "python_exec" | "node_exec" | "ruby_exec" | "perl_exec"
+        | "deno_exec" | "bash_exec" | "file_list" | "file_stat" | "file_read" | "host_diagnose" => {
+            host(Need::Cap(Exec))
+        }
+        "file_write" => {
+            let sudo = args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false);
+            host(Need::Cap(if sudo { SudoExec } else { Exec }))
+        }
+        "claude_exec" => host(Need::Cap(ClaudeExec)),
+        "mcp_list"
+        | "mcp_get"
+        | "mcp_add"
+        | "mcp_remove"
+        | "mcp_restart_claudecli"
+        | "mcp_status" => Some(Requirements::Hosts(vec![(
+            "client",
+            Need::Cap(ClaudeAdmin),
+        )])),
+        "rsync_sync" => Some(Requirements::Hosts(vec![
+            ("source_host", Need::Cap(Exec)),
+            ("dest_host", Need::Cap(Exec)),
+        ])),
+        _ => None,
+    }
+}
+
+/// The hosts a ticket for this call binds: `(host, dest_host)`, each the
+/// canonical inventory name of what the call names (or the name as typed
+/// when it is no inventory host; such a call is refused before tickets
+/// matter).
+pub fn bound_hosts(
+    tool: &str,
+    args: &serde_json::Value,
+    inv: Option<&Inventory>,
+) -> (Option<String>, Option<String>) {
+    let canon = |field: &str| {
+        let name = args.get(field)?.as_str()?;
+        Some(
+            inv.and_then(|i| i.canonical(name))
+                .unwrap_or(name)
+                .to_string(),
+        )
+    };
+    match requirements(tool, args) {
+        Some(Requirements::Lookup(f)) => (canon(f), None),
+        Some(Requirements::Hosts(v)) => (
+            v.first().and_then(|(f, _)| canon(f)),
+            v.get(1).and_then(|(f, _)| canon(f)),
+        ),
+        Some(Requirements::Hostless) | None => (None, None),
+    }
+}
+
 /// What a tool needs from its target host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
@@ -233,13 +322,13 @@ pub fn authorize(
     }
 
     // Policy can only narrow: it runs after the self-target guard and
-    // has no way to undo it.
+    // has no way to undo it. Then the ticket, where the rule wants one.
     if let Some(p) = policy {
         let root = is_root_capable(tool, need);
-        target.rule = Some(p.check(ctx, tool, Some((&target.canonical, &target.host)), root)?);
+        let grant = p.check(ctx, tool, Some((&target.canonical, &target.host)), root)?;
+        approve(p, Some(inv), ctx, tool, &grant, Some(&target.canonical))?;
+        target.rule = Some(grant.rule);
     }
-    // E6 seam: ticket verification goes here, after policy has said
-    // whether one is required.
 
     Ok(target)
 }
@@ -258,7 +347,9 @@ pub fn lookup(
 ) -> Result<Authorized, ClassifiedError> {
     let mut target = resolve(inv, host_name, Need::Exists)?;
     if let Some(p) = policy {
-        target.rule = Some(p.check(ctx, tool, Some((&target.canonical, &target.host)), false)?);
+        let grant = p.check(ctx, tool, Some((&target.canonical, &target.host)), false)?;
+        approve(p, Some(inv), ctx, tool, &grant, Some(&target.canonical))?;
+        target.rule = Some(grant.rule);
     }
     Ok(target)
 }
@@ -271,7 +362,26 @@ pub fn authorize_tool(
     ctx: &CallCtx,
     tool: &str,
 ) -> Result<Option<String>, ClassifiedError> {
-    policy.map(|p| p.check(ctx, tool, None, false)).transpose()
+    let Some(p) = policy else { return Ok(None) };
+    let grant = p.check(ctx, tool, None, false)?;
+    approve(p, None, ctx, tool, &grant, None)?;
+    Ok(Some(grant.rule))
+}
+
+/// Step 5: the ticket, when the granting rule demands an approval.
+fn approve(
+    p: &Enforcer,
+    inv: Option<&Inventory>,
+    ctx: &CallCtx,
+    tool: &str,
+    grant: &crate::policy::Grant,
+    on: Option<&str>,
+) -> Result<(), ClassifiedError> {
+    if grant.approval == crate::policy::Approval::None {
+        return Ok(());
+    }
+    p.approvals
+        .require(inv, ctx, tool, &grant.rule, on, grant.approval)
 }
 #[cfg(test)]
 mod tests {
@@ -535,6 +645,7 @@ capabilities = ["exec"]
         Enforcer {
             policy: PolicyStore::new(Policy::from_toml_str(policy, "policy.toml").unwrap(), None),
             agents: Default::default(),
+            approvals: Default::default(),
         }
     }
 

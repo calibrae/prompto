@@ -183,6 +183,7 @@ async fn server(mode: AuthMode) -> Server {
         mode,
         store: store(),
         policy: allow_all(),
+        approvals: Default::default(),
     })
     .await
 }
@@ -591,6 +592,7 @@ async fn legacy_session_is_bound_to_its_creator() {
                 mode,
                 store: store(),
                 policy: allow_all(),
+                approvals: Default::default(),
             },
             true,
         )
@@ -647,6 +649,7 @@ async fn legacy_anonymous_session_refuses_an_agent() {
             mode: AuthMode::Optional,
             store: store(),
             policy: allow_all(),
+            approvals: Default::default(),
         },
         true,
     )
@@ -1023,6 +1026,7 @@ async fn torn_config_writes_never_break_a_response() {
         mode: AuthMode::Required,
         store: AgentStore::load_from(agents_path.clone()).unwrap(),
         policy: PolicyStore::load_from(policy_path.clone()).unwrap(),
+        approvals: Default::default(),
     })
     .await;
 
