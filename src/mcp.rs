@@ -652,6 +652,7 @@ impl Prompto {
             Ok(v) => {
                 let payload = serde_json::to_value(&v).unwrap_or_default();
                 let verdict = self.judge(ctx, tool, &audit::Outcome::Success(&payload));
+                let payload = with_error_class(payload, verdict.error_class);
                 let mut blocks = success_blocks(payload, &request_id);
                 let bytes = blocks.iter().map(|b| b.len()).sum::<usize>();
                 self.tracker.record(tool, host, true, exec_ms, bytes as u64);
@@ -2097,6 +2098,26 @@ fn with_groups(v: &mut serde_json::Value, groups: &[String]) {
     if !groups.is_empty() {
         v["groups"] = groups.into();
     }
+}
+
+/// An exec-style result — one carrying `exit_code`, `timed_out` or
+/// (`ssh_batch`) `all_ok` — gets `error_class`: the audit record's class
+/// for the call (`remote_nonzero`, `ssh_connect`, `timeout`, …), `null`
+/// when the command succeeded. Same field and values as `rsync_sync`,
+/// which sets its own. Additive: nothing else in the result changes.
+fn with_error_class(
+    mut payload: serde_json::Value,
+    class: Option<ErrorClass>,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut payload
+        && ["exit_code", "timed_out", "all_ok"]
+            .iter()
+            .any(|k| map.contains_key(*k))
+        && !map.contains_key("error_class")
+    {
+        map.insert("error_class".into(), serde_json::json!(class));
+    }
+    payload
 }
 
 fn success_blocks(payload: serde_json::Value, request_id: &str) -> Vec<String> {
