@@ -28,12 +28,16 @@ export type Fake = {
 
 /** Install the fake and the engine stubs every test needs. */
 export type Opts = {
-  /** Claude Code's permission verdict, for every tool or per MCP tool name. */
-  check?: 'allow' | 'ask' | 'deny' | ((tool: string) => 'allow' | 'ask' | 'deny')
+  /**
+   * Claude Code's permission verdict, for every tool or per MCP tool name;
+   * `absent`: the tool isn't in the session (a deny rule took it out), and
+   * the check throws, as Claude Code's does.
+   */
+  check?: 'allow' | 'ask' | 'deny' | ((tool: string) => 'allow' | 'ask' | 'deny' | 'absent')
   /** Tool names `$.tool.check` was asked about, in order. */
   checked?: string[]
-  /** What `$.mcp.connect('prompto')` answers: the server's name (default the plugin's own). */
-  mcpServer?: string
+  /** What `$.mcp.connect('prompto')` answers: the server's name (default the plugin's own), or `null`: not connected. */
+  mcpServer?: string | null
   /** The person's pick when asked (AskUserQuestion). */
   answer?: string
   /** The headers helper fails (no token file). */
@@ -97,9 +101,15 @@ export function install(on: On, opts: Opts = {}): Fake {
   on('tool.check', ($, e) => {
     opts.checked?.push(e.tool)
     const c = opts.check ?? 'allow'
-    return { decision: typeof c === 'function' ? c(e.tool) : c }
+    const decision = typeof c === 'function' ? c(e.tool) : c
+    if (decision === 'absent') throw new Error(`no tool named "${e.tool}" in this session`)
+    return { decision }
   })
-  on('mcp.connect', () => ({ value: { isConnected: true, server: opts.mcpServer ?? 'plugin:prompto:prompto' } }))
+  on('mcp.connect', () =>
+    opts.mcpServer === null
+      ? { value: { isConnected: false, reason: 'failed', message: 'unauthorized: missing bearer token' } }
+      : { value: { isConnected: true, server: opts.mcpServer ?? 'plugin:prompto:prompto' } },
+  )
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', () => ({ value: undefined }))
   on('store.get', ($, e) => ({ value: fake.store.get(e.key) }))

@@ -56,6 +56,8 @@ const PANE = 'prompto-approval'
 const WAIT_MS = 10 * 60 * 1000
 const VERSION = '0.1.0'
 const USER_AGENT = `prompto-claude-plugin/${VERSION}`
+/** Where bin/prompto-headers looks for the token when told nothing else. */
+const DEFAULT_TOKEN_FILE = '~/.config/prompto/token'
 
 const pending = atom({ plugin: 'prompto', key: 'pending' } as const, [] as PromptoPending[], { shape: 'pending-2' })
 
@@ -388,11 +390,21 @@ async function enrich($: $, id: string, mcpTool: string, tool: string, args: Rec
     let diff: string | null = null
     let note: string | null = null
     const readTool = mcpTool.replace(/__file_write$/, '__file_read')
-    const verdict = await $.tool.check({ tool: readTool, input: readArgs })
-    const pc =
-      verdict.decision === 'allow' ? await precheck($, cfg, session, 'file_read', readArgs) : { answer: undefined, why: undefined }
-    if (verdict.decision !== 'allow') {
-      note = `diff unavailable: your Claude Code settings ${verdict.decision === 'deny' ? 'deny' : 'ask before'} file_read; the full new content is shown instead`
+    let verdict: 'allow' | 'deny' | 'ask' | 'absent'
+    try {
+      verdict = (await $.tool.check({ tool: readTool, input: readArgs })).decision
+    } catch {
+      // A settings deny rule naming an MCP tool takes it out of the
+      // session, and the check throws: no read either way.
+      verdict = 'absent'
+    }
+    const pc = verdict === 'allow' ? await precheck($, cfg, session, 'file_read', readArgs) : { answer: undefined, why: undefined }
+    if (verdict !== 'allow') {
+      const why =
+        verdict === 'absent'
+          ? 'file_read is not in this session (a Claude Code deny rule removes it)'
+          : `your Claude Code settings ${verdict === 'deny' ? 'deny' : 'ask before'} file_read`
+      note = `diff unavailable: ${why}; the full new content is shown instead`
     } else if (!pc.answer) note = `cannot check read access: ${pc.why}`
     else if (pc.answer.decision === 'deny') note = `no read grant: ${pc.answer.reason ?? pc.answer.error_class}`
     else if (pc.answer.decision === 'ask') note = 'no diff: reading the file needs a human approval of its own'
@@ -617,11 +629,22 @@ async function warnIfShadowed($: $, servers: readonly string[]): Promise<void> {
   try {
     r = await $.mcp.connect('prompto')
   } catch (err) {
-    $.ui.log(`prompto: cannot tell which MCP server serves prompto: ${(err as Error).message}`)
+    $.ui.log(`cannot tell which MCP server serves prompto: ${clean((err as Error).message)}`)
     return
   }
   if (!r.isConnected) {
-    $.ui.log(`prompto: the plugin's MCP server is not connected (${r.reason}): ${clean(r.message)}`)
+    // Claude Code (2.1.295) runs the headers helper with neither the
+    // manifest's `env` nor the settings' `env`: it can only find the
+    // token at its default path.
+    const file = String(S.options.token_file ?? '').trim()
+    const elsewhere = file !== '' && file !== DEFAULT_TOKEN_FILE
+    $.ui.log(
+      `the plugin's MCP server is not connected (${r.reason}): ${clean(r.message)}` +
+        (elsewhere
+          ? `\nIts headers helper can't see the token_file option (${clean(file)}): Claude Code gives it no plugin options. ` +
+            `Put the token at ${DEFAULT_TOKEN_FILE} (mode 0600) for prompto's tools to be listed.`
+          : ''),
+    )
     return
   }
   if (r.server.startsWith('plugin:')) return
@@ -629,7 +652,7 @@ async function warnIfShadowed($: $, servers: readonly string[]): Promise<void> {
   if (servers.includes(r.server) || servers.includes(asTool)) return
   const name = clean(r.server)
   const msg =
-    `prompto: Claude Code serves prompto through your MCP server "${name}" (same URL as the plugin's), ` +
+    `Claude Code serves prompto through your MCP server "${name}" (same URL as the plugin's), ` +
     `and the plugin option \`servers\` doesn't name it: its calls get no precheck, ticket, approval pane or session. ` +
     `Add "${name}" to \`servers\`, or remove that server.`
   $.ui.log(msg)
@@ -814,7 +837,7 @@ export const register: Register = (on, options) => {
           <Text color="yellow">{c}</Text>
         ))}
         {p.diff ? <Code source={clean(p.diff)} format="diff" path={p.path ?? undefined} /> : ''}
-        {p.diffNote ? <Text dimColor>diff: {clean(p.diffNote)}</Text> : ''}
+        {p.diffNote ? <Text dimColor>{p.diffNote.startsWith('diff ') ? '' : 'diff: '}{clean(p.diffNote)}</Text> : ''}
         {p.audit.length > 0 || p.auditNote ? (
           <Box flexDirection="column">
             <Text dimColor>recent calls by this agent on {host}:</Text>

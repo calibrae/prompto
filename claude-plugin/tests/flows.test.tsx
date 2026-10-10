@@ -610,7 +610,7 @@ test('file_write with Claude Code denying file_read: no read, the whole new cont
   const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw1', host: 'h2', path: '/etc/x.conf', content, mode: '0600' })
   const ui = await paneReady($, clock)
   expect(checked).toContain('mcp__prompto__file_read')
-  expect(await shows(ui, /diff unavailable: your Claude Code settings deny file_read/)).toBe(true)
+  expect(await shows(ui, /^diff unavailable: your Claude Code settings deny file_read/)).toBe(true)
   const codes = await ui.findAll({ type: 'Code' })
   expect(codes.some(c => c.props.format === 'diff')).toBe(false)
   expect(codes.some(c => c.props.source === content)).toBe(true)
@@ -812,4 +812,38 @@ test('file_write whose diff is too long to draw: the new content instead, whole'
   expect(codes.some(c => c.props.source === 'new\n')).toBe(true)
   await ui.press({ key: 'deny' })
   await done(clock, call)
+})
+
+test('a plugin server that didn\'t connect is logged; with token_file elsewhere, why', { options: { token_file: '/srv/tokens/ops' } }, async ($, on) => {
+  mock.clock(on)
+  const fake = install(on, { mcpServer: null })
+  await start($)
+  const said = fake.logs.join('\n')
+  expect(said).toContain("the plugin's MCP server is not connected (failed)")
+  expect(said).toContain("can't see the token_file option (/srv/tokens/ops)")
+  expect(said).toContain('~/.config/prompto/token')
+})
+
+test('a plugin server that didn\'t connect, token at the default path: no token_file hint', async ($, on) => {
+  mock.clock(on)
+  const fake = install(on, { mcpServer: null })
+  await start($)
+  expect(fake.logs.join('\n')).toContain('not connected')
+  expect(fake.logs.join('\n')).not.toContain('token_file')
+})
+
+test('file_write when a deny rule took file_read out of the session: the pane still shows, with the whole content', async ($, on) => {
+  // Found live: Claude Code's $.tool.check throws for a tool a deny rule removed.
+  const clock = mock.clock(on)
+  const fake = install(on, { clock, check: t => (t.endsWith('__file_read') ? 'absent' : 'allow') })
+  fake.precheck.file_write = { ...ASK, root: false }
+  await start($)
+  const content = 'a = 1\nb = 2\n'
+  const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw5', host: 'h2', path: '/etc/y', content })
+  const ui = await paneReady($, clock)
+  expect(await shows(ui, /diff unavailable: file_read is not in this session/)).toBe(true)
+  expect((await ui.findAll({ type: 'Code' })).some(c => c.props.source === content)).toBe(true)
+  expect(fake.seen.filter(s => s.body?.tool === 'file_read' || s.body?.params?.name === 'file_read')).toHaveLength(0)
+  await ui.press({ key: 'deny' })
+  expect((await done(clock, call)).deny).toContain('the human approver refused this call')
 })
