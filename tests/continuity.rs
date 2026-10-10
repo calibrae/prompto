@@ -585,7 +585,8 @@ async fn a_successor_that_dies_after_ready_never_takes_over() {
     write_exe(&exe, &format!("#!/bin/sh\nprintf R >&4\nexec sleep {n}\n"));
     p.signal(libc::SIGUSR2);
     let t = Instant::now();
-    while !p.stderr().contains("both accept until its probation ends") {
+    // The second probation: the crashed successor's is in the log too.
+    while p.stderr().matches("both accept until its probation ends").count() < 2 {
         assert!(t.elapsed() < Duration::from_secs(15), "{}", p.stderr());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
