@@ -257,6 +257,13 @@ pub struct HostConfig {
     /// anyway (`true` or unset, or `ssh_user = "root"`).
     #[serde(default)]
     pub nopasswd_sudo: Option<bool>,
+    /// This machine runs prompto. Root on it reads prompto's vault token
+    /// (`/etc/prompto/env`), the ticket key and approvers' TOTP files —
+    /// every approval factor — so `policy lint` reports an **error** for
+    /// any rule that grants root here, or an exec tool where `ssh_user`
+    /// can sudo, unless the rule says `crown_jewel_ack = true`.
+    #[serde(default)]
+    pub prompto_host: bool,
 }
 
 impl HostConfig {

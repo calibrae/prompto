@@ -51,9 +51,12 @@
 //!   root wherever that user is root or has passwordless sudo. `lint`
 //!   warns about those grants (inventory `nopasswd_sudo`).
 //!
-//! A matching rule with `approval` other than `none` refuses the call
-//! with `approval_required`: tickets and human approval arrive with E6,
-//! and until then such a rule fails closed.
+//! A matching rule with `approval` other than `none` grants the call only
+//! with a valid ticket (E6, `crate::approval`): `ticket` takes one from
+//! `POST /v1/precheck`, `human` one from `POST /v1/approve` (an
+//! approver's TOTP code). Without one the call is refused
+//! (`approval_required`, saying how to get one); with a bad one,
+//! `refused_ticket`.
 //!
 //! # Reload
 //!
@@ -98,15 +101,17 @@ pub const DEFAULT_DENY: &str = "default-deny";
 pub const GROUP_PREFIX: &str = "group:";
 
 /// What a matching rule demands beyond the match itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Approval {
     /// The match is enough.
     #[default]
     None,
-    /// A valid precheck ticket must accompany the call (E6).
+    /// A valid ticket must accompany the call: one from
+    /// `POST /v1/precheck` (or a human one) — E6.
     Ticket,
-    /// A human must approve the call (E6/E7).
+    /// A human must approve the call: a ticket from `POST /v1/approve`,
+    /// which takes an approver's TOTP code — E6.
     Human,
 }
 
@@ -132,6 +137,8 @@ struct RawRule {
     sudo: bool,
     #[serde(default)]
     approval: Approval,
+    #[serde(default)]
+    crown_jewel_ack: bool,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +218,9 @@ pub struct Rule {
     pub tools: Vec<Glob>,
     pub sudo: bool,
     pub approval: Approval,
+    /// The operator knowingly grants root on a `prompto_host` (see
+    /// [`lint`]).
+    pub crown_jewel_ack: bool,
     /// `policy.toml:<line>`, plus ` (<id>)` when the rule has an id.
     name: String,
 }
@@ -342,7 +352,7 @@ fn one_line_error(e: &anyhow::Error) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Allow,
-    /// A rule matched but demands an approval prompto cannot check yet.
+    /// A rule matched but demands an approval: the call needs a ticket.
     ApprovalRequired(Approval),
     Deny,
 }
@@ -473,6 +483,7 @@ impl Policy {
             tools,
             sudo: r.sudo,
             approval: r.approval,
+            crown_jewel_ack: r.crown_jewel_ack,
             name,
         })
     }
@@ -550,13 +561,10 @@ impl Policy {
                     outcome: Outcome::ApprovalRequired(a),
                     rule: rule.name().into(),
                     message: format!(
-                        "approval_required: rule {} grants agent {} {what}{on} only with \
-                         approval = \"{}\", and this prompto cannot take approvals yet \
-                         (tickets arrive in a later release), so the call is refused. Ask \
-                         the operator to run it, or to grant it without approval.",
-                        rule.name(),
+                        "agent {} may use {what}{on} with approval = \"{}\" (rule {})",
                         r.agent.name,
-                        a.as_str()
+                        a.as_str(),
+                        rule.name()
                     ),
                 },
             };
@@ -721,12 +729,24 @@ impl PolicyStore {
 pub struct Enforcer {
     pub policy: PolicyStore,
     pub agents: AgentStore,
+    /// Tickets and approvers (E6), for rules with an `approval`.
+    pub approvals: crate::approval::Approvals,
+}
+
+/// A call policy grants, and what the granting rule demands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    /// The deciding rule's name.
+    pub rule: String,
+    /// `none`, or the approval the call's ticket must carry.
+    pub approval: Approval,
 }
 
 impl Enforcer {
     /// Check one call. `host` is the resolved target (canonical name and
-    /// inventory entry), `None` for hostless tools. Returns the name of
-    /// the allowing rule, or a `refused_policy` / `approval_required`
+    /// inventory entry), `None` for hostless tools. Returns the granting
+    /// rule and the approval it demands — which the caller (`authz`) must
+    /// then check the call's ticket against — or a `refused_policy`
     /// refusal naming the rule that decided.
     pub fn check(
         &self,
@@ -734,7 +754,7 @@ impl Enforcer {
         tool: &str,
         host: Option<(&str, &HostConfig)>,
         root: bool,
-    ) -> Result<String, ClassifiedError> {
+    ) -> Result<Grant, ClassifiedError> {
         // An edit to policy.toml applies to this call, no SIGHUP needed.
         self.policy.refresh();
         let (name, groups) = self.subject(ctx, tool).map_err(|msg| {
@@ -757,23 +777,30 @@ impl Enforcer {
             Outcome::Deny => None,
         };
         ctx.note(|n| n.approval = approval);
-        let class = match d.outcome {
-            Outcome::Allow => {
-                tracing::info!(
-                    request_id = %ctx.request_id,
-                    agent = %name,
-                    tool,
-                    host = host.map(|h| h.0),
-                    root,
-                    rule = %d.rule,
-                    "policy allow"
+        let approval = match d.outcome {
+            Outcome::Allow => Approval::None,
+            Outcome::ApprovalRequired(a) => a,
+            Outcome::Deny => {
+                return Err(
+                    ClassifiedError::refused(ErrorClass::RefusedPolicy, d.message)
+                        .with_rule(d.rule),
                 );
-                return Ok(d.rule);
             }
-            Outcome::ApprovalRequired(_) => ErrorClass::ApprovalRequired,
-            Outcome::Deny => ErrorClass::RefusedPolicy,
         };
-        Err(ClassifiedError::refused(class, d.message).with_rule(d.rule))
+        tracing::info!(
+            request_id = %ctx.request_id,
+            agent = %name,
+            tool,
+            host = host.map(|h| h.0),
+            root,
+            rule = %d.rule,
+            approval = approval.as_str(),
+            "policy allow"
+        );
+        Ok(Grant {
+            rule: d.rule,
+            approval,
+        })
     }
 
     /// The caller's name and current groups, or why policy grants it
@@ -862,9 +889,10 @@ impl std::fmt::Display for Finding {
 /// Check `policy` against the inventory, the agents and the tool list.
 ///
 /// Errors: references to agents, hosts, host groups or tools that don't
-/// exist (a typo there silently grants nothing). Warnings: agent groups
-/// nobody is in yet, globs that match nothing, disabled agents, approval
-/// modes that refuse until E6, exec grants without `sudo = true` on hosts
+/// exist (a typo there silently grants nothing), and root granted on the
+/// host running prompto (inventory `prompto_host`, see
+/// `root_on_prompto_host`) without `crown_jewel_ack = true`. Warnings: agent groups
+/// nobody is in yet, globs that match nothing, disabled agents, exec grants without `sudo = true` on hosts
 /// where the shell is root anyway ([`authz::ARBITRARY_EXEC_TOOLS`]), and
 /// rules that can never decide a call —
 /// because an earlier rule always wins (shadowed) or because nothing
@@ -949,16 +977,8 @@ pub fn lint(policy: &Policy, inv: &Inventory, agents: &Agents, tools: &[&str]) -
         if let Some(msg) = exec_as_root(rule, inv, tools) {
             push(Level::Warning, rule, msg)
         }
-        if rule.approval != Approval::None {
-            push(
-                Level::Warning,
-                rule,
-                format!(
-                    "approval = \"{}\" is not available yet: calls this rule decides are \
-                     refused (approval_required) until tickets ship",
-                    rule.approval.as_str()
-                ),
-            )
+        if let Some(msg) = root_on_prompto_host(rule, inv, tools) {
+            push(Level::Error, rule, msg)
         }
     }
     reachability(policy, inv, agents, tools, &mut out);
@@ -1014,6 +1034,72 @@ fn exec_as_root(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> 
          a password",
         names.join(", "),
         hosts.join(", ")
+    ))
+}
+
+/// Root on a host marked `prompto_host`: whoever has it reads prompto's
+/// vault token (`/etc/prompto/env`), the ticket key and TOTP files, and
+/// can then approve anything or forge any ticket. An **error** for a rule
+/// that grants, on such a host, a root-capable tool (`sudo = true`; not
+/// `vm_stop`, which is not a shell) or an exec tool
+/// ([`authz::ARBITRARY_EXEC_TOOLS`]) where `ssh_user` can become root —
+/// is root, or sudo works without a password or isn't known not to
+/// (`nopasswd_sudo` true or unset), or prompto itself sudoes there
+/// (`sudo_exec`, `sudo_password_vault_path`). Hosts lacking the tools'
+/// capability are skipped. `crown_jewel_ack = true` on the rule silences
+/// it.
+fn root_on_prompto_host(rule: &Rule, inv: &Inventory, tools: &[&str]) -> Option<String> {
+    use crate::inventory::Capability;
+    if rule.crown_jewel_ack {
+        return None;
+    }
+    let mut hits: Vec<String> = Vec::new();
+    for (n, h) in &inv.hosts {
+        if !h.prompto_host || !rule.matches_host(&Target::of(n, h)) {
+            continue;
+        }
+        let granted: Vec<&str> = if rule.sudo {
+            if !h.has(Capability::SudoExec) {
+                continue;
+            }
+            tools
+                .iter()
+                .copied()
+                .filter(|t| {
+                    *t != "vm_stop"
+                        && rule.matches_tool(t)
+                        && authz::root_variants(t).contains(&true)
+                })
+                .collect()
+        } else {
+            let can_sudo = h.ssh_user == "root"
+                || h.nopasswd_sudo != Some(false)
+                || h.has(Capability::SudoExec)
+                || h.sudo_password_vault_path.is_some();
+            if !can_sudo {
+                continue;
+            }
+            authz::ARBITRARY_EXEC_TOOLS
+                .iter()
+                .filter(|(t, cap)| tools.contains(t) && rule.matches_tool(t) && h.has(*cap))
+                .map(|(t, _)| *t)
+                .collect()
+        };
+        if !granted.is_empty() {
+            hits.push(format!("{n} ({})", granted.join(", ")));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort();
+    Some(format!(
+        "grants root on the host running prompto (prompto_host = true): {}. Root there reads \
+         /etc/prompto/env (prompto's vault token, which reads the approval secrets' private \
+         mount), the ticket key file and approvers' TOTP files: an agent with it can approve \
+         its own calls and forge any ticket. Narrow the rule's hosts or tools, or set \
+         crown_jewel_ack = true on it if that is really intended",
+        hits.join("; ")
     ))
 }
 
@@ -1346,7 +1432,7 @@ approval = "ticket"
     }
 
     #[test]
-    fn approval_fails_closed_naming_the_rule() {
+    fn approval_rules_name_the_rule_and_the_approval() {
         for (approval, host, groups) in
             [("human", "bravo", vec![]), ("ticket", "bravo", vec!["ops"])]
         {
@@ -1365,12 +1451,7 @@ approval = "ticket"
             assert_eq!(d.rule, "policy.toml:1");
             assert!(
                 d.message
-                    .starts_with("approval_required: rule policy.toml:1"),
-                "{}",
-                d.message
-            );
-            assert!(
-                d.message.contains(&format!("approval = \"{approval}\"")),
+                    .contains(&format!("with approval = \"{approval}\"")),
                 "{}",
                 d.message
             );
@@ -1589,6 +1670,82 @@ capabilities = ["virt"]
         assert!(f[0].contains("(ssh_exec)") && f[0].contains("unknown (nopasswd_sudo unset)"));
     }
 
+    /// Root on the host running prompto reads every approval factor: an
+    /// error (not a warning) for a sudo grant there, or an exec grant
+    /// where ssh_user can sudo — unless the rule acknowledges it.
+    #[test]
+    fn lint_errors_on_root_grants_on_the_prompto_host() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.core]
+ip = "192.0.2.1"
+ssh_user = "u"
+ssh_key = "/k"
+prompto_host = true
+capabilities = ["exec", "sudo_exec"]
+
+[host.corepw]
+ip = "192.0.2.2"
+ssh_user = "u"
+ssh_key = "/k"
+prompto_host = true
+nopasswd_sudo = false
+capabilities = ["exec"]
+
+[host.other]
+ip = "192.0.2.3"
+ssh_user = "u"
+ssh_key = "/k"
+nopasswd_sudo = false
+capabilities = ["exec", "sudo_exec"]
+"#,
+        )
+        .unwrap();
+        let tools = ["ssh_exec", "ssh_sudo_exec", "file_read", "file_write"];
+        let errors_of = |policy: &str| -> Vec<String> {
+            let p = Policy::from_toml_str(policy, "policy.toml").unwrap();
+            lint(&p, &inv, &agents(), &tools)
+                .iter()
+                .filter(|f| f.level == Level::Error)
+                .map(|f| f.to_string())
+                .collect()
+        };
+        // sudo = true on the prompto host: error, naming host and tools.
+        let f = errors_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"*\"]\nsudo = true\n",
+        );
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("core (ssh_sudo_exec, file_write)") && f[0].contains("crown_jewel_ack"),
+            "{f:#?}"
+        );
+        // An exec grant where ssh_user can sudo: error too.
+        let f =
+            errors_of("[[rule]]\nagents = [\"dev\"]\nhosts = [\"*\"]\ntools = [\"ssh_exec\"]\n");
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].contains("core (ssh_exec)") && !f[0].contains("corepw"),
+            "{f:#?}"
+        );
+        // Not on a host whose sudo needs a password, not for read-only
+        // tools, not on other hosts.
+        for ok in [
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"corepw\"]\ntools = [\"ssh_exec\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"file_read\"]\n",
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"other\"]\ntools = [\"*\"]\nsudo = true\n",
+        ] {
+            assert!(errors_of(ok).is_empty(), "{ok}: {:#?}", errors_of(ok));
+        }
+        // Acknowledged: no error.
+        assert!(
+            errors_of(
+                "[[rule]]\nagents = [\"dev\"]\nhosts = [\"core\"]\ntools = [\"*\"]\nsudo = true\n\
+                 crown_jewel_ack = true\n"
+            )
+            .is_empty()
+        );
+    }
+
     /// Writing ~/.bashrc is code execution: a plain `file_write` grant and
     /// an `rsync_sync` grant warn like an exec grant does. `file_write`
     /// with `sudo = true` is a root grant and doesn't.
@@ -1642,8 +1799,6 @@ capabilities = ["virt"]
         assert_eq!(
             f,
             [
-                "warning: policy.toml:18: approval = \"human\" is not available yet: calls this \
-                 rule decides are refused (approval_required) until tickets ship",
                 "warning: policy.toml:5: shadowed: every call it matches is decided first by \
                  policy.toml:1",
                 "warning: policy.toml:9: matches no call: sudo = true, but none of its tools is \
@@ -1688,6 +1843,7 @@ capabilities = ["virt"]
         let e = Enforcer {
             policy: PolicyStore::new(pol, None),
             agents: agents.clone(),
+            approvals: Default::default(),
         };
         let inv = inv();
         let host = Some(("alpha", inv.get("alpha").unwrap()));
@@ -1706,7 +1862,8 @@ capabilities = ["virt"]
         agents.reload().unwrap();
         assert_eq!(
             e.check(&ctx_for(Some("eve")), "ssh_exec", host, false)
-                .unwrap(),
+                .unwrap()
+                .rule,
             "policy.toml:1"
         );
 
@@ -1739,7 +1896,7 @@ capabilities = ["virt"]
     }
 
     #[test]
-    fn enforcer_maps_approval_to_its_class() {
+    fn enforcer_grants_with_the_rules_approval() {
         let pol = Policy::from_toml_str(
             "[[rule]]\nagents = [\"anonymous\"]\nhosts = [\"*\"]\ntools = [\"*\"]\napproval = \"ticket\"\n",
             "policy.toml",
@@ -1748,13 +1905,29 @@ capabilities = ["virt"]
         let e = Enforcer {
             policy: PolicyStore::new(pol, None),
             agents: AgentStore::default(),
+            approvals: Default::default(),
         };
-        let err = e
+        let g = e
             .check(&ctx_for(Some("anonymous")), "prompto_gain", None, false)
+            .unwrap();
+        assert_eq!(
+            g,
+            Grant {
+                rule: "policy.toml:1".into(),
+                approval: Approval::Ticket
+            }
+        );
+        // The ticket check is authz's: with none and no key configured,
+        // the call is refused naming the rule and why.
+        let err = authz::authorize_tool(Some(&e), &ctx_for(Some("anonymous")), "prompto_gain")
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::ApprovalRequired);
-        assert_eq!(err.rule.as_deref(), Some("policy.toml:1"));
         assert_eq!(err.data()["rule"], "policy.toml:1");
+        assert!(
+            err.message.contains("no ticket key configured"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -1819,6 +1992,7 @@ capabilities = ["virt"]
         let e = Enforcer {
             policy: PolicyStore::load_from(path.clone()).unwrap(),
             agents,
+            approvals: Default::default(),
         };
         let ok = |tool: &str| e.check(&ctx_for(Some("eve")), tool, None, false).is_ok();
         assert!(ok("ssh_exec") && !ok("file_read"));
@@ -1918,7 +2092,7 @@ capabilities = ["virt"]
         let p = Policy::from_toml_str(include_str!("../deploy/policy.toml.example"), "policy.toml")
             .unwrap();
         assert_eq!(p.rules.len(), 6);
-        assert_eq!(p.rules[0].name(), "policy.toml:33 (infra-router-sudo)");
+        assert_eq!(p.rules[0].name(), "policy.toml:40 (infra-router-sudo)");
     }
 
     #[test]

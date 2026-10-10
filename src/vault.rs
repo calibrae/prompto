@@ -111,6 +111,21 @@ impl VaultClient {
         &self.addr
     }
 
+    pub fn mount(&self) -> &str {
+        &self.mount
+    }
+
+    /// The same server and token on another KV v2 mount (the approval
+    /// secrets' private mount, `crate::approval::PrivateVault`).
+    pub fn with_mount(&self, mount: &str) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            mount: mount.trim_matches('/').to_string(),
+            token: self.token.clone(),
+            http: self.http.clone(),
+        }
+    }
+
     /// Read one string field from a KV v2 secret.
     pub async fn kv2_field(&self, path: &str, field: &str) -> Result<String> {
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
@@ -142,6 +157,30 @@ impl VaultClient {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("vault field {path:?}/{field:?} is not a string"))
+    }
+
+    /// Write a KV v2 secret (replacing every field at `path`). Used only
+    /// by the CLI (`prompto approver add --vault-path`), with an operator
+    /// token that may write; the server's token only reads.
+    pub async fn kv2_put(&self, path: &str, data: serde_json::Value) -> Result<()> {
+        let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(&serde_json::json!({ "data": data }))
+            .send()
+            .await
+            .with_context(|| format!("vault unreachable at {}", self.addr))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            bail!(
+                "vault write of {path:?} failed ({status}): {}",
+                body.get("errors").cloned().unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     /// Renew our own token. Returns the new lease duration. A periodic

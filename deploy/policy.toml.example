@@ -23,8 +23,15 @@
 #            This gates prompto's OWN root paths. An exec grant (ssh_exec,
 #            bash_exec, …) is a shell as ssh_user — root wherever that user
 #            is root or has passwordless sudo (inventory nopasswd_sudo).
-#   approval "none" (default) | "ticket" | "human". Not implemented yet:
-#            a ticket/human rule REFUSES what it matches (approval_required).
+#   approval "none" (default) | "ticket" | "human". "ticket": the call needs
+#            a ticket from POST /v1/precheck; "human": one from POST
+#            /v1/approve (an approver's TOTP code). Without a ticket key
+#            configured (PROMPTO_TICKET_KEY_*), such a rule refuses its calls.
+#   crown_jewel_ack
+#            false (default). A rule that grants root on the host running
+#            prompto (inventory prompto_host = true) is a lint ERROR: root
+#            there reads prompto's vault token and every approval secret.
+#            true says you mean it.
 #
 # Policy only narrows: host capabilities still apply, and no rule can let an
 # agent act on its own machine (the self-targeting guard runs first).

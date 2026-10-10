@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.12.1 (unreleased)
+
+Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"` now grants a call that carries a valid ticket, instead of always refusing it.
+
+### What's new
+
+- **`POST /v1/precheck`** (bearer auth, like `/mcp`): runs a call's whole authorization without running it and answers `allow` / `deny` / `ask`, with the deciding `rule` and a `reason`. On a `ticket` rule, `allow` carries a ticket: single-use, valid for 120 s, bound to the agent, session, tool, canonical host(s) and the SHA-256 of the canonical arguments (RFC 8785).
+- **`POST /v1/approve`**: a human approver's TOTP code (RFC 6238; single-use codes; lockout after 5 wrong codes in 15 min) turns an `ask` into an `approval = "human"` ticket naming the approver. Optional `scope_minutes` (≤ 60): one ticket for every call by the same agent, session, tool and host(s), decided by the same policy rule(s) and with the same root-capability, whatever the other arguments. A scope for a root-capable call needs `allow_root_scope: true`.
+- **Every tool accepts a `ticket` argument**, checked where policy demands one: missing → `approval_required` (the message says how to get one), invalid, forged, expired, replayed or for another call → `refused_ticket`.
+- **Keys** from vault KV (`PROMPTO_TICKET_KEY_VAULT_PATH`, fields `current` / `previous`) or an owner-only file (`PROMPTO_TICKET_KEY_FILE`); current and previous both accepted; re-read every minute and on SIGHUP. Used nonces and TOTP steps persist (synced) in `PROMPTO_APPROVAL_STATE` across restarts.
+- **Approval secrets are never agent-readable.** The ticket key and vault-held TOTP secrets are read from their own KV mount, `PROMPTO_PRIVATE_MOUNT` (default `prompto-private`), which only prompto's token may read. If either is configured under `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` (default `prompto/,infra/` on `PROMPTO_VAULT_MOUNT`), approvals are turned off with an error saying what to move. `prompto approver add --vault-path` refuses such paths, and paths next to a sudo password unless `--i-know`.
+- **Inventory `prompto_host = true`** marks the machine running prompto; `policy lint` reports an error for any rule granting root there (sudo, or exec where the shell can sudo) unless the rule says `crown_jewel_ack = true`.
+- **CLI:** `prompto approver add|list|revoke` (prints the `otpauth://` URI and a terminal QR code once; `--i-know`), `prompto ticket keygen`.
+- **Audit:** the ticket is removed from `args` and recorded as `ticket_sha256`; `approved_by` is filled in; new record types `precheck` and `approve`.
+
+### Upgrade note — no new config
+
+With neither ticket variable set, nothing is minted or accepted: `approval` rules refuse their calls as in v0.12.0. Visible changes:
+
+1. The `approval_required` message is new (it explains the precheck/approve flow, or says no ticket key is configured) and `policy lint` no longer warns about `approval` rules; the server warns at startup instead when such rules exist and no ticket key is configured.
+2. Two new routes, `POST /v1/precheck` and `POST /v1/approve`, behind the same authentication as `/mcp` (unauthenticated with `PROMPTO_AUTH=off`, where they report every call as needing no approval).
+3. Audit records may carry `ticket_sha256` / `scope_minutes`, and `args.ticket` is never recorded.
+4. `serde_json`'s `float_roundtrip` is on: JSON numbers in arguments now always parse to the nearest double (needed for stable argument digests).
+
 ## v0.12.0
 
 Attributable, policed, audited, killable. Every call now has a request ID,

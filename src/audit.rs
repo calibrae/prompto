@@ -111,6 +111,12 @@ pub struct Notes {
     pub audit_refused: bool,
     /// Refused by this kill switch (`crate::kill`).
     pub kill: Option<crate::kill::Kill>,
+    /// The call's ticket, once `authz` accepted it (E6).
+    pub ticket: Option<crate::approval::TicketNote>,
+    /// Each authorization whose granting rule demanded an approval: the
+    /// rule and whether the call is root-capable there. A scoped ticket
+    /// is bound to these (`crate::ticket::Scope`).
+    pub demands: Vec<crate::approval::Demand>,
 }
 
 /// The raw call as the client sent it. Installed by `Prompto::call_tool`
@@ -427,7 +433,7 @@ pub fn clamp(s: &str, max: usize) -> String {
 pub struct Record {
     /// RFC 3339, UTC, milliseconds.
     pub ts: String,
-    /// `tool` or `auth`.
+    /// `tool`, `auth`, `precheck` or `approve`.
     #[serde(rename = "type")]
     pub kind: &'static str,
     /// Same ULID the caller got back.
@@ -460,8 +466,17 @@ pub struct Record {
     pub rule: Option<String>,
     /// The deciding rule's `approval` (`none` | `ticket` | `human`).
     pub approval: Option<&'static str>,
-    /// Who approved (E6). Always `null` for now.
+    /// Who approved (E6): the approver named in the call's ticket, or in
+    /// an `approve` record the approver who tried.
     pub approved_by: Option<String>,
+    /// SHA-256 (hex) of the ticket the call carried, or that a precheck
+    /// or approval minted — never the ticket itself, which is a bearer
+    /// credential until it is used (and `args` never has it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_sha256: Option<String>,
+    /// `approve` records: the "approve similar calls" scope asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_minutes: Option<u32>,
     pub exit_code: Option<i32>,
     /// The call did what was asked: no error, and a remote command that
     /// ran exited 0 and did not time out. Stricter than the gain log's
@@ -632,6 +647,14 @@ fn success_status(p: &Value, sudo: bool) -> (Option<i32>, Option<ErrorClass>) {
     (exit_code, class)
 }
 
+/// `args` without a top-level `ticket` (S6.5: the record has its hash).
+fn strip_ticket(mut args: Value) -> Value {
+    if let Value::Object(m) = &mut args {
+        m.remove("ticket");
+    }
+    args
+}
+
 /// A tool record for `ctx`, without the outcome fields.
 pub fn tool_record(ctx: &CallCtx, tool: &str, args: Value) -> Record {
     let (agent, agent_groups) = match &ctx.agent {
@@ -652,11 +675,19 @@ pub fn tool_record(ctx: &CallCtx, tool: &str, args: Value) -> Record {
         queried_as: None,
         dest_host: None,
         dest_queried_as: None,
-        args: redact(&args),
+        ticket_sha256: args
+            .get("ticket")
+            .map(|t| match t {
+                Value::String(s) => s.as_bytes().to_vec(),
+                other => other.to_string().into_bytes(),
+            })
+            .map(|b| crate::agent::hex(&crate::agent::sha256(&b))),
+        args: redact(&strip_ticket(args)),
         decision: None,
         rule: None,
         approval: ctx.notes().approval,
-        approved_by: None,
+        approved_by: ctx.notes().ticket.and_then(|t| t.approved_by),
+        scope_minutes: None,
         exit_code: None,
         ok: false,
         error_class: None,
@@ -1271,6 +1302,8 @@ impl Audit {
             rule: None,
             approval: None,
             approved_by: None,
+            ticket_sha256: None,
+            scope_minutes: None,
             exit_code: None,
             ok: false,
             error_class: None,
@@ -1493,6 +1526,8 @@ fn emit_event(r: &Record) {
         rule = r.rule.as_deref(),
         approval = r.approval,
         approved_by = r.approved_by.as_deref(),
+        ticket_sha256 = r.ticket_sha256.as_deref(),
+        scope_minutes = r.scope_minutes,
         exit_code = r.exit_code,
         ok = r.ok,
         error_class = r.error_class.map(ErrorClass::as_str),
@@ -1821,15 +1856,19 @@ pub fn table_row(r: &Value) -> [String; 8] {
         if !s("auth_note").is_empty() {
             d = format!("[{}] {d}", s("auth_note"));
         }
+        if !s("approved_by").is_empty() {
+            d = format!("by={} {d}", s("approved_by"));
+        }
         d
     };
     [
         cell(&time, CELL_MAX),
         cell(s("agent"), CELL_MAX),
-        if s("type") == "auth" {
-            "(auth)".into()
-        } else {
-            cell(s("tool"), CELL_MAX)
+        match s("type") {
+            "auth" => "(auth)".into(),
+            // Not a call that ran: say what it was.
+            t @ ("precheck" | "approve") => cell(&format!("{t}:{}", s("tool")), CELL_MAX),
+            _ => cell(s("tool"), CELL_MAX),
         },
         cell(&host, CELL_MAX),
         cell(
@@ -2572,6 +2611,26 @@ mod tests {
         assert_eq!(table_row(&r)[7], "kill=host web1 id");
         let g = json!({ "type": "tool", "args": {}, "kill": { "scope": "global" } });
         assert_eq!(table_row(&g)[7], "kill=global ");
+    }
+
+    /// A precheck or approval didn't run anything: the tool column says
+    /// so, and the approver shows.
+    #[test]
+    fn table_marks_prechecks_and_approvals() {
+        let p = json!({
+            "type": "precheck", "tool": "ssh_exec", "decision": "ask", "ok": true,
+            "args": { "cmd": "id" },
+        });
+        assert_eq!(table_row(&p)[2], "precheck:ssh_exec");
+        assert_eq!(table_row(&p)[4], "ask");
+        let a = json!({
+            "type": "approve", "tool": "ssh_sudo_exec", "decision": "allow", "ok": true,
+            "approved_by": "alice", "args": { "cmd": "id" },
+        });
+        assert_eq!(table_row(&a)[2], "approve:ssh_sudo_exec");
+        assert_eq!(table_row(&a)[7], "by=alice id");
+        let t = json!({ "type": "tool", "tool": "ssh_exec", "args": { "cmd": "id" } });
+        assert_eq!(table_row(&t)[2], "ssh_exec");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use mcp_gain::Tracker;
 use prompto::agent::{AgentStore, Agents, AuthConfig, AuthMode, Identity};
+use prompto::approval::{ApprovalConfig, Approvals};
 use prompto::audit::{self, Audit, AuditLog};
 use prompto::baselines::BASELINES;
 use prompto::caller;
@@ -180,6 +181,8 @@ fn open_audit(cfg: &Config, mode: AuthMode) -> Result<Audit> {
 struct PolicyReload {
     policy: PolicyStore,
     agents: AgentStore,
+    /// Ticket keys are re-read on SIGHUP too (and every minute).
+    approvals: Approvals,
 }
 
 /// Log `policy lint` findings against the live inventory and agents. A
@@ -260,11 +263,101 @@ fn spawn_sighup_reloader(store: InventoryStore, policy: Option<PolicyReload>, mo
                     tracing::error!(error = %format!("{e:#}"), "policy reload failed — DENYING every call until a valid file is loaded")
                 }
             }
+            let approvals = p.approvals.clone();
+            tokio::spawn(async move {
+                if approvals.configured() && approvals.load_keys().await.is_ok() {
+                    tracing::info!("ticket keys re-read on SIGHUP");
+                }
+            });
             let live = p.policy.snapshot();
             warn_if_deny_all(&live, mode);
             log_policy_lint(&live, &store.snapshot(), &p.agents.snapshot());
         }
     });
+}
+
+/// Tickets and approvals (E6), when a ticket key source is configured
+/// and auth is on (with `off` there is no policy, so nothing to approve).
+/// Never fatal: a key that can't be read now is retried every minute,
+/// and only calls that need a ticket wait for it.
+async fn open_approvals(
+    mode: AuthMode,
+    vault: Option<Arc<VaultClient>>,
+    inv: &prompto::inventory::Inventory,
+) -> Approvals {
+    let Some(cfg) = ApprovalConfig::from_env() else {
+        return Approvals::default();
+    };
+    if mode == AuthMode::Off {
+        tracing::info!("PROMPTO_AUTH=off — ticket key settings ignored (no policy, no approvals)");
+        return Approvals::default();
+    }
+    tracing::info!(
+        key_vault_path = cfg.key_vault_path.as_deref(),
+        key_file = cfg.key_file.as_ref().map(|p| p.display().to_string()),
+        approvers = %cfg.approvers_path.display(),
+        state = %cfg.state_path.display(),
+        private_mount = %cfg.private.mount,
+        agent_readable = %cfg.private.agent_readable.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        "tickets and approvals enabled"
+    );
+    if cfg.private.agent_readable.is_empty() {
+        tracing::warn!(
+            "PROMPTO_AGENT_READABLE_VAULT_PREFIXES is empty: prompto cannot check that agents \
+             can't read the approval secrets"
+        );
+    }
+    warn_sudo_prefix_overlap(&cfg, inv);
+    // Approval secrets are read from their own mount, with the same token.
+    let vault = vault.map(|v| Arc::new(v.with_mount(&cfg.private.mount)));
+    let approvals = Approvals::new(cfg, vault);
+    if approvals.load_keys().await.is_err() {
+        tracing::error!(
+            "NO TICKET KEY — calls whose policy rule demands an approval are refused until one \
+             can be read (retrying every minute, and on SIGHUP)"
+        );
+    }
+    approvals.spawn_key_refresh();
+    approvals
+}
+
+/// Approval secrets in the same vault directory as a sudo password: a
+/// vault policy written for the passwords likely covers them too. Not
+/// fatal (the agent-readable check is), but worth fixing.
+fn warn_sudo_prefix_overlap(cfg: &ApprovalConfig, inv: &prompto::inventory::Inventory) {
+    let list = prompto::approvers::Approvers::from_path(&cfg.approvers_path).unwrap_or_default();
+    let mut paths: Vec<String> = cfg.key_vault_path.iter().cloned().collect();
+    paths.extend(
+        list.approvers
+            .values()
+            .filter_map(|e| e.totp_vault_path.clone()),
+    );
+    for p in paths {
+        if let Some(sudo) = sudo_prefix_covering(inv, &cfg.private.mount, &p) {
+            tracing::warn!(
+                path = %format!("{}/{p}", cfg.private.mount),
+                sudo_prefix = %sudo,
+                "an approval secret shares a vault prefix with a sudo password; a policy that \
+                 lets anything read the passwords likely reads it too — move it to its own mount \
+                 (PROMPTO_PRIVATE_MOUNT)"
+            );
+        }
+    }
+}
+
+/// The directory of a host's `sudo_password_vault_path` that `path` on
+/// `mount` falls under, if any.
+fn sudo_prefix_covering(
+    inv: &prompto::inventory::Inventory,
+    mount: &str,
+    path: &str,
+) -> Option<prompto::approval::VaultPrefix> {
+    let shared = env_or("PROMPTO_VAULT_MOUNT", "secret");
+    inv.hosts
+        .values()
+        .filter_map(|h| h.sudo_password_vault_path.as_deref())
+        .map(|p| prompto::approval::VaultPrefix::dir_of(shared.trim_matches('/'), p))
+        .find(|d| d.covers(mount, path))
 }
 
 /// Keep prompto's vault token alive. A periodic token renewed inside its
@@ -387,6 +480,282 @@ fn run_agent_cli(cfg: &Config, args: &[String]) -> Result<()> {
         _ => anyhow::bail!("{AGENT_USAGE}"),
     }
     Ok(())
+}
+
+const APPROVER_USAGE: &str = "\
+Usage: prompto approver add <name> [--vault-path <kv path> [--i-know] | --file <path>]
+                            [--issuer <label>] [--replace]
+       prompto approver list
+       prompto approver revoke <name>
+
+`add` mints a TOTP secret for a human approver, stores it, records the
+reference in $PROMPTO_APPROVERS (default /etc/prompto/approvers.toml), and
+prints the otpauth:// URI and a QR code ONCE: scan it with an authenticator
+app now. --replace re-enrolls an existing approver (lost phone). The server
+reads the file on every approval; no reload needed.
+
+Where the secret goes — NOTHING AN AGENT CAN READ MAY HOLD IT (an agent that
+reads it approves its own calls):
+
+  --vault-path approvers/<name>
+      vault KV v2, field totp_secret, on the PRIVATE mount
+      $PROMPTO_PRIVATE_MOUNT (default prompto-private) — a mount only
+      prompto's own token may read; see the README, \"Where the approval
+      secrets live\", for the vault policy. Uses PROMPTO_VAULT_ADDR/_CACERT
+      and a PROMPTO_VAULT_TOKEN that may write there (an operator token,
+      not prompto's). Refused if the path is under
+      $PROMPTO_AGENT_READABLE_VAULT_PREFIXES (default prompto/,infra/ on
+      $PROMPTO_VAULT_MOUNT). Refused too if it shares a vault directory
+      with a host's sudo_password_vault_path (policies written for those
+      would likely cover it) unless --i-know.
+  --file <path>   (default: approvers.d/<name>.totp next to the approvers
+      file) an owner-only file in a directory owned by the service user.
+      Anyone who is root on this machine can read it — and so can any
+      agent policy lets run root, or a shell as a user that can sudo,
+      here: mark this host prompto_host = true in the inventory and
+      `prompto policy lint` flags those grants.";
+
+fn approvers_path() -> PathBuf {
+    env_or("PROMPTO_APPROVERS", prompto::approval::DEFAULT_APPROVERS).into()
+}
+
+/// `prompto approver …`.
+async fn run_approver_cli(cfg: &Config, args: &[String]) -> Result<()> {
+    use prompto::approvers::{ApproverEntry, Approvers};
+    let path = approvers_path();
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let (mut name, mut vault_path, mut file, mut issuer, mut replace) =
+                (None, None, None, String::from("prompto"), false);
+            let mut i_know = false;
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                let mut val = |flag: &str| {
+                    it.next()
+                        .with_context(|| format!("{flag} needs a value"))
+                        .cloned()
+                };
+                match a.as_str() {
+                    "--vault-path" => vault_path = Some(val("--vault-path")?),
+                    "--file" => file = Some(PathBuf::from(val("--file")?)),
+                    "--issuer" => issuer = val("--issuer")?,
+                    "--replace" => replace = true,
+                    "--i-know" => i_know = true,
+                    s if s.starts_with('-') || name.is_some() => {
+                        anyhow::bail!("unexpected argument {s:?}\n{APPROVER_USAGE}")
+                    }
+                    s => name = Some(s.to_string()),
+                }
+            }
+            let name =
+                name.with_context(|| format!("approver add needs a name\n{APPROVER_USAGE}"))?;
+            prompto::agent::validate_name("approver", &name)?;
+            if vault_path.is_some() && file.is_some() {
+                anyhow::bail!("--vault-path and --file are exclusive");
+            }
+            let mut list = Approvers::from_path(&path)?;
+            if list.approvers.contains_key(&name) && !replace {
+                anyhow::bail!(
+                    "approver {name:?} exists in {}; --replace re-enrolls it",
+                    path.display()
+                );
+            }
+            let secret = prompto::totp::mint_secret()?;
+            let b32 = prompto::totp::base32_encode(&secret);
+            let mut entry = ApproverEntry {
+                created: Some(
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                ..Default::default()
+            };
+            if let Some(vp) = vault_path {
+                prompto::vault::validate_kv_path(&vp)?;
+                let private = prompto::approval::PrivateVault::from_env();
+                private.check_path(&format!("approver {name}'s TOTP secret"), &vp)?;
+                check_sudo_overlap(cfg, &private.mount, &vp, i_know)?;
+                let vault = VaultClient::from_env()?
+                    .context(
+                        "--vault-path needs PROMPTO_VAULT_TOKEN (a token that may write there) and \
+                         PROMPTO_VAULT_ADDR",
+                    )?
+                    .with_mount(&private.mount);
+                vault
+                    .kv2_put(
+                        &vp,
+                        serde_json::json!({ prompto::approvers::VAULT_FIELD: b32 }),
+                    )
+                    .await?;
+                entry.totp_vault_path = Some(vp);
+            } else {
+                let f = match file {
+                    Some(f) => f,
+                    None => path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("approvers.d")
+                        .join(format!("{name}.totp")),
+                };
+                write_secret_file(&f, &b32, replace)?;
+                entry.totp_file = Some(f);
+            }
+            list.approvers.insert(name.clone(), entry);
+            prompto::agent::write_atomic(&path, &list.to_toml_string()?)?;
+            let uri = prompto::totp::otpauth_uri(&issuer, &name, &secret);
+            if let Some(qr) = prompto::totp::qr_terminal(&uri) {
+                println!("{qr}");
+            }
+            println!("{uri}");
+            eprintln!(
+                "approver {name:?} enrolled in {}. The URI and QR code above were shown ONCE: \
+                 scan it with an authenticator app now. The secret is stored only where the \
+                 entry points.",
+                path.display()
+            );
+        }
+        Some("list") if args.len() == 1 => {
+            let list = Approvers::from_path(&path)?;
+            if list.approvers.is_empty() {
+                eprintln!("no approvers in {}", path.display());
+            }
+            println!("{:<24} {:<8} {:<21} FACTOR", "NAME", "STATUS", "CREATED");
+            for (name, e) in &list.approvers {
+                let factor = match (&e.totp_vault_path, &e.totp_file) {
+                    (Some(v), _) => format!(
+                        "totp vault:{}/{v}",
+                        prompto::approval::PrivateVault::from_env().mount
+                    ),
+                    (_, Some(f)) => format!("totp file:{}", f.display()),
+                    _ => "-".into(),
+                };
+                println!(
+                    "{:<24} {:<8} {:<21} {factor}",
+                    name,
+                    if e.disabled { "revoked" } else { "active" },
+                    e.created.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+        Some("revoke") if args.len() == 2 => {
+            let name = &args[1];
+            let mut list = Approvers::from_path(&path)?;
+            let e = list
+                .approvers
+                .get_mut(name)
+                .with_context(|| format!("no approver {name:?} in {}", path.display()))?;
+            if e.disabled {
+                eprintln!("approver {name:?} was already revoked; nothing changed.");
+            } else {
+                e.disabled = true;
+                prompto::agent::write_atomic(&path, &list.to_toml_string()?)?;
+                eprintln!(
+                    "approver {name:?} revoked: their codes are refused from the next approval."
+                );
+            }
+        }
+        Some("--help" | "-h" | "help") => println!("{APPROVER_USAGE}"),
+        _ => anyhow::bail!("{APPROVER_USAGE}"),
+    }
+    Ok(())
+}
+
+/// `approver add --vault-path`: refuse a path in the same vault directory
+/// as a host's sudo password unless the operator says they know.
+fn check_sudo_overlap(cfg: &Config, mount: &str, path: &str, i_know: bool) -> Result<()> {
+    let inv = match prompto::inventory::Inventory::from_path(&cfg.inventory_path) {
+        Ok(inv) => inv,
+        Err(e) if i_know => {
+            eprintln!("WARNING: cannot read the inventory ({e:#}); sudo-prefix check skipped");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).context(
+                "reading the inventory to check the path against the sudo passwords' vault \
+                 prefixes (--i-know skips the check)",
+            );
+        }
+    };
+    let Some(sudo) = sudo_prefix_covering(&inv, mount, path) else {
+        return Ok(());
+    };
+    let msg = format!(
+        "{mount}/{path} is in the same vault directory as a host's sudo password ({sudo}). A \
+         vault policy that grants reading the passwords — to an agent gateway, a script, a \
+         person — most likely grants this too, and whoever reads a TOTP secret can approve \
+         anything. Use the private mount (PROMPTO_PRIVATE_MOUNT) that only prompto's token \
+         reads."
+    );
+    if !i_know {
+        anyhow::bail!(
+            "{msg}\nRefused; --i-know overrides if that policy really is prompto's alone."
+        );
+    }
+    eprintln!("WARNING (--i-know): {msg}");
+    Ok(())
+}
+
+/// Write a TOTP secret owner-only, owned like its directory (which the
+/// operator creates owned by the service user, as for `keys/`).
+fn write_secret_file(path: &std::path::Path, b32: &str, replace: bool) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let d = std::fs::metadata(dir).with_context(|| {
+        format!(
+            "{} does not exist: create it owned by the service user, e.g. \
+             install -d -o prompto -g prompto -m 0700 {}",
+            dir.display(),
+            dir.display()
+        )
+    })?;
+    if replace {
+        let _ = std::fs::remove_file(path);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(format!("{b32}\n").as_bytes())?;
+    f.sync_all()?;
+    if let Err(e) = std::os::unix::fs::fchown(&f, Some(d.uid()), Some(d.gid())) {
+        let m = f.metadata()?;
+        if (m.uid(), m.gid()) != (d.uid(), d.gid()) {
+            let _ = std::fs::remove_file(path);
+            return Err(e).context("give the secret file to its directory's owner");
+        }
+    }
+    Ok(())
+}
+
+const TICKET_USAGE: &str = "\
+Usage: prompto ticket keygen   print a fresh ticket key (base64, 32 bytes)
+
+Whoever holds the key can mint any ticket: it must be readable by prompto's
+own token or user ONLY. Store it as the `current` field of
+PROMPTO_TICKET_KEY_VAULT_PATH (KV v2) on the private mount
+$PROMPTO_PRIVATE_MOUNT (default prompto-private, which no other token may
+read; prompto refuses a path under $PROMPTO_AGENT_READABLE_VAULT_PREFIXES),
+or as the first line of PROMPTO_TICKET_KEY_FILE (mode 0600, owned by the
+service user; any agent with root on this host defeats it — see
+prompto_host in the README). To rotate: move the old key to `previous`
+(second line), put the new one in `current`, SIGHUP (or wait a minute);
+remove `previous` once outstanding tickets have expired (120 s; up to 60
+min for scoped approvals).";
+
+/// `prompto ticket …`.
+fn run_ticket_cli(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("keygen") if args.len() == 1 => {
+            println!("{}", prompto::ticket::generate_key()?);
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("{TICKET_USAGE}");
+            Ok(())
+        }
+        _ => anyhow::bail!("{TICKET_USAGE}"),
+    }
 }
 
 /// Startup: where the kill switches are, and any that are already on.
@@ -885,6 +1254,12 @@ async fn main() -> Result<()> {
     if raw_args.len() >= 2 && raw_args[1] == "audit" {
         return run_audit_cli(&cfg, &raw_args[2..]);
     }
+    if raw_args.len() >= 2 && raw_args[1] == "approver" {
+        return run_approver_cli(&cfg, &raw_args[2..]).await;
+    }
+    if raw_args.len() >= 2 && raw_args[1] == "ticket" {
+        return run_ticket_cli(&raw_args[2..]);
+    }
     if raw_args.len() >= 2 && raw_args[1] == "policy" {
         let code = run_policy_cli(&cfg, &raw_args[2..])?;
         std::process::exit(code);
@@ -958,17 +1333,8 @@ async fn main() -> Result<()> {
         log_policy_lint(&live, &store.snapshot(), &agents.snapshot());
         Some(policy)
     };
-    let reload = match (&agents, &policy) {
-        (Some(a), Some(p)) => Some(PolicyReload {
-            policy: p.clone(),
-            agents: a.clone(),
-        }),
-        _ => None,
-    };
-    spawn_sighup_reloader(store.clone(), reload, auth_mode);
-    let audit = open_audit(&cfg, auth_mode)?;
-
     let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
+    let mut vault_client = None;
     let needs_vault: Vec<String> = store
         .snapshot()
         .hosts
@@ -981,7 +1347,8 @@ async fn main() -> Result<()> {
             let vault = Arc::new(vault);
             tracing::info!(addr = %vault.addr(), hosts = ?needs_vault, "vault-backed sudo enabled");
             spawn_vault_renewal(vault.clone());
-            ssh_client = ssh_client.with_vault(vault);
+            ssh_client = ssh_client.with_vault(vault.clone());
+            vault_client = Some(vault);
         }
         None if !needs_vault.is_empty() => tracing::warn!(
             hosts = ?needs_vault,
@@ -990,6 +1357,35 @@ async fn main() -> Result<()> {
         ),
         None => {}
     }
+    let approvals = open_approvals(auth_mode, vault_client, &store.snapshot()).await;
+    if let Some(p) = &policy {
+        let asking: Vec<String> = p
+            .snapshot()
+            .rules
+            .iter()
+            .filter(|r| r.approval != prompto::policy::Approval::None)
+            .map(|r| r.name().to_string())
+            .collect();
+        if !asking.is_empty() && !approvals.configured() {
+            tracing::warn!(
+                rules = ?asking,
+                "these policy rules demand an approval, and no ticket key is configured \
+                 (PROMPTO_TICKET_KEY_VAULT_PATH / PROMPTO_TICKET_KEY_FILE): their calls are \
+                 refused (approval_required)"
+            );
+        }
+    }
+    let reload = match (&agents, &policy) {
+        (Some(a), Some(p)) => Some(PolicyReload {
+            policy: p.clone(),
+            agents: a.clone(),
+            approvals: approvals.clone(),
+        }),
+        _ => None,
+    };
+    spawn_sighup_reloader(store.clone(), reload, auth_mode);
+    let audit = open_audit(&cfg, auth_mode)?;
+
     let ssh = Arc::new(ssh_client);
     let tracker = Arc::new(Tracker::new(
         cfg.usage_log.clone(),
@@ -1012,6 +1408,7 @@ async fn main() -> Result<()> {
         mode: auth_mode,
         store: agents.unwrap_or_default(),
         policy: policy.unwrap_or_default(),
+        approvals,
     };
 
     if stdio_mode {

@@ -1,0 +1,21 @@
+# /etc/prompto/approvers.toml — humans who may approve calls whose policy
+# rule says approval = "human" (POST /v1/approve with their TOTP code).
+# Manage with `prompto approver add|list|revoke`; read at every approval,
+# so edits apply to the next one. Each approver has exactly one factor.
+
+# Whoever can read an approver's TOTP secret can approve anything: no agent
+# may be able to read it (README, "Where the approval secrets live").
+
+# TOTP secret in vault KV v2, field totp_secret, on PROMPTO_PRIVATE_MOUNT
+# (default prompto-private): a mount ONLY prompto's token may read.
+[approver.alice]
+totp_vault_path = "approvers/alice"
+created = "2026-10-10T12:00:00Z"
+
+# TOTP secret (base32) in a file readable only by the service user (0600).
+# Root on this machine reads it: mark it prompto_host = true in the
+# inventory so `prompto policy lint` flags any rule granting root here.
+[approver.bob]
+totp_file = "/etc/prompto/approvers.d/bob.totp"
+created = "2026-10-10T12:00:00Z"
+disabled = true    # revoked: codes refused

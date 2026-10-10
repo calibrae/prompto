@@ -357,7 +357,9 @@ async fn log_tail(
         // errors; a policy refusal is a 403.
         Err(e) => {
             let status = match e.class {
-                ErrorClass::RefusedPolicy | ErrorClass::ApprovalRequired => StatusCode::FORBIDDEN,
+                ErrorClass::RefusedPolicy
+                | ErrorClass::ApprovalRequired
+                | ErrorClass::RefusedTicket => StatusCode::FORBIDDEN,
                 _ => StatusCode::BAD_REQUEST,
             };
             return Err((status, e.into()));
@@ -380,8 +382,9 @@ async fn log_tail(
 /// Response header carrying the request ID on `GET /log`.
 pub const REQUEST_ID_HEADER: &str = "x-prompto-request-id";
 
-/// Build the axum router serving MCP at `/mcp` and the plain-HTTP log
-/// tail at `/log`.
+/// Build the axum router serving MCP at `/mcp`, the plain-HTTP log tail
+/// at `/log`, and `POST /v1/precheck` / `POST /v1/approve`
+/// (`crate::precheck`).
 pub fn build_router(p: HttpParams) -> axum::Router {
     // `stateless_protocol_metadata_required` is left at its default of
     // false: enabling it rejects ordinary requests from any client
@@ -430,6 +433,13 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     let audit_for_log = audit.clone();
     let audit_for_auth = audit.clone();
     let kill_for_log = kill.clone();
+    let api_state = crate::precheck::ApiState {
+        store: store.clone(),
+        policy: policy.clone(),
+        approvals: auth.approvals.clone(),
+        audit: audit.clone(),
+        kill: kill.clone(),
+    };
 
     let service = StreamableHttpService::new(
         move || {
@@ -471,6 +481,16 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         .route(
             "/log",
             axum::routing::get(log_handler).with_state(log_state),
+        )
+        // Precheck and approval (E6): JSON in, JSON out, same
+        // authentication as /mcp.
+        .route(
+            "/v1/precheck",
+            axum::routing::post(crate::precheck::precheck).with_state(api_state.clone()),
+        )
+        .route(
+            "/v1/approve",
+            axum::routing::post(crate::precheck::approve).with_state(api_state),
         )
         // Layers wrap outward: the caller-IP layer (added last) runs
         // first, so authentication sees the resolved client address.

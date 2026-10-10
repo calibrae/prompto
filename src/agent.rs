@@ -367,6 +367,9 @@ pub struct AuthConfig {
     /// `policy.toml`. Ignored with `off`; otherwise enforced, and the
     /// default (no rules) denies every call.
     pub policy: crate::policy::PolicyStore,
+    /// Tickets and approvers (E6). `Default`: not configured, so rules
+    /// with an `approval` refuse their calls.
+    pub approvals: crate::approval::Approvals,
 }
 
 impl AuthConfig {
@@ -376,6 +379,7 @@ impl AuthConfig {
         (self.mode != AuthMode::Off).then(|| crate::policy::Enforcer {
             policy: self.policy.clone(),
             agents: self.store.clone(),
+            approvals: self.approvals.clone(),
         })
     }
 }
@@ -670,6 +674,7 @@ mod tests {
             mode,
             store: AgentStore::new(a, None),
             policy: Default::default(),
+            approvals: Default::default(),
         }
     }
 

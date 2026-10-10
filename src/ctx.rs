@@ -52,6 +52,9 @@ pub struct CallCtx {
     /// What authorization found out, for the audit record: filled in by
     /// `authz` and the policy, read by `finish_tool`.
     pub notes: Arc<Mutex<Notes>>,
+    /// `POST /v1/precheck`: authorize as for the real call, but change
+    /// nothing — a ticket presented is checked, its nonce not spent.
+    pub dry_run: bool,
 }
 
 impl CallCtx {
@@ -67,6 +70,7 @@ impl CallCtx {
             user_agent: None,
             call: None,
             notes: Default::default(),
+            dry_run: false,
         }
     }
 

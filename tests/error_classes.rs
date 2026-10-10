@@ -109,6 +109,7 @@ async fn spawn(mode: AuthMode, policy: &str) -> Server {
             mode,
             store: AgentStore::new(Agents::from_toml_str(&agents).unwrap(), None),
             policy: PolicyStore::new(Policy::from_toml_str(policy, "policy.toml").unwrap(), None),
+            approvals: Default::default(),
         },
         audit: Audit::new(AuditLog::open(audit_path.clone(), None, mode != AuthMode::Off).unwrap()),
         kill: prompto::kill::KillSwitch::in_dir(dir.path()),

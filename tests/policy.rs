@@ -157,6 +157,7 @@ async fn spawn(mode: AuthMode, agents: AgentStore, policy: PolicyStore) -> Serve
             mode,
             store: agents,
             policy,
+            approvals: Default::default(),
         },
         audit: Default::default(),
         kill: prompto::kill::KillSwitch::in_dir(dir.path()),

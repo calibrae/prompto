@@ -225,6 +225,7 @@ async fn spawn_opts(o: Opts) -> Server {
         mode: o.mode,
         store: AgentStore::new(Agents::from_toml_str(&agents).unwrap(), None),
         policy: PolicyStore::new(Policy::from_toml_str(POLICY, "policy.toml").unwrap(), None),
+        approvals: Default::default(),
     };
     let vault = VaultClient::new(spawn_fake_vault().await, "secret", "tok");
     let cancel = CancellationToken::new();
