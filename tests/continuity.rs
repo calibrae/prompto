@@ -646,6 +646,50 @@ async fn a_successor_that_dies_after_ready_never_takes_over() {
     assert_eq!(successors(&p.stderr()).len(), 1);
 }
 
+/// A stop during a probation means "abandon the handover and drain",
+/// even when it comes as more than one signal at once (a SIGTERM with a
+/// SIGINT): the drain runs in full and the call in flight finishes. Only
+/// a stop sent during the drain cuts it short.
+#[tokio::test]
+async fn stops_during_a_probation_do_not_cut_the_drain_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let exe = d.join("prompto");
+    std::os::unix::fs::symlink(BIN, &exe).unwrap();
+    let mut p = spawn_exe(d, &exe, &[]);
+    let addr = p.addr();
+    let n = unique_secs();
+    std::fs::remove_file(&exe).unwrap();
+    write_exe(&exe, &format!("#!/bin/sh\nprintf R >&4\nexec sleep {n}\n"));
+    let long = tokio::spawn(async move { exec(addr, "sleep 3; echo finished", 30).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    p.signal(libc::SIGUSR2);
+    let t = Instant::now();
+    while !p.stderr().contains("both accept until its probation ends") {
+        assert!(t.elapsed() < Duration::from_secs(15), "{}", p.stderr());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Both pending when the process next runs, whatever the scheduling.
+    p.signal(libc::SIGSTOP);
+    p.signal(libc::SIGTERM);
+    p.signal(libc::SIGINT);
+    p.signal(libc::SIGCONT);
+    let v = long.await.unwrap();
+    assert_eq!(stdout(&v).as_deref(), Some("finished\n"), "{v}");
+    assert_eq!(
+        p.exited_within(Duration::from_secs(10)),
+        Some(0),
+        "{}",
+        p.stderr()
+    );
+    let log = p.stderr();
+    assert!(log.contains("abandoning the successor"), "{log}");
+    assert!(log.contains("drained: every call finished"), "{log}");
+    assert!(!log.contains("cutting the drain short"), "{log}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(pgrep(&format!("^sleep {n}$")).is_empty());
+}
+
 /// A successor that can't start (here: an invalid setting in the env
 /// file) leaves the old process serving; under a systemd unit that is not
 /// `Type=notify` a handover is refused outright, since systemd would kill
