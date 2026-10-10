@@ -435,6 +435,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
     let kill_for_log = kill.clone();
     let api_state = crate::precheck::ApiState {
         store: store.clone(),
+        mode: auth.mode,
         policy: policy.clone(),
         approvals: auth.approvals.clone(),
         audit: audit.clone(),
@@ -490,7 +491,20 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         )
         .route(
             "/v1/approve",
-            axum::routing::post(crate::precheck::approve).with_state(api_state),
+            axum::routing::post(crate::precheck::approve).with_state(api_state.clone()),
+        )
+        // What an agent may ask about itself (E7, the Claude Code plugin).
+        .route(
+            "/v1/whoami",
+            axum::routing::get(crate::agent_api::whoami).with_state(api_state.clone()),
+        )
+        .route(
+            "/v1/audit",
+            axum::routing::get(crate::agent_api::audit).with_state(api_state.clone()),
+        )
+        .route(
+            "/v1/kill",
+            axum::routing::post(crate::agent_api::kill).with_state(api_state),
         )
         // Layers wrap outward: the caller-IP layer (added last) runs
         // first, so authentication sees the resolved client address.

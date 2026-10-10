@@ -5,6 +5,7 @@
 
 pub mod advisor;
 pub mod agent;
+pub mod agent_api;
 pub mod approval;
 pub mod approvers;
 pub mod apytti_client;

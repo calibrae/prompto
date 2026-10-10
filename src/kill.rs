@@ -38,6 +38,17 @@
 //! `/`, no leading `.`, so `kill host ../x` can't reach outside `kill.d`.
 //! A call naming a host that isn't a valid file name can't match a file
 //! and is not looked up.
+//!
+//! **Switches set over HTTP** (`POST /v1/kill`, `crate::agent_api`) live
+//! in a second directory the server itself may write
+//! (`PROMPTO_KILL_API_DIR`, default `/var/lib/prompto/kill.d`: under
+//! systemd `/etc` is read-only to it). Two kinds only: `global` (an
+//! approver's TOTP code is required to set it) and
+//! `session-<agent>.<session>` (an agent stopping its own session: it
+//! stops that agent's calls carrying that session, nobody else's). The
+//! server never removes them: an operator does, with `prompto kill off`
+//! and `prompto unkill session <id>`. They are checked, listed and probed
+//! like the others.
 
 use crate::error_class::{ClassifiedError, ErrorClass};
 use anyhow::{Context, Result, bail};
@@ -49,6 +60,10 @@ use std::time::SystemTime;
 
 /// Default global kill file.
 pub const DEFAULT_FILE: &str = "/etc/prompto/kill";
+/// Default directory of the switches set over HTTP (see the module docs).
+pub const DEFAULT_API_DIR: &str = "/var/lib/prompto/kill.d";
+/// File name of the global switch in the API directory.
+const API_GLOBAL: &str = "global";
 /// Longest reason shown, in chars.
 pub const MAX_REASON: usize = 200;
 /// Bytes read from a kill file to find its first line.
@@ -62,6 +77,10 @@ pub enum Scope {
     Agent,
     Host,
     Session,
+    /// One agent's calls in one session, set over HTTP by the agent
+    /// itself. `target` is the session, `agent` the agent.
+    #[serde(rename = "agent_session")]
+    AgentSession,
 }
 
 impl Scope {
@@ -71,6 +90,7 @@ impl Scope {
             Scope::Agent => "agent",
             Scope::Host => "host",
             Scope::Session => "session",
+            Scope::AgentSession => "agent_session",
         }
     }
 
@@ -90,7 +110,7 @@ impl Scope {
             Scope::Global => "",
             Scope::Agent => "agent-",
             Scope::Host => "host-",
-            Scope::Session => "session-",
+            Scope::Session | Scope::AgentSession => "session-",
         }
     }
 
@@ -106,7 +126,7 @@ pub fn validate(scope: Scope, name: &str) -> Result<()> {
     match scope {
         Scope::Global => bail!("the global kill takes no name"),
         Scope::Agent => crate::agent::validate_name("agent", name),
-        Scope::Host | Scope::Session => {
+        Scope::Host | Scope::Session | Scope::AgentSession => {
             let ok = !name.is_empty()
                 && name.len() <= crate::agent::MAX_SESSION_LEN
                 && name.as_bytes()[0].is_ascii_alphanumeric()
@@ -132,6 +152,9 @@ pub struct Kill {
     /// The agent, host or session; `None` for the global kill.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// `agent_session`: whose calls in that session are stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// When it was set (the file's mtime), RFC 3339 UTC.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
@@ -164,6 +187,13 @@ impl Kill {
             ),
             Scope::Session => (
                 format!("every call from session {t}"),
+                format!("prompto unkill session {t}"),
+            ),
+            Scope::AgentSession => (
+                format!(
+                    "every call by agent {} in session {t}",
+                    self.agent.as_deref().unwrap_or("?")
+                ),
                 format!("prompto unkill session {t}"),
             ),
         };
@@ -240,12 +270,15 @@ pub fn hosts_in(args: &serde_json::Value, inv: &crate::inventory::Inventory) -> 
 pub struct KillSwitch {
     file: PathBuf,
     dir: PathBuf,
+    /// The switches set over HTTP; `None`: that endpoint can't set any.
+    api: Option<PathBuf>,
 }
 
 impl Default for KillSwitch {
-    /// `/etc/prompto/kill` and `/etc/prompto/kill.d`.
+    /// `/etc/prompto/kill`, `/etc/prompto/kill.d` and
+    /// `/var/lib/prompto/kill.d`.
     fn default() -> Self {
-        Self::new(PathBuf::from(DEFAULT_FILE), None)
+        Self::new(PathBuf::from(DEFAULT_FILE), None).with_api_dir(Some(DEFAULT_API_DIR.into()))
     }
 }
 
@@ -258,15 +291,25 @@ impl KillSwitch {
             d.push(".d");
             d.into()
         });
-        Self { file, dir }
+        Self {
+            file,
+            dir,
+            api: None,
+        }
     }
 
-    /// `<dir>/kill` and `<dir>/kill.d` (tests).
+    /// The directory of the switches set over HTTP.
+    pub fn with_api_dir(mut self, api: Option<PathBuf>) -> Self {
+        self.api = api;
+        self
+    }
+
+    /// `<dir>/kill`, `<dir>/kill.d` and `<dir>/api-kill.d` (tests).
     pub fn in_dir(dir: &Path) -> Self {
-        Self::new(dir.join("kill"), None)
+        Self::new(dir.join("kill"), None).with_api_dir(Some(dir.join("api-kill.d")))
     }
 
-    /// `PROMPTO_KILL_FILE` and `PROMPTO_KILL_DIR`.
+    /// `PROMPTO_KILL_FILE`, `PROMPTO_KILL_DIR` and `PROMPTO_KILL_API_DIR`.
     pub fn from_env() -> Self {
         let get = |k| {
             std::env::var_os(k)
@@ -277,6 +320,13 @@ impl KillSwitch {
             get("PROMPTO_KILL_FILE").unwrap_or_else(|| PathBuf::from(DEFAULT_FILE)),
             get("PROMPTO_KILL_DIR"),
         )
+        .with_api_dir(Some(
+            get("PROMPTO_KILL_API_DIR").unwrap_or_else(|| PathBuf::from(DEFAULT_API_DIR)),
+        ))
+    }
+
+    pub fn api_dir(&self) -> Option<&Path> {
+        self.api.as_deref()
     }
 
     pub fn file(&self) -> &Path {
@@ -292,6 +342,9 @@ impl KillSwitch {
         match (scope, name) {
             (Scope::Global, None) => Ok(self.file.clone()),
             (Scope::Global, Some(_)) => bail!("the global kill takes no name"),
+            (Scope::AgentSession, _) => {
+                bail!("an agent's session kill is set over HTTP (set_agent_session)")
+            }
             (_, None) => bail!("a {} kill needs a name", scope.as_str()),
             (_, Some(n)) => {
                 validate(scope, n)?;
@@ -312,13 +365,146 @@ impl KillSwitch {
         read(&path, scope, Some(name))
     }
 
-    /// The kill switch that stops this call, if any: global first, then
-    /// the agent, the session and each host.
+    /// The global kill set over HTTP, if set.
+    pub fn api_global(&self) -> Option<Kill> {
+        read(&self.api.as_ref()?.join(API_GLOBAL), Scope::Global, None)
+    }
+
+    /// The file of agent `agent`'s kill of session `session`. Validates
+    /// both: agent names have no `.`, so the name is unambiguous.
+    fn agent_session_path(&self, agent: &str, session: &str) -> Result<PathBuf> {
+        let api = self
+            .api
+            .as_ref()
+            .context("no directory for kill switches set over HTTP")?;
+        crate::agent::validate_name("agent", agent)?;
+        validate(Scope::Session, session)?;
+        Ok(api.join(format!("session-{agent}.{session}")))
+    }
+
+    /// The file of a switch set over HTTP: `Global`, or `AgentSession`
+    /// with the agent and the session.
+    pub fn api_path(
+        &self,
+        scope: Scope,
+        agent: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<PathBuf> {
+        match (scope, agent, session) {
+            (Scope::Global, None, None) => Ok(self
+                .api
+                .as_ref()
+                .context("no directory for kill switches set over HTTP")?
+                .join(API_GLOBAL)),
+            (Scope::AgentSession, Some(a), Some(s)) => self.agent_session_path(a, s),
+            _ => bail!("only a global or an agent's session kill is set over HTTP"),
+        }
+    }
+
+    /// Agent `agent`'s kill of its session `session`, if set.
+    pub fn agent_session(&self, agent: &str, session: &str) -> Option<Kill> {
+        let path = self.agent_session_path(agent, session).ok()?;
+        read(&path, Scope::AgentSession, Some(session)).map(|k| Kill {
+            agent: Some(agent.to_string()),
+            ..k
+        })
+    }
+
+    /// The kill switch that stops this call, if any: global first (the
+    /// file, then the one set over HTTP), then the agent, the session,
+    /// the agent's own kill of that session and each host.
     pub fn check(&self, s: &Subject) -> Option<Kill> {
         self.global()
+            .or_else(|| self.api_global())
             .or_else(|| s.agent.and_then(|a| self.named(Scope::Agent, a)))
             .or_else(|| s.session.and_then(|id| self.named(Scope::Session, id)))
+            .or_else(|| {
+                s.agent
+                    .zip(s.session)
+                    .and_then(|(a, id)| self.agent_session(a, id))
+            })
             .or_else(|| s.hosts.iter().find_map(|h| self.named(Scope::Host, h)))
+    }
+
+    /// Set the global kill over HTTP (the caller checked the approver).
+    pub fn set_api_global(&self, reason: &str) -> Result<PathBuf> {
+        let api = self
+            .api
+            .as_ref()
+            .context("no directory for kill switches set over HTTP")?;
+        create_dir(api)?;
+        let path = api.join(API_GLOBAL);
+        write_switch(&path, reason)?;
+        Ok(path)
+    }
+
+    /// Agent `agent` stops its own session `session`.
+    pub fn set_agent_session(&self, agent: &str, session: &str, reason: &str) -> Result<PathBuf> {
+        let path = self.agent_session_path(agent, session)?;
+        create_dir(path.parent().context("kill file has no directory")?)?;
+        write_switch(&path, reason)?;
+        Ok(path)
+    }
+
+    /// `prompto kill off`'s second half: lift the global kill set over
+    /// HTTP. `Ok(false)`: it wasn't set.
+    pub fn clear_api_global(&self) -> Result<bool> {
+        match &self.api {
+            Some(api) => remove(&api.join(API_GLOBAL)),
+            None => Ok(false),
+        }
+    }
+
+    /// `prompto unkill session <id>`'s second half: lift every agent's
+    /// kill of that session. Returns the agents whose kill was lifted.
+    pub fn clear_agent_sessions(&self, session: &str) -> Result<Vec<String>> {
+        validate(Scope::Session, session)?;
+        let mut lifted = vec![];
+        for (agent, sess) in self.api_entries()?.1 {
+            if sess == session && remove(&self.agent_session_path(&agent, &sess)?)? {
+                lifted.push(agent);
+            }
+        }
+        Ok(lifted)
+    }
+
+    /// The API directory's switches: whether `global` is there, and each
+    /// valid `session-<agent>.<session>`, sorted. Other files are ignored
+    /// (and returned as the third element).
+    #[allow(clippy::type_complexity)]
+    fn api_entries(&self) -> Result<(bool, Vec<(String, String)>, Vec<String>)> {
+        let Some(api) = &self.api else {
+            return Ok((false, vec![], vec![]));
+        };
+        let entries = match std::fs::read_dir(api) {
+            Ok(e) => e,
+            Err(e) if absent(&e) => return Ok((false, vec![], vec![])),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", api.display())),
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let (mut global, mut pairs, mut ignored) = (false, vec![], vec![]);
+        for f in names {
+            if f == API_GLOBAL {
+                global = true;
+                continue;
+            }
+            let pair = f
+                .strip_prefix("session-")
+                .and_then(|r| r.split_once('.'))
+                .filter(|(a, s)| {
+                    crate::agent::validate_name("agent", a).is_ok()
+                        && validate(Scope::Session, s).is_ok()
+                });
+            match pair {
+                Some((a, s)) => pairs.push((a.to_string(), s.to_string())),
+                None => ignored.push(f),
+            }
+        }
+        Ok((global, pairs, ignored))
     }
 
     /// Every active kill switch, global first, and the files in `kill.d`
@@ -326,15 +512,14 @@ impl KillSwitch {
     pub fn list(&self) -> Result<(Vec<Kill>, Vec<String>)> {
         let mut kills: Vec<Kill> = self.global().into_iter().collect();
         let mut ignored = Vec::new();
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((kills, ignored)),
+        let mut names: Vec<String> = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
         };
-        let mut names: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
         names.sort();
         for file in names {
             let found = Scope::NAMED.iter().find_map(|&scope| {
@@ -346,6 +531,19 @@ impl KillSwitch {
                 Some(k) => kills.push(k),
                 None => ignored.push(file),
             }
+        }
+        let (global, pairs, other) = self.api_entries()?;
+        if global && let Some(k) = self.api_global() {
+            kills.insert(
+                usize::from(!kills.is_empty() && kills[0].scope == Scope::Global),
+                k,
+            );
+        }
+        for (a, s) in pairs {
+            kills.extend(self.agent_session(&a, &s));
+        }
+        if let Some(api) = &self.api {
+            ignored.extend(other.into_iter().map(|f| api.join(f).display().to_string()));
         }
         Ok((kills, ignored))
     }
@@ -359,50 +557,13 @@ impl KillSwitch {
         if scope != Scope::Global {
             create_dir(parent)?;
         }
-        let reason: String = reason
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-            .collect();
-        let body = if reason.trim().is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", reason.trim())
-        };
-        let tmp = parent.join(format!(
-            ".{}.tmp{}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
-        ));
-        let write = || -> io::Result<()> {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(&tmp)?;
-            f.write_all(body.as_bytes())?;
-            f.sync_all()?;
-            // Whatever the umask said.
-            std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
-            std::fs::rename(&tmp, &path)
-        };
-        if let Err(e) = write() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e).with_context(|| format!("writing {}", path.display()));
-        }
+        write_switch(&path, reason)?;
         Ok(path)
     }
 
     /// Lift a kill switch. `Ok(false)`: it wasn't set.
     pub fn clear(&self, scope: Scope, name: Option<&str>) -> Result<bool> {
-        let path = self.path(scope, name)?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
-        }
+        remove(&self.path(scope, name)?)
     }
 
     /// Can this process check every kill switch? The global file, the
@@ -412,7 +573,11 @@ impl KillSwitch {
     /// module docs).
     pub fn probe(&self) -> std::result::Result<(), String> {
         // `.probe` is never a valid switch name, so it is normally absent.
-        for p in [&self.file, &self.dir, &self.dir.join(".probe")] {
+        let mut paths = vec![self.file.clone(), self.dir.clone(), self.dir.join(".probe")];
+        if let Some(api) = &self.api {
+            paths.extend([api.clone(), api.join(".probe")]);
+        }
+        for p in &paths {
             if let Err(e) = std::fs::metadata(p)
                 && !absent(&e)
             {
@@ -420,6 +585,56 @@ impl KillSwitch {
             }
         }
         Ok(())
+    }
+}
+
+/// Write a switch whole, then rename it into place, mode 0644: the
+/// reason is not a secret and the server must read it. Newlines in the
+/// reason become spaces.
+fn write_switch(path: &Path, reason: &str) -> Result<()> {
+    let parent = path.parent().context("kill file has no directory")?;
+    let reason: String = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let body = if reason.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", reason.trim())
+    };
+    let tmp = parent.join(format!(
+        ".{}.tmp{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let write = || -> io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        // Whatever the umask said.
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Remove a switch. `Ok(false)`: it wasn't there.
+fn remove(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
 }
 
@@ -456,6 +671,7 @@ fn read(path: &Path, scope: Scope, target: Option<&str>) -> Option<Kill> {
             return Some(Kill {
                 scope,
                 target: target.map(str::to_string),
+                agent: None,
                 since: None,
                 reason: sanitize_reason(&format!(
                     "kill switch unreadable: {}: {e}",
@@ -476,6 +692,7 @@ fn read(path: &Path, scope: Scope, target: Option<&str>) -> Option<Kill> {
     Some(Kill {
         scope,
         target: target.map(str::to_string),
+        agent: None,
         since,
         reason,
         unreadable: false,
@@ -774,5 +991,92 @@ mod tests {
         let k = KillSwitch::new(d.path().join("f").join("kill"), None);
         assert_eq!(k.probe(), Ok(()));
         assert_eq!(k.global(), None);
+    }
+
+    fn subject<'a>(agent: &'a str, session: &'a str) -> Subject<'a> {
+        Subject {
+            agent: Some(agent),
+            session: Some(session),
+            hosts: vec![],
+        }
+    }
+
+    #[test]
+    fn an_agents_session_kill_stops_that_agent_in_that_session_only() {
+        let (_d, k) = ks();
+        assert_eq!(k.check(&subject("alpha", "s1")), None);
+        k.set_agent_session("alpha", "s1", "runaway").unwrap();
+        let hit = k.check(&subject("alpha", "s1")).expect("killed");
+        assert_eq!(hit.scope, Scope::AgentSession);
+        assert_eq!(hit.agent.as_deref(), Some("alpha"));
+        assert_eq!(hit.target.as_deref(), Some("s1"));
+        assert!(hit.message().contains("agent alpha in session s1"));
+        assert_eq!(k.check(&subject("alpha", "s2")), None);
+        assert_eq!(k.check(&subject("beta", "s1")), None);
+        // Listed, and lifted by `unkill session`.
+        let (kills, ignored) = k.list().unwrap();
+        assert_eq!(kills, vec![hit]);
+        assert!(ignored.is_empty());
+        assert_eq!(k.clear_agent_sessions("s2").unwrap(), Vec::<String>::new());
+        assert_eq!(k.clear_agent_sessions("s1").unwrap(), vec!["alpha"]);
+        assert_eq!(k.check(&subject("alpha", "s1")), None);
+        // Names that could escape the directory are refused.
+        assert!(k.set_agent_session("al.pha", "s1", "").is_err());
+        assert!(k.set_agent_session("alpha", "../s1", "").is_err());
+        assert!(k.set_agent_session("alpha", ".s1", "").is_err());
+    }
+
+    #[test]
+    fn a_global_kill_set_over_http_stops_everything() {
+        let (_d, k) = ks();
+        k.set_api_global("panic").unwrap();
+        let hit = k.check(&Subject::default()).expect("killed");
+        assert_eq!(hit.scope, Scope::Global);
+        assert_eq!(hit.reason.as_deref(), Some("panic"));
+        // Listed next to the file's own global kill.
+        k.set(Scope::Global, None, "file").unwrap();
+        let reasons: Vec<_> = k.list().unwrap().0.into_iter().map(|k| k.reason).collect();
+        assert_eq!(reasons, vec![Some("file".into()), Some("panic".into())]);
+        k.clear(Scope::Global, None).unwrap();
+        assert!(
+            k.check(&Subject::default()).is_some(),
+            "the HTTP one is still on"
+        );
+        assert!(k.clear_api_global().unwrap());
+        assert!(!k.clear_api_global().unwrap());
+        assert_eq!(k.check(&Subject::default()), None);
+    }
+
+    #[test]
+    fn without_an_api_directory_nothing_is_set_over_http() {
+        let d = tempfile::tempdir().unwrap();
+        let k = KillSwitch::new(d.path().join("kill"), None);
+        assert!(k.set_api_global("x").is_err());
+        assert!(k.set_agent_session("alpha", "s1", "x").is_err());
+        assert!(!k.clear_api_global().unwrap());
+        assert_eq!(k.check(&subject("alpha", "s1")), None);
+    }
+
+    #[test]
+    fn an_api_directory_that_cant_be_checked_fails_closed() {
+        let (d, k) = ks();
+        // A symlink loop: stat fails with ELOOP, as root too.
+        std::os::unix::fs::symlink("api-kill.d", d.path().join("api-kill.d")).unwrap();
+        assert!(k.probe().unwrap_err().contains("api-kill.d"));
+        let hit = k.check(&Subject::default()).expect("fails closed");
+        assert!(hit.unreadable);
+    }
+
+    #[test]
+    fn junk_in_the_api_directory_is_ignored() {
+        let (d, k) = ks();
+        let api = d.path().join("api-kill.d");
+        std::fs::create_dir(&api).unwrap();
+        for f in ["session-noagent", "session-a.b/c", "other"] {
+            let _ = std::fs::write(api.join(f), "");
+        }
+        let (kills, ignored) = k.list().unwrap();
+        assert!(kills.is_empty(), "{kills:?}");
+        assert_eq!(ignored.len(), 2, "{ignored:?}");
     }
 }

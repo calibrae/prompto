@@ -834,6 +834,26 @@ fn audit_kill(cfg: &Config, on: bool, scope: KillScope, target: Option<&str>, re
     }
 }
 
+/// Record the lifting of a switch that was set over HTTP (`POST
+/// /v1/kill`): the global one, or an agent's kill of its own session.
+fn audit_kill_api(cfg: &Config, scope: KillScope, session: Option<&str>, agent: Option<&str>) {
+    let file = cfg.kill.api_path(scope, agent, session).unwrap_or_default();
+    let mut rec =
+        audit::KillRecord::new(false, scope, session, "", &file, audit::Operator::current());
+    rec.agent = agent.map(str::to_string);
+    let gid = cfg
+        .audit_group
+        .as_deref()
+        .and_then(|g| audit::resolve_group(g).ok());
+    if let Err(e) = audit::append_operator_record(&cfg.audit_path, gid, &rec) {
+        eprintln!(
+            "WARNING: the kill switch change above IS in effect, but it could not be recorded in \
+             the audit log {}: {e}",
+            cfg.audit_path.display()
+        );
+    }
+}
+
 /// `prompto kill …` / `prompto unkill …`: write or remove kill files,
 /// and record each change in the audit log.
 fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
@@ -853,10 +873,20 @@ fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
         };
         let scope = KillScope::parse_named(kind)
             .with_context(|| format!("unknown scope {kind:?}\n{KILL_USAGE}"))?;
-        if kill.clear(scope, Some(name))? {
+        let mut lifted = kill.clear(scope, Some(name))?;
+        if lifted {
             eprintln!("{kind} {name} kill lifted. {applies}");
             audit_kill(cfg, false, scope, Some(name), "");
-        } else {
+        }
+        // An agent's own kill of this session (POST /v1/kill).
+        if scope == KillScope::Session {
+            for agent in kill.clear_agent_sessions(name)? {
+                eprintln!("agent {agent}'s own kill of session {name} lifted. {applies}");
+                audit_kill_api(cfg, KillScope::AgentSession, Some(name), Some(&agent));
+                lifted = true;
+            }
+        }
+        if !lifted {
             eprintln!("{kind} {name} was not killed; nothing changed.");
         }
         return Ok(());
@@ -873,10 +903,18 @@ fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
             audit_kill(cfg, true, KillScope::Global, None, &why);
         }
         Some("off") if args.len() == 1 => {
-            if kill.clear(KillScope::Global, None)? {
+            let file = kill.clear(KillScope::Global, None)?;
+            if file {
                 eprintln!("global kill lifted. {applies}");
                 audit_kill(cfg, false, KillScope::Global, None, "");
-            } else {
+            }
+            // The global kill an approver set over HTTP (POST /v1/kill).
+            let api = kill.clear_api_global()?;
+            if api {
+                eprintln!("global kill set over HTTP lifted. {applies}");
+                audit_kill_api(cfg, KillScope::Global, None, None);
+            }
+            if !file && !api {
                 eprintln!("the global kill was not on; nothing changed.");
             }
         }
@@ -893,15 +931,20 @@ fn run_kill_cli(cfg: &Config, unkill: bool, args: &[String]) -> Result<()> {
                 println!("no kill switch is on");
             }
             for k in &kills {
+                let target = match (&k.agent, &k.target) {
+                    (Some(a), Some(t)) => format!("{a}@{t}"),
+                    (_, t) => t.as_deref().unwrap_or("*").to_string(),
+                };
                 println!(
                     "{:<8} {:<24} since {:<21} {}",
                     k.scope.as_str(),
-                    k.target.as_deref().unwrap_or("*"),
+                    target,
                     k.since.as_deref().unwrap_or("?"),
                     k.reason.as_deref().unwrap_or("")
                 );
             }
             for f in ignored {
+                // API-directory entries come back as full paths.
                 eprintln!(
                     "ignored (not a kill switch file): {}",
                     kill.dir().join(f).display()

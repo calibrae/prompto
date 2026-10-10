@@ -54,6 +54,8 @@ use serde_json::{Map, Value, json};
 #[derive(Clone)]
 pub struct ApiState {
     pub store: InventoryStore,
+    /// `PROMPTO_AUTH` (`crate::agent_api` needs to tell `off` apart).
+    pub mode: crate::agent::AuthMode,
     /// `None` with `PROMPTO_AUTH=off`: no policy, so nothing needs an
     /// approval.
     pub policy: Option<Enforcer>,
@@ -284,6 +286,9 @@ pub async fn precheck(
             covered,
         } => {
             out["approval"] = required.as_str().into();
+            // Whether the call is root-capable: a client offering "approve
+            // similar calls" needs to know (a root scope is opt-in).
+            out["root"] = notes_root(&ctx).into();
             if covered {
                 out["reason"] = "the ticket in `arguments` is valid for this call".into();
                 ("allow", None, None, rule)

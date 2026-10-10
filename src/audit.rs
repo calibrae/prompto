@@ -1047,7 +1047,9 @@ impl AuditLog {
     }
 
     /// Append one line (which must end in `\n`) with a single write.
-    fn append(&self, line: &[u8]) -> io::Result<()> {
+    /// Public for records that are not [`Record`]s (`crate::agent_api`'s
+    /// kill records); it keeps the failure bookkeeping.
+    pub fn append(&self, line: &[u8]) -> io::Result<()> {
         let mut st = lock(&self.state);
         let res = match self.ensure_open(&mut st) {
             Err(e) => Err((e, Failure::Open)),
@@ -1356,9 +1358,13 @@ impl Operator {
         }
     }
 
-    /// `root (sudo: ops)`, `ops`, `uid 1234`.
+    /// `root (sudo: ops)`, `ops`, `uid 1234`; `agent builder` for a kill
+    /// an agent set over HTTP (`crate::agent_api`).
     pub fn display(r: &Value) -> String {
         let s = |k: &str| r.get(k).and_then(Value::as_str);
+        if let Some(a) = s("agent") {
+            return format!("agent {a}");
+        }
         let user = match (s("user"), r.get("uid").and_then(Value::as_u64)) {
             (Some(u), _) => u.to_string(),
             (None, Some(uid)) => format!("uid {uid}"),
@@ -1404,6 +1410,9 @@ pub struct KillRecord {
     pub scope: crate::kill::Scope,
     /// The agent, host or session; `null` for the global switch.
     pub target: Option<String>,
+    /// `agent_session`: the agent whose calls in session `target` stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// As the server will show it (`kill::sanitize_reason`); `null` for
     /// `off` and for a switch set without one.
     pub reason: Option<String>,
@@ -1428,6 +1437,7 @@ impl KillRecord {
             action: if on { "on" } else { "off" },
             scope,
             target: target.map(|t| clamp(t, MAX_FIELD)),
+            agent: None,
             reason: on
                 .then(|| crate::kill::sanitize_reason(reason))
                 .flatten()
