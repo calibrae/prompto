@@ -15,10 +15,11 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **CLI:** `prompto approver add|list|revoke` (prints the `otpauth://` URI and a terminal QR code once; `--i-know`), `prompto ticket keygen`.
 - **Audit:** the ticket is removed from `args` and recorded as `ticket_sha256`; `approved_by` is filled in; new record types `precheck` and `approve`.
 
-### macOS targets
+### macOS and FreeBSD targets
 
 - **`file_list`** no longer drops entries whose mode carries an indicator (BSD `@` extended attributes, `+` ACL; GNU `+`, `.` SELinux): they come back with `xattrs` / `acl` / `security_context: true`. Device files are listed (`device: "major,minor"`, size 0), symlinks get `link_target`, names keep runs of spaces. A line that still can't be parsed is returned in `unparsed` (at most 20, with `unparsed_count`) instead of vanishing. A path that is a symlink to a directory lists the directory (macOS `/tmp`); on BSD/macOS a symlink to a file is listed as that file. New fields are left out when unset.
 - **`rsync_sync`** recognises openrsync (macOS since 15.4): its `rsync(<pid>): error: …` lines mark a source→dest failure (`dest_ssh_auth` / `dest_ssh_connect`, not `ssh_auth`), its exit 1 is `remote_nonzero`, and zsh/csh "command not found" wording is `rsync_missing`.
+- **`file_write` with `mode`** works on FreeBSD and macOS: prompto sent `chmod 640 -- <path>`, and BSD `chmod` takes the `--` after the mode as a file name (`chmod: --: No such file or directory`, after the file was written). It now sends `chmod -- 640 <path>`.
 - **Exec-style results carry `error_class`** (as `rsync_sync`'s did): the audit record's class for a non-zero exit, `null` on success. Additive.
 
 ### Upgrade note — no new config
