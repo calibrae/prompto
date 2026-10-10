@@ -104,11 +104,17 @@ fn successors(log: &str) -> Vec<u32> {
 
 /// The server, auth off unless `env` says otherwise, on a free port.
 fn spawn(dir: &Path, env: &[(&str, String)]) -> Proc {
+    spawn_exe(dir, Path::new(BIN), env)
+}
+
+/// [`spawn`], started as `exe` — the path a handover starts the
+/// successor from.
+fn spawn_exe(dir: &Path, exe: &Path, env: &[(&str, String)]) -> Proc {
     if !dir.join("prompto.toml").exists() {
         std::fs::write(dir.join("prompto.toml"), INVENTORY).unwrap();
     }
     write_exe(&dir.join("ssh"), FAKE_SSH);
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(exe);
     cmd.env("PROMPTO_INVENTORY", dir.join("prompto.toml"))
         .env("PROMPTO_AUTH", "off")
         .env("PROMPTO_SSH_BIN", dir.join("ssh"))
@@ -441,6 +447,141 @@ async fn sigusr2_hands_over_with_no_failed_request() {
     let log = p.stderr();
     assert!(log.contains("stop_vm_step: 77s"), "{log}");
     assert!(log.contains("listening socket inherited"), "{log}");
+}
+
+/// A successor that says it is ready and dies right after (a broken
+/// deploy) never becomes the main process: the old one keeps accepting
+/// through the successor's probation, so a client calling throughout sees
+/// no failure, systemd is never told `MAINPID=`, and the old process
+/// serves on. A good binary then hands over, `MAINPID` only after the
+/// probation. And a stop during a probation abandons the successor
+/// (SIGTERM) and drains here.
+#[tokio::test]
+async fn a_successor_that_dies_after_ready_never_takes_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let exe = d.join("prompto");
+    std::os::unix::fs::symlink(BIN, &exe).unwrap();
+    let notify = std::os::unix::net::UnixDatagram::bind(d.join("notify")).unwrap();
+    notify.set_nonblocking(true).unwrap();
+    let mut p = spawn_exe(
+        d,
+        &exe,
+        &[("NOTIFY_SOCKET", d.join("notify").display().to_string())],
+    );
+    let addr = p.addr();
+    let messages = || {
+        let mut out = String::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = notify.recv(&mut buf) {
+            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+            out.push('\n');
+        }
+        out
+    };
+    assert!(messages().contains("READY=1"));
+    let looping = |addr: SocketAddr, secs: u64| {
+        tokio::spawn(async move {
+            let mut n = 0;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(secs) {
+                match call_at(addr, None, "inventory_list", json!({})).await {
+                    Ok((200, v)) if v["result"].is_object() => n += 1,
+                    other => panic!("request {n} failed: {other:?}"),
+                }
+            }
+            n
+        })
+    };
+
+    // A deploy that says ready, then crashes.
+    std::fs::remove_file(&exe).unwrap();
+    write_exe(&exe, "#!/bin/sh\nprintf R >&4\nsleep 1\nexit 3\n");
+    let calls = looping(addr, 4);
+    p.signal(libc::SIGUSR2);
+    let t = Instant::now();
+    while !p.stderr().contains("handover failed") {
+        assert!(t.elapsed() < Duration::from_secs(15), "{}", p.stderr());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(calls.await.unwrap() > 10);
+    let log = p.stderr();
+    assert!(log.contains("exited during its probation"), "{log}");
+    assert!(!log.contains("handover done"), "{log}");
+    assert!(
+        !messages().contains("MAINPID"),
+        "systemd told to follow a dead successor"
+    );
+    let v = exec(addr, "echo still", 30).await;
+    assert_eq!(stdout(&v).as_deref(), Some("still\n"), "{v}");
+    assert_eq!(p.exited_within(Duration::from_millis(100)), None);
+
+    // A stop during the probation of one that serves: it is told to
+    // stop too, and this process drains and exits.
+    let n = unique_secs();
+    std::fs::remove_file(&exe).unwrap();
+    write_exe(&exe, &format!("#!/bin/sh\nprintf R >&4\nexec sleep {n}\n"));
+    p.signal(libc::SIGUSR2);
+    let t = Instant::now();
+    while !p.stderr().contains("both accept until its probation ends") {
+        assert!(t.elapsed() < Duration::from_secs(15), "{}", p.stderr());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    p.signal(libc::SIGTERM);
+    assert_eq!(
+        p.exited_within(Duration::from_secs(10)),
+        Some(0),
+        "{}",
+        p.stderr()
+    );
+    assert!(
+        p.stderr().contains("abandoning the successor"),
+        "{}",
+        p.stderr()
+    );
+    assert!(!messages().contains("MAINPID"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        pgrep(&format!("^sleep {n}$")).is_empty(),
+        "abandoned successor still runs"
+    );
+
+    // The real binary again: handed over, MAINPID once proven.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let exe = d.join("prompto");
+    std::os::unix::fs::symlink(BIN, &exe).unwrap();
+    let notify = std::os::unix::net::UnixDatagram::bind(d.join("notify")).unwrap();
+    let mut p = spawn_exe(
+        d,
+        &exe,
+        &[("NOTIFY_SOCKET", d.join("notify").display().to_string())],
+    );
+    let mut buf = [0u8; 512];
+    let n = notify.recv(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("READY=1"));
+    let calls = looping(p.addr(), 3);
+    p.signal(libc::SIGUSR2);
+    let t = Instant::now();
+    notify
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let n = notify.recv(&mut buf).unwrap();
+    let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(msg.starts_with("MAINPID="), "{msg}");
+    assert!(
+        t.elapsed() >= prompto::handover::PROBATION,
+        "MAINPID before the probation ended: {:?}",
+        t.elapsed()
+    );
+    assert!(calls.await.unwrap() > 10);
+    assert_eq!(
+        p.exited_within(Duration::from_secs(10)),
+        Some(0),
+        "{}",
+        p.stderr()
+    );
+    assert_eq!(successors(&p.stderr()).len(), 1);
 }
 
 /// A successor that can't start (here: an invalid setting in the env

@@ -11,7 +11,10 @@
 //!    logs why and carries on;
 //! 3. once serving on the inherited socket it writes one byte on the
 //!    pipe ([`signal_ready`]);
-//! 4. the old server tells systemd the successor is the service's main
+//! 4. probation ([`PROBATION`]): both processes accept, and the
+//!    successor must stay up — if it dies, the old server, which never
+//!    stopped accepting, carries on alone ([`Successor::proven`]);
+//! 5. the old server tells systemd the successor is the service's main
 //!    process now (`MAINPID=`, [`notify`]), stops accepting, and drains
 //!    its calls in flight (`crate::drain`) before it exits.
 //!
@@ -53,6 +56,9 @@ pub const PREDECESSOR_ENV: &str = "PROMPTO_PREDECESSOR_PID";
 pub const ENV_FILE_ENV: &str = "PROMPTO_ENV_FILE";
 /// How long a successor may take to start serving.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a successor that serves must stay up, both processes
+/// accepting, before it becomes the main process ([`Successor::proven`]).
+pub const PROBATION: Duration = Duration::from_secs(5);
 
 /// Where the listening socket came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +157,83 @@ fn adopt(fd: RawFd, source: Source) -> Result<(std::net::TcpListener, Source), S
     Ok((l, source))
 }
 
+/// Is `fd` a listening TCP socket? Portable: `fstat` says socket,
+/// `SO_TYPE` stream, `getsockname` an IPv4/IPv6 address, and
+/// `getpeername` finds no peer (a connected socket has one).
+/// `SO_ACCEPTCONN` then confirms it listens where the kernel answers it:
+/// Linux and FreeBSD do, macOS fails it with `ENOPROTOOPT`, so there a
+/// stream socket with no peer is taken as listening.
 fn check_listening_socket(fd: RawFd) -> Result<()> {
+    check_socket(fd, ACCEPTCONN_SUPPORTED)
+}
+
+fn check_socket(fd: RawFd, acceptconn: bool) -> Result<()> {
+    let err = std::io::Error::last_os_error;
+    // SAFETY: a zeroed stat is a valid out-buffer for fstat.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out-pointer.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        bail!("inherited descriptor {fd} is not open: {}", err());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        bail!("inherited descriptor {fd} is not a socket");
+    }
+    if sockopt(fd, libc::SO_TYPE).map_err(|e| anyhow::anyhow!("SO_TYPE on {fd}: {e}"))?
+        != libc::SOCK_STREAM
+    {
+        bail!("inherited descriptor {fd} is not a stream socket");
+    }
+    // SAFETY: a zeroed sockaddr_storage is a valid out-buffer.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: valid out-pointers of the right size.
+    if unsafe {
+        libc::getsockname(
+            fd,
+            (&mut addr as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    } != 0
+    {
+        bail!("getsockname on inherited descriptor {fd}: {}", err());
+    }
+    let family = libc::c_int::from(addr.ss_family);
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        bail!("inherited descriptor {fd} is not a TCP/IP socket (family {family})");
+    }
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: as above.
+    if unsafe {
+        libc::getpeername(
+            fd,
+            (&mut addr as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    } == 0
+    {
+        bail!("inherited descriptor {fd} is a connected socket, not a listening one");
+    }
+    if acceptconn {
+        match sockopt(fd, libc::SO_ACCEPTCONN) {
+            Ok(0) => bail!("inherited descriptor {fd} is a socket that is not listening"),
+            Ok(_) => {}
+            // Not answered here after all: the checks above stand.
+            Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
+            Err(e) => bail!("SO_ACCEPTCONN on inherited descriptor {fd}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the kernel answers `SO_ACCEPTCONN` (see
+/// [`check_listening_socket`]).
+const ACCEPTCONN_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+));
+
+fn sockopt(fd: RawFd, opt: libc::c_int) -> std::io::Result<libc::c_int> {
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: valid out-pointers of the right size.
@@ -159,21 +241,15 @@ fn check_listening_socket(fd: RawFd) -> Result<()> {
         libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
+            opt,
             (&mut v as *mut libc::c_int).cast(),
             &mut len,
         )
     };
     if r != 0 {
-        bail!(
-            "inherited descriptor {fd} is not a socket: {}",
-            std::io::Error::last_os_error()
-        );
+        return Err(std::io::Error::last_os_error());
     }
-    if v == 0 {
-        bail!("inherited descriptor {fd} is a socket that is not listening");
-    }
-    Ok(())
+    Ok(v)
 }
 
 fn set_cloexec(fd: RawFd) -> Result<()> {
@@ -329,10 +405,12 @@ pub fn successor_env(
     Ok((now, removed))
 }
 
-/// A successor started and not yet ready.
+/// A successor started and not yet proven (see [`Successor::proven`]).
 pub struct Successor {
-    pub child: tokio::process::Child,
-    ready: std::fs::File,
+    child: tokio::process::Child,
+    ready: Option<std::io::PipeReader>,
+    /// It said it serves: it accepts on the socket too.
+    serving: bool,
 }
 
 /// Start `exe` with `listener` as fd 3 and a readiness pipe as fd 4.
@@ -343,21 +421,11 @@ pub fn spawn_successor(
     set: &BTreeMap<String, String>,
     remove: &[String],
 ) -> Result<Successor> {
-    let mut fds = [0 as RawFd; 2];
-    // SAFETY: a valid out-array of two descriptors.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        bail!("pipe: {}", std::io::Error::last_os_error());
-    }
-    let (rd, wr) = (fds[0], fds[1]);
-    // SAFETY: both just opened and owned here.
-    let (ready, wr_file) = unsafe {
-        (
-            std::fs::File::from_raw_fd(rd),
-            std::fs::File::from_raw_fd(wr),
-        )
-    };
-    set_cloexec(rd)?;
-    set_cloexec(wr)?;
+    // Both ends close-on-exec from the start (`pipe2(O_CLOEXEC)` where
+    // there is one; macOS has none, std sets the flag right after), so
+    // no other child — an ssh started meanwhile — inherits the write end
+    // and keeps the pipe from reading EOF when the successor dies.
+    let (ready, wr) = std::io::pipe().context("readiness pipe")?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(args);
     for k in remove {
@@ -367,7 +435,7 @@ pub fn spawn_successor(
         .env(LISTEN_FD_ENV, "3")
         .env(READY_FD_ENV, "4")
         .env(PREDECESSOR_ENV, std::process::id().to_string());
-    let wr_fd = wr_file.as_raw_fd();
+    let wr_fd = wr.as_raw_fd();
     // SAFETY: only async-signal-safe calls (fcntl, dup2, close) between
     // fork and exec. Each source is first copied above 10 so neither can
     // be overwritten by the other's dup2, and dup2 clears close-on-exec
@@ -388,29 +456,42 @@ pub fn spawn_successor(
         .spawn()
         .with_context(|| format!("starting {}", exe.display()))?;
     // Ours closed: the pipe reads EOF if the successor exits unready.
-    drop(wr_file);
-    Ok(Successor { child, ready })
+    drop(wr);
+    Ok(Successor {
+        child,
+        ready: Some(ready),
+        serving: false,
+    })
 }
 
 impl Successor {
-    /// Wait until the successor serves; `Err` (and the successor killed)
-    /// if it exits or stays silent past [`READY_TIMEOUT`].
-    pub async fn ready(mut self) -> Result<u32> {
+    /// The two phases of a handover; the caller keeps serving — accepting
+    /// on the socket — throughout, and its PID when the successor is
+    /// proven:
+    ///
+    /// 1. the successor loads its configuration and starts serving, then
+    ///    says so on the pipe — `Err` (and the successor killed) if it
+    ///    exits first or stays silent past [`READY_TIMEOUT`];
+    /// 2. probation: both processes accept for `probation`, and the
+    ///    successor must still be running at its end — `Err` if it exits
+    ///    meanwhile.
+    ///
+    /// Only then may the caller move `MAINPID` and stop accepting. A
+    /// successor that crashes right after "ready" thus never becomes the
+    /// service's main process: the old one, which never stopped
+    /// accepting, carries on alone, instead of systemd restarting the
+    /// service and killing the calls it was draining. (A connection the
+    /// successor accepted before dying is lost with it.)
+    pub async fn proven(&mut self, probation: Duration) -> Result<u32> {
         let pid = self.child.id().context("successor already reaped")?;
-        let mut pipe = self.ready;
+        let mut pipe = self.ready.take().context("successor already waited for")?;
         let read = tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let mut b = [0u8; 1];
             pipe.read(&mut b).map(|n| n == 1 && b[0] == b'R')
         });
         match tokio::time::timeout(READY_TIMEOUT, read).await {
-            Ok(Ok(Ok(true))) => {
-                // Reaped in the background if it exits while we still run.
-                tokio::spawn(async move {
-                    let _ = self.child.wait().await;
-                });
-                Ok(pid)
-            }
+            Ok(Ok(Ok(true))) => {}
             Ok(_) => {
                 let status = self.child.wait().await;
                 bail!("the successor exited before it was ready ({status:?}); see its log above")
@@ -423,6 +504,44 @@ impl Successor {
                 )
             }
         }
+        self.serving = true;
+        tracing::info!(
+            successor = pid,
+            probation_secs = probation.as_secs(),
+            "handover: the successor serves; both accept until its probation ends"
+        );
+        tokio::select! {
+            status = self.child.wait() => bail!(
+                "the successor exited during its probation ({status:?}), after it said it was \
+                 ready; see its log above"
+            ),
+            () = tokio::time::sleep(probation) => Ok(pid),
+        }
+    }
+
+    /// The successor runs on; reaped in the background if it exits while
+    /// this process still runs.
+    pub fn detach(mut self) {
+        tokio::spawn(async move {
+            let _ = self.child.wait().await;
+        });
+    }
+
+    /// This process stops before the successor was proven: one that
+    /// already serves is asked to drain (SIGTERM), one that doesn't yet
+    /// is killed.
+    pub fn abandon(mut self) {
+        match (self.serving, self.child.id()) {
+            (true, Some(pid)) => {
+                // SAFETY: kill has no memory-safety preconditions; the
+                // child is unreaped, so the PID is still its own.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+            _ => {
+                let _ = self.child.start_kill();
+            }
+        }
+        self.detach();
     }
 }
 
@@ -490,5 +609,57 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = rx.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"MAINPID=1\nREADY=1");
+    }
+
+    /// The inherited-socket check, both ways: with `SO_ACCEPTCONN` (Linux,
+    /// FreeBSD) and without (macOS, where the kernel refuses it — a
+    /// check that relied on it failed every handover there).
+    #[test]
+    fn only_a_listening_tcp_socket_is_adopted() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let unix = std::os::unix::net::UnixListener::bind(d.path().join("s")).unwrap();
+        let file = std::fs::File::open(d.path()).unwrap();
+        for acceptconn in [false, true] {
+            check_socket(listener.as_raw_fd(), acceptconn).unwrap();
+            for (fd, what) in [
+                (client.as_raw_fd(), "connected"),
+                (udp.as_raw_fd(), "stream"),
+                (unix.as_raw_fd(), "TCP/IP"),
+                (file.as_raw_fd(), "not a socket"),
+                (-1, "not open"),
+            ] {
+                let e = check_socket(fd, acceptconn).unwrap_err().to_string();
+                assert!(e.contains(what), "{what}: {e}");
+            }
+        }
+        check_listening_socket(listener.as_raw_fd()).unwrap();
+    }
+
+    /// Where the kernel answers it, a bound TCP socket that never called
+    /// `listen` is refused too.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn a_bound_socket_that_does_not_listen_is_refused() {
+        // SAFETY: plain socket calls on a descriptor owned here.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let mut sa: libc::sockaddr_in = std::mem::zeroed();
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let r = libc::bind(
+                fd,
+                (&sa as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            assert_eq!(r, 0);
+            let e = check_listening_socket(fd).unwrap_err().to_string();
+            assert!(e.contains("not listening"), "{e}");
+            libc::close(fd);
+        }
     }
 }

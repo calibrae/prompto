@@ -1656,10 +1656,34 @@ async fn run(inherited: Inherited) -> Result<()> {
                         tracing::error!("SIGUSR2: handover refused: {why}");
                         continue;
                     }
-                    match start_successor(&raw_args, listen_fd, env_file.as_deref(), &env_at_start)
-                        .await
-                    {
+                    let mut successor = match start_successor(
+                        &raw_args,
+                        listen_fd,
+                        env_file.as_deref(),
+                        &env_at_start,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "SIGUSR2: handover failed — still serving here"
+                            );
+                            continue;
+                        }
+                    };
+                    // This process accepts throughout; a stop meanwhile
+                    // abandons the successor and drains here.
+                    let proven = tokio::select! {
+                        r = successor.proven(handover::PROBATION) => r,
+                        () = signals.stop() => {
+                            tracing::warn!("stop signal during a handover: abandoning the successor");
+                            successor.abandon();
+                            break false;
+                        }
+                    };
+                    match proven {
                         Ok(pid) => {
+                            successor.detach();
                             handover::notify(&format!(
                                 "MAINPID={pid}\nSTATUS=serving on {local} (handed over from PID \
                                  {}); SIGUSR2 = binary handover",
@@ -1668,10 +1692,13 @@ async fn run(inherited: Inherited) -> Result<()> {
                             tracing::info!("handover done: successor PID {pid} serves; draining");
                             break true;
                         }
-                        Err(e) => tracing::error!(
-                            error = %format!("{e:#}"),
-                            "SIGUSR2: handover failed — still serving here"
-                        ),
+                        Err(e) => {
+                            successor.detach();
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "SIGUSR2: handover failed — still serving here"
+                            );
+                        }
                     }
                 }
             }
@@ -1708,7 +1735,7 @@ async fn run(inherited: Inherited) -> Result<()> {
         let clean = tokio::select! {
             () = finished => true,
             () = tokio::time::sleep(budget) => false,
-            () = signals.stop_again() => {
+            () = signals.stop() => {
                 tracing::warn!("second stop signal: cutting the drain short");
                 false
             }
@@ -1781,8 +1808,8 @@ impl Signals {
         }
     }
 
-    /// A second SIGTERM or SIGINT while draining.
-    async fn stop_again(&mut self) {
+    /// SIGTERM or SIGINT; a second one while draining.
+    async fn stop(&mut self) {
         tokio::select! {
             _ = self.term.recv() => {}
             _ = self.int.recv() => {}
@@ -1790,13 +1817,14 @@ impl Signals {
     }
 }
 
-/// Start the successor of a handover and wait until it serves. Its PID.
-async fn start_successor(
+/// Start the successor of a handover (`handover::Successor::proven` then
+/// says when it may take over).
+fn start_successor(
     args: &[String],
     listen_fd: std::os::fd::RawFd,
     env_file: Option<&std::path::Path>,
     env_at_start: &std::collections::BTreeMap<String, String>,
-) -> Result<u32> {
+) -> Result<handover::Successor> {
     let exe = handover::successor_exe()?;
     let (set, remove) = match env_file {
         Some(f) => handover::successor_env(f, env_at_start)?,
@@ -1809,6 +1837,5 @@ async fn start_successor(
         env_removed = ?remove,
         "SIGUSR2: starting the successor"
     );
-    let successor = handover::spawn_successor(&exe, &args[1..], listen_fd, &set, &remove)?;
-    successor.ready().await
+    handover::spawn_successor(&exe, &args[1..], listen_fd, &set, &remove)
 }
