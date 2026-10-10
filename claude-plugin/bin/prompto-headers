@@ -2,10 +2,10 @@
 # prompto-headers [token-file]: print prompto's Authorization header as the
 # JSON object a Claude Code headersHelper returns.
 #
-# The token file (default $PROMPTO_TOKEN_FILE, else ~/.config/prompto/token)
-# must be a regular file owned by this user, mode 0600 (or 0400): anything
-# group- or world-readable is refused, so a mistake fails loudly instead of
-# leaking the role token. A mode with an ACL marker (`+`, or macOS's `@`)
+# The token file, ~/.config/prompto/token (an argument names another, for
+# tests; the plugin passes none), must be a regular file owned by this
+# user, mode 0600 (or 0400): anything group- or world-readable is refused,
+# so a mistake fails loudly instead of leaking the role token. A mode with an ACL marker (`+`, or macOS's `@`)
 # passes only when the ACL grants nobody else read; when that can't be
 # told (no getfacl, no `ls -e`), it is refused. Its first line is the token.
 #
@@ -13,7 +13,7 @@
 # fstat): a file swapped in between would be read unchecked. Only someone
 # who can write the token's directory can do that, and they can already
 # replace the token.
-f=${1:-${PROMPTO_TOKEN_FILE:-$HOME/.config/prompto/token}}
+f=${1:-$HOME/.config/prompto/token}
 case $f in "~/"*) f=$HOME/${f#"~/"} ;; esac
 die() { echo "prompto-headers: $*" >&2; exit 1; }
 

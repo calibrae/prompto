@@ -20,9 +20,9 @@ Use a typed tool where one exists. Its arguments are checked, its result is stru
 | copy a tree between hosts | `rsync_sync` | scp through a shell |
 | VMs | `vm_list`, `vm_state`, `vm_start`, `vm_stop`, `vm_ensure_up` | `virsh` in a shell |
 | several commands in one go | `ssh_batch` | `a && b && c` in one `ssh_exec` |
-| a script | `bash_exec` / `python_exec` … (the body goes over stdin, no quoting) | long `ssh_exec` one-liners |
+| a script | `bash_exec` (the body goes over stdin, no quoting); another language: `ssh_exec` with a heredoc, `python3 - <<'EOF'` | long `ssh_exec` one-liners |
 
-Use `ssh_exec` only for what no typed tool does. Use `ssh_sudo_exec` only when root is really needed. It is a separate grant, and it is the one most likely to need a human approval.
+Use `ssh_exec` only for what no typed tool does. A result that ends with an `[advisor]` line names the typed tool for what you just did: use it next time. Use `ssh_sudo_exec` only when root is really needed. It is a separate grant, and it is the one most likely to need a human approval.
 
 `inventory_list` shows the hosts you have some grant on. Check it before guessing host names.
 
@@ -63,10 +63,9 @@ Errors read `[request_id=… error_class=<class>] …`. Mention the `request_id`
 | `ssh_auth` | SSH reached the host, but the key was refused. | Tell the user; it is an operator fix. |
 | `timeout` | The command ran past its timeout. | Use a longer `timeout_secs` if it should take long; otherwise look at why it hangs. |
 | `remote_nonzero` | The command ran and exited non-zero (a result, not an error: read `stdout`, `stderr` and `exit_code`). | Treat it like any failing command. |
-| `interpreter_missing` | The `*_exec` tool's interpreter isn't installed there. | Use `bash_exec` or another tool. |
+| `interpreter_missing` | `bash_exec`: bash isn't installed there (FreeBSD, OPNsense). | Use `ssh_exec`, which runs the host's own shell. |
 | `sudo_guard` | The vault sudo path refused a host that has a passwordless sudo rule (exit 97). | Tell the user; it is an inventory mismatch. |
 | `vault` | prompto couldn't get the host's sudo password from vault. | Tell the user. Don't retry in a loop. |
-| `upstream` | `claude_exec`'s gateway on the host failed. | Retry once at most, then report it. |
 | `rsync_*`, `dest_ssh_*` | `rsync_sync` failed in rsync, or on the destination's SSH. | Read the message: it says which end and why. |
 | `internal` | prompto itself failed, for example its audit log can't be written. Calls are refused until it is fixed. | Stop and tell the user. |
 
