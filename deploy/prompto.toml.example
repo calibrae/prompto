@@ -38,6 +38,11 @@ capabilities = ["exec", "virt"]
 #                                 # non-sudo rule grants exec tools where this is
 #                                 # true/unset (or ssh_user is root): that shell
 #                                 # is root anyway.
+#   prompto_host = true           # this machine runs prompto: root here reads
+#                                 # its vault token and approval secrets, so
+#                                 # `prompto policy lint` makes any rule granting
+#                                 # root here an ERROR (crown_jewel_ack = true on
+#                                 # the rule if you really mean it).
 #   request_id_env = "off"        # export | setenv | off — how PROMPTO_REQUEST_ID
 #                                 # reaches remote commands. Default: export on
 #                                 # linux/macos, setenv on freebsd/windows. Use
