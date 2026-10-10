@@ -513,6 +513,10 @@ pub struct Record {
     /// `since` and `reason` (see `crate::kill`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill: Option<crate::kill::Kill>,
+    /// The advisor's hint appended to the result, by pattern (`cat`,
+    /// `repeated_ssh_exec`, … — `crate::advisor::HINTS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<&'static str>,
 }
 
 /// Caps, in chars, on the caller-controlled strings of a record (see
@@ -706,6 +710,7 @@ pub fn tool_record(ctx: &CallCtx, tool: &str, args: Value) -> Record {
         auth_note: ctx.auth_note.clone(),
         mcp_session: None,
         kill: ctx.notes().kill,
+        advisor: None,
     }
 }
 
@@ -1324,6 +1329,7 @@ impl Audit {
             auth_note: None,
             mcp_session,
             kill: None,
+            advisor: None,
         };
         self.write(rec);
     }

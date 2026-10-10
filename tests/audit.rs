@@ -1252,3 +1252,43 @@ fn cli_filters_records() {
     let (ok, _, err) = audit_cli(&path, &["--since", "yesterday"]);
     assert!(!ok && err.contains("--since"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// The advisor (task 020)
+// ---------------------------------------------------------------------------
+
+/// A simple `cat` through `ssh_exec` gets one short `file_read` hint, once
+/// per session per hour. The call's audit record names the pattern, and
+/// `prompto_gain` counts the hint and its bytes.
+#[tokio::test]
+async fn advisor_hints_once_and_is_recorded_and_counted() {
+    let s = spawn(AuthMode::Required).await;
+    let args = json!({ "host": "run", "cmd": "cat /etc/hostname" });
+    let first = call(&s, "ssh_exec", args.clone()).await;
+    assert_ok(&first);
+    let blocks = first["result"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{first}");
+    let hint = blocks[1]["text"].as_str().unwrap();
+    assert!(hint.starts_with("[advisor] file_read "), "{hint}");
+    assert!(hint.len() <= 120 && !hint.contains('\n'), "{hint}");
+    assert_eq!(s.record(&rid(&first))["advisor"], "cat");
+
+    let second = call(&s, "ssh_exec", args).await;
+    assert_eq!(second["result"]["content"].as_array().unwrap().len(), 1);
+    assert!(s.record(&rid(&second)).get("advisor").is_none());
+
+    // Compound shell: never a hint.
+    let piped = call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "run", "cmd": "ls -la /etc | head -3" }),
+    )
+    .await;
+    assert_eq!(piped["result"]["content"].as_array().unwrap().len(), 1);
+
+    let gain = result(&call(&s, "prompto_gain", json!({})).await);
+    let adv = &gain["advisor"];
+    assert_eq!(adv["hints"], 1, "{gain}");
+    assert_eq!(adv["bytes"], hint.len(), "{gain}");
+    assert_eq!(adv["by_pattern"]["cat"]["hints"], 1, "{gain}");
+}

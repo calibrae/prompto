@@ -527,7 +527,14 @@ impl Prompto {
         res: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
         let exec_ms = ctx.started.elapsed().as_millis() as u64;
-        let hint = self.advisor.record(tool, host);
+        let cmd = ctx.call.as_ref().and_then(|c| c.args.get("cmd")?.as_str());
+        let hint = self.advisor.record(&crate::advisor::Call {
+            tool,
+            host,
+            cmd,
+            who: Advisor::who(ctx.session_id.as_deref(), ctx.agent_name(), ctx.caller_ip),
+            ok: res.is_ok(),
+        });
         let request_id = ctx.request_id();
         match res {
             Ok(v) => {
@@ -537,9 +544,10 @@ impl Prompto {
                 let mut blocks = success_blocks(payload, &request_id);
                 let bytes = blocks.iter().map(|b| b.len()).sum::<usize>();
                 self.tracker.record(tool, host, true, exec_ms, bytes as u64);
-                self.audit_record(ctx, tool, host, verdict, bytes as u64);
+                let advisor = hint.map(|h| h.pattern);
+                self.audit_record(ctx, tool, host, verdict, bytes as u64, advisor);
                 if let Some(h) = hint {
-                    blocks.push(format!("[advisor] {h}"));
+                    blocks.push(h.text.to_string());
                 }
                 Ok(CallToolResult::success(
                     blocks.into_iter().map(ContentBlock::text).collect(),
@@ -551,7 +559,7 @@ impl Prompto {
                 self.tracker
                     .record(tool, host, false, exec_ms, msg.len() as u64);
                 let verdict = self.judge(ctx, tool, &audit::Outcome::Failure(&e));
-                self.audit_record(ctx, tool, host, verdict, msg.len() as u64);
+                self.audit_record(ctx, tool, host, verdict, msg.len() as u64, None);
                 // mcp-gain's Event has no room for a class, so a
                 // classified failure is also logged here, for journald.
                 if let Some(c) = classified {
@@ -582,7 +590,8 @@ impl Prompto {
     }
 
     /// Write the call's audit record. `host` is what the caller typed;
-    /// the record resolves it against the live inventory.
+    /// the record resolves it against the live inventory. `advisor`: the
+    /// pattern of the hint appended to the result, if any.
     fn audit_record(
         &self,
         ctx: &CallCtx,
@@ -590,6 +599,7 @@ impl Prompto {
         host: Option<&str>,
         verdict: audit::Verdict,
         bytes: u64,
+        advisor: Option<&'static str>,
     ) {
         let args = ctx
             .call
@@ -604,6 +614,7 @@ impl Prompto {
             (rec.dest_host, rec.dest_queried_as) = audit::resolve_host(&inv, dest);
         }
         rec.bytes = bytes;
+        rec.advisor = advisor;
         self.audit.write(rec);
         if let Some(c) = &ctx.call {
             c.mark_recorded();
@@ -659,7 +670,14 @@ impl Prompto {
             &ctx.notes(),
             false,
         );
-        self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, msg.len() as u64);
+        self.audit_record(
+            &ctx,
+            &call.tool,
+            host.as_deref(),
+            verdict,
+            msg.len() as u64,
+            None,
+        );
         Err(McpError::internal_error(msg, Some(data)))
     }
 
@@ -723,7 +741,7 @@ impl Prompto {
         let host = record_host(&call.args);
         let bytes = if res.is_some() { msg.len() as u64 } else { 0 };
         // The record clamps the name (`Record::clamp_strings`).
-        self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, bytes);
+        self.audit_record(&ctx, &call.tool, host.as_deref(), verdict, bytes, None);
     }
 
     #[tool(description = "Wake a host via WOL magic packet.")]
@@ -1547,7 +1565,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Token-savings analytics vs an SSH+bash baseline. Optional since_secs lookback. Returns total + per-tool breakdown."
+        description = "Token-savings analytics vs an SSH+bash baseline. Optional since_secs lookback. Returns total + per-tool breakdown, and the advisor's hints and bytes since start."
     )]
     async fn prompto_gain(
         &self,
@@ -1560,7 +1578,16 @@ impl Prompto {
         let res = self
             .authorize_tool(&ctx, "prompto_gain")
             .map_err(anyhow::Error::from)
-            .and_then(|()| self.tracker.summary(cutoff).class(ErrorClass::Internal));
+            .and_then(|()| self.tracker.summary(cutoff).class(ErrorClass::Internal))
+            .map(|summary| {
+                let mut v = serde_json::to_value(summary).unwrap_or_default();
+                // In-memory, since this process started; `since_secs`
+                // doesn't apply.
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("advisor".into(), serde_json::json!(self.advisor.stats()));
+                }
+                v
+            });
         self.finish_tool(&ctx, "prompto_gain", None, res)
     }
 }
