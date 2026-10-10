@@ -130,10 +130,23 @@ export function auditLine(r: Record<string, unknown>): string {
   const args = (r.args ?? {}) as Record<string, unknown>
   const what = ['cmd', 'script', 'task'].map(k => args[k]).find(v => typeof v === 'string') as string | undefined
   const kind = s('type') === 'tool' ? '' : `${s('type')}:`
-  const outcome = r.ok === true ? 'ok' : s('error_class') || (s('decision') === 'allow' ? 'allowed' : s('decision') || 'failed')
+  // A precheck or an approval is a decision, not a run.
+  const decided = s('type') === 'tool' ? '' : s('decision')
+  const outcome = decided || (r.ok === true ? 'ok' : s('error_class') || 'failed')
   const by = s('approved_by') ? ` by=${s('approved_by')}` : ''
   return `${time} ${kind}${s('tool')} ${s('host')} ${outcome}${by} ${(what ?? '').replace(/\s+/g, ' ').slice(0, 60)}`.trim()
 }
+
+/**
+ * Text holding a run of exactly 6 digits: likely a TOTP code typed into
+ * the wrong field. The name and the reason fields refuse it.
+ */
+export function looksLikeCode(text: string): boolean {
+  return /(^|[^0-9])[0-9]{6}([^0-9]|$)/.test(text)
+}
+
+export const CODE_IN_FIELD =
+  'That looks like a TOTP code in the wrong field: it was cleared and not sent. The code goes in the TOTP field only.'
 
 export const HELP = [
   '/prompto whoami          the agent, its groups and this session as prompto sees them',

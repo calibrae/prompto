@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import { unifiedDiff } from '../hooks/diff'
-import { argsOf, commandOf, rpcMessage, scopeKey, toolPattern } from '../hooks/util'
+import { argsOf, auditLine, commandOf, looksLikeCode, rpcMessage, scopeKey, toolPattern } from '../hooks/util'
 
 test('diff: one changed line, with context and line numbers', () => {
   const d = unifiedDiff('a\nb\nc\nd\ne\nf\ng\nh\n', 'a\nb\nc\nd\nE\nf\ng\nh\n', 'x')
@@ -62,4 +62,17 @@ test('rpcMessage: plain JSON or an SSE data line', () => {
   expect(rpcMessage('{"jsonrpc":"2.0","id":1,"result":{"a":1}}')?.result).toEqual({ a: 1 })
   expect(rpcMessage('event: message\ndata: {"jsonrpc":"2.0","id":1,"error":{"message":"x"}}\n\n')?.error).toEqual({ message: 'x' })
   expect(rpcMessage('not json')).toBeUndefined()
+})
+
+test('looksLikeCode: a run of exactly six digits', () => {
+  for (const t of ['123456', 'alice123456', 'code: 123456.', '123456 is it']) expect(looksLikeCode(t)).toBe(true)
+  for (const t of ['alice', 'sbx-approver', '12345', '1234567', 'policy.toml:36', 'ticket 2026-10-10']) expect(looksLikeCode(t)).toBe(false)
+})
+
+test('auditLine: a call shows its outcome, a precheck its decision', () => {
+  const base = { ts: '2026-10-10T13:30:54.000Z', tool: 'ssh_sudo_exec', host: 'h2', args: { cmd: 'id -u' } }
+  expect(auditLine({ ...base, type: 'tool', ok: true })).toBe('13:30:54 ssh_sudo_exec h2 ok id -u')
+  expect(auditLine({ ...base, type: 'tool', ok: false, error_class: 'remote_nonzero' })).toBe('13:30:54 ssh_sudo_exec h2 remote_nonzero id -u')
+  expect(auditLine({ ...base, type: 'precheck', ok: true, decision: 'ask' })).toBe('13:30:54 precheck:ssh_sudo_exec h2 ask id -u')
+  expect(auditLine({ ...base, type: 'approve', ok: true, decision: 'allow', approved_by: 'alice' })).toBe('13:30:54 approve:ssh_sudo_exec h2 allow by=alice id -u')
 })

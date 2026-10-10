@@ -771,6 +771,7 @@ fn check_kill_switches(kill: &KillSwitch) -> Result<()> {
     tracing::info!(
         file = %kill.file().display(),
         dir = %kill.dir().display(),
+        api_dir = %kill.api_dir().map(|d| d.display().to_string()).unwrap_or_default(),
         "kill switches checked on every call (prompto kill …)"
     );
     match kill.list() {

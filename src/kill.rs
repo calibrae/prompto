@@ -214,10 +214,14 @@ impl Kill {
         if let Some(r) = &self.reason {
             detail.push_str(&format!(", reason: {r}"));
         }
+        let who = match self.scope {
+            Scope::AgentSession => "this session was stopped on request, so prompto refuses",
+            _ => "the operator has stopped",
+        };
         format!(
-            "refused: the operator has stopped {what} ({detail}). Nothing was run. This is \
-             deliberate, not a fault: do not retry or work around it; stop and tell the user. \
-             An operator lifts it with `{lift}`."
+            "refused: {who} {what} ({detail}). Nothing was run. This is deliberate, not a \
+             fault: do not retry or work around it; stop and tell the user. An operator lifts \
+             it with `{lift}`."
         )
     }
 

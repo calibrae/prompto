@@ -174,7 +174,7 @@ test('ask: deny with a reason refuses the call and sends nothing', async ($, on)
   await start($)
   const call = $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'tu6', host: 'h2', cmd: 'rm -rf /srv' })
   const ui = await paneReady($, clock)
-  await ui.input({ key: 'reason', text: 'not on a Friday', kind: 'change' })
+  await ui.input({ key: 'reason-0', text: 'not on a Friday', kind: 'change' })
   await ui.press({ key: 'deny' })
   const out = await done(clock, call)
   expect(out.deny).toContain('the human approver refused this call: not on a Friday')
@@ -292,6 +292,51 @@ test('the TOTP code is never kept: not in state, store, logs, results or other r
   expect(fake.approvals().map(a => a.body.totp_code)).toEqual(['314159', secret])
   // The store keeps the approver's name, nothing else.
   expect([...fake.store.keys()]).toEqual(['approver'])
+})
+
+test('a code typed into the approver name or the deny reason is refused, cleared and never sent', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock })
+  fake.precheck.ssh_sudo_exec = ASK
+  await start($)
+  const call = $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'tu30', host: 'h2', cmd: 'id' })
+  const ui = await paneReady($, clock)
+  // The code lands in the name field (a Tab too many), then Approve.
+  await ui.input({ key: 'approver-0', text: 'alice271828', kind: 'change' })
+  await ui.input({ key: 'totp-0', text: CODE, kind: 'change' })
+  await ui.press({ key: 'approve' })
+  expect(await shows(ui, /looks like a TOTP code in the wrong field/)).toBe(true)
+  expect(fake.approvals()).toHaveLength(0)
+  expect(fake.store.has('approver')).toBe(false)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('271828')
+  // The same in the deny reason, which the model would read.
+  await ui.input({ key: 'reason-1', text: 'code 271828', kind: 'change' })
+  await ui.press({ key: 'deny' })
+  expect(await shows(ui, /looks like a TOTP code in the wrong field/)).toBe(true)
+  // Still waiting: nothing was decided, nothing sent.
+  expect(fake.calls()).toHaveLength(0)
+  await ui.input({ key: 'reason-2', text: 'not today', kind: 'change' })
+  await ui.press({ key: 'deny' })
+  const out = await done(clock, call)
+  expect(out.deny).toContain('not today')
+  expect(out.deny).not.toContain('271828')
+})
+
+test('the approver name is remembered only after an approval worked', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock })
+  fake.precheck.ssh_sudo_exec = ASK
+  await start($)
+  const call = $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'tu31', host: 'h2', cmd: 'id' })
+  const ui = await paneReady($, clock)
+  await ui.input({ key: 'approver-0', text: 'alcie', kind: 'change' })
+  await ui.input({ key: 'totp-0', text: '000000', kind: 'change' })
+  await ui.press({ key: 'approve' })
+  expect(fake.store.has('approver')).toBe(false)
+  await ui.input({ key: 'approver-1', text: 'alice', kind: 'change' })
+  await ui.input({ key: 'totp-1', text: CODE })
+  expect((await done(clock, call)).deny).toBeUndefined()
+  expect(fake.store.get('approver')).toBe('alice')
 })
 
 test('precheck unreachable: fail open, prompto decides, the model is told why no ticket came', async ($, on) => {

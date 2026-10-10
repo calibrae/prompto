@@ -19,6 +19,7 @@ import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 import type { PromptoPending } from '../types'
 import { unifiedDiff } from './diff'
 import {
+  CODE_IN_FIELD,
   HELP,
   argsOf,
   auditLine,
@@ -26,6 +27,7 @@ import {
   configFrom,
   errorText,
   hostOf,
+  looksLikeCode,
   refusal,
   rpcMessage,
   scopeKey,
@@ -400,7 +402,11 @@ async function approvePressed($: $, id: string, minutes: number | undefined): Pr
   const approver = (approverDrafts.get(id) ?? p.approver).trim()
   if (!/^[0-9]{6}$/.test(code)) return patch($, id, q => ({ message: 'Type the 6-digit TOTP code first.', generation: q.generation + 1 }))
   if (!approver) return patch($, id, q => ({ message: 'Type the approver name.', generation: q.generation + 1 }))
-  await $.store.set('approver', approver)
+  if (looksLikeCode(approver)) {
+    // A code typed into the name field: never send it, store it or draw it.
+    approverDrafts.delete(id)
+    return patch($, id, q => ({ approver: '', message: CODE_IN_FIELD, generation: q.generation + 1 }))
+  }
   await patch($, id, () => ({ isBusy: true, message: null, approver }))
   if (p.kind === 'kill-global') return killGlobal($, id, approver, code)
   const w = waiters.get(id)
@@ -419,6 +425,8 @@ async function approvePressed($: $, id: string, minutes: number | undefined): Pr
   }
   const j = (r.json ?? {}) as { ticket?: unknown; expires_at?: unknown; reason?: unknown; error?: unknown }
   if (r.status === 200 && typeof j.ticket === 'string') {
+    // Remembered once it proved right, so a typo never becomes the default.
+    await $.store.set('approver', approver)
     if (minutes) {
       const expiresAt = typeof j.expires_at === 'number' ? j.expires_at : (await $.clock.now()) / 1000 + minutes * 60
       scopes.set(scopeKey(w.session, w.tool, w.args), { ticket: j.ticket, expiresAt })
@@ -439,6 +447,11 @@ async function approvePressed($: $, id: string, minutes: number | undefined): Pr
 async function denyPressed($: $, id: string): Promise<void> {
   codes.delete(id)
   const reason = (reasons.get(id) ?? '').trim() || 'no reason given'
+  if (looksLikeCode(reason)) {
+    // The reason goes to the model: a code typed there must not.
+    reasons.delete(id)
+    return patch($, id, q => ({ message: CODE_IN_FIELD, generation: q.generation + 1 }))
+  }
   const w = waiters.get(id)
   if (w) w.decision = { kind: 'denied', reason }
   else await dropPending($, id)
@@ -454,6 +467,10 @@ async function dropPending($: $, id: string): Promise<void> {
 
 async function killGlobal($: $, id: string, approver: string, code: string): Promise<void> {
   const reason = (reasons.get(id) ?? '').trim() || 'from the prompto plugin'
+  if (looksLikeCode(reason)) {
+    reasons.delete(id)
+    return patch($, id, q => ({ isBusy: false, message: CODE_IN_FIELD, generation: q.generation + 1 }))
+  }
   let r: Reply
   try {
     r = await request($, cfgOf($), await sessionOf($), 'POST', `${cfgOf($).base}/v1/kill`, {
@@ -468,6 +485,7 @@ async function killGlobal($: $, id: string, approver: string, code: string): Pro
   if (r.status !== 200) {
     return patch($, id, q => ({ isBusy: false, message: `HTTP ${r.status}${errorText(r.json)}`, generation: q.generation + 1 }))
   }
+  await $.store.set('approver', approver)
   await dropPending($, id)
   $.ui.toast('prompto: GLOBAL KILL ON. Every call is refused until an operator runs `prompto kill off`.', { timeoutMs: 10_000 })
 }
@@ -674,8 +692,8 @@ export const register: Register = (on, options) => {
         )}
         <Box flexDirection="column">
           <Input
-            key="approver"
-            label="Approver: "
+            key={`approver-${p.generation}`}
+            label="Approver"
             value={p.approver}
             placeholder="your approver name"
             onInput={v => void approverDrafts.set(p.id, v)}
@@ -683,7 +701,7 @@ export const register: Register = (on, options) => {
           />
           <Input
             key={`totp-${p.generation}`}
-            label="TOTP code: "
+            label="TOTP code"
             placeholder={isKill ? '6 digits, Enter kills' : '6 digits from your authenticator, Enter approves once'}
             autoFocus
             submitLabel={isKill ? 'kill' : 'approve once'}
@@ -694,11 +712,15 @@ export const register: Register = (on, options) => {
             }}
           />
           <Input
-            key="reason"
-            label={isKill ? 'Reason: ' : 'Deny reason: '}
+            key={`reason-${p.generation}`}
+            label={isKill ? 'Reason' : 'Deny reason'}
             placeholder={isKill ? 'why (recorded)' : 'optional; the model reads it'}
+            submitLabel={isKill ? 'keep' : 'deny'}
             onInput={v => void reasons.set(p.id, v)}
-            onSubmit={v => void reasons.set(p.id, v)}
+            onSubmit={v => {
+              reasons.set(p.id, v)
+              if (!isKill) void denyPressed($, p.id)
+            }}
           />
         </Box>
         <Box flexDirection="row" gap={2}>
@@ -723,6 +745,7 @@ export const register: Register = (on, options) => {
             {isKill ? 'Cancel' : 'Deny'}
           </Button>
         </Box>
+        <Text dimColor>Tab moves between fields and buttons · Esc closes the pane{isKill ? '' : ' (and refuses the call)'}</Text>
         {p.isBusy ? <Text dimColor>asking prompto…</Text> : ''}
         {p.message ? <Text color="yellow">{p.message}</Text> : ''}
         {list.length > 1 ? <Text dimColor>{list.length - 1} more waiting</Text> : ''}
