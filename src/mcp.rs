@@ -1295,7 +1295,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List a directory on a remote host. Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link }."
+        description = "List a directory on a remote host (a symlink to a directory lists the directory). Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link } plus, when set, link_target, device, xattrs, acl, security_context; lines that could not be parsed come back in `unparsed`."
     )]
     async fn file_list(
         &self,
@@ -1325,13 +1325,19 @@ impl Prompto {
                 )
                 .into());
             }
-            let entries = files::parse_ls(host.platform, &raw.stdout);
-            Ok(serde_json::json!({
+            let listing = files::parse_ls(host.platform, &raw.stdout);
+            let mut out = serde_json::json!({
                 "host": args.host,
                 "path": args.path,
-                "entries": entries,
-                "count": entries.len(),
-            }))
+                "count": listing.entries.len(),
+                "entries": listing.entries,
+            });
+            // Lines that weren't entries are returned, never dropped.
+            if listing.unparsed_count > 0 {
+                out["unparsed"] = serde_json::json!(listing.unparsed);
+                out["unparsed_count"] = serde_json::json!(listing.unparsed_count);
+            }
+            Ok(out)
         }
         .await;
         self.finish_tool(&ctx, "file_list", Some(&host_name), res)
