@@ -38,6 +38,9 @@ fn main() {
                     groups
                 );
             }
+            for w in inv.warnings() {
+                println!("  warning: {w}");
+            }
             if let (Some(policy), Some(agents)) = (args.get(2), args.get(3)) {
                 lint_policy(&inv, policy.as_ref(), agents.as_ref());
             }

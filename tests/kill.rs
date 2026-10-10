@@ -288,15 +288,10 @@ fn args_for(tool: &str) -> Value {
             "dest_host": "t2", "dest_path": "/tmp/b/"
         }),
         "inventory_get_host" => json!({ "name": "t1" }),
-        "mcp_list" | "mcp_status" | "mcp_restart_claudecli" => json!({ "client": "t1" }),
-        "mcp_get" | "mcp_remove" => json!({ "client": "t1", "name": "x" }),
-        "mcp_add" => json!({
-            "client": "t1", "name": "x", "transport": "http", "url_or_cmd": "http://x"
-        }),
         _ => json!({
             "host": "t1", "cmd": "true", "commands": ["true"], "script": "true",
             "path": "/tmp/x", "content": "x", "vm": "v", "unit": "u", "action": "status",
-            "ports": [9], "task": "t", "probe_ms": 50, "step_timeout_secs": 1,
+            "ports": [9], "probe_ms": 50, "step_timeout_secs": 1,
             "total_timeout_secs": 1
         }),
     }
@@ -310,7 +305,7 @@ async fn tool_names(s: &Server, token: Option<&str>) -> Vec<String> {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 38, "tools/list looks short: {tools:?}");
+    assert!(tools.len() >= 24, "tools/list looks short: {tools:?}");
     tools
 }
 

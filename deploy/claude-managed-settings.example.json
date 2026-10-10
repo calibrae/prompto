@@ -14,7 +14,6 @@
     "prompto@prompto": {
       "options": {
         "url": "https://prompto.example.com/mcp",
-        "token_file": "~/.config/prompto/token",
         "servers": "prompto"
       }
     }

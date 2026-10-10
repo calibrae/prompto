@@ -1,14 +1,13 @@
-//! Generic interpreter execution — feeds the script body via SSH stdin
-//! so the source never gets re-parsed by an intermediate shell. Removes
-//! the quoting-hell that plagues `ssh_exec "python3 -c '...'"`.
+//! Script execution — feeds the script body via SSH stdin so the source
+//! never gets re-parsed by an intermediate shell. Removes the quoting
+//! hell of `ssh_exec "bash -c '...'"`.
 //!
-//! Per-language wrapper tools (`python_exec`, `node_exec`, `bash_exec`)
-//! call [`run`] with their interpreter and an optional argv. Each tool
-//! gets its own MCP surface, baseline tokens, and filter integration —
-//! this module is plumbing only.
+//! `bash_exec` and `host_diagnose` call [`run`] with `bash` and an
+//! optional argv. This module is plumbing only. (The other interpreter
+//! tools were removed in v0.12.2; `ssh_exec` with a heredoc replaces
+//! them.)
 
 use anyhow::Result;
-use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::ctx::CallCtx;
@@ -18,9 +17,7 @@ use crate::ssh::{ExecOutput, SshClient};
 /// Allow-list of interpreter names. Restrictive by design — the value
 /// flows into the remote shell command, and the goal is to fail closed
 /// on typos rather than open a shell-injection vector.
-pub const ALLOWED_INTERPRETERS: &[&str] = &[
-    "python", "python3", "node", "deno", "bun", "ruby", "perl", "bash", "sh", "zsh",
-];
+pub const ALLOWED_INTERPRETERS: &[&str] = &["bash"];
 
 pub fn validate_interpreter(name: &str) -> Result<()> {
     if !ALLOWED_INTERPRETERS.contains(&name) {
@@ -34,14 +31,7 @@ pub fn validate_interpreter(name: &str) -> Result<()> {
 }
 
 /// The interpreter each interpreter tool runs.
-pub const INTERPRETER_TOOLS: &[(&str, &str)] = &[
-    ("python_exec", "python3"),
-    ("node_exec", "node"),
-    ("ruby_exec", "ruby"),
-    ("perl_exec", "perl"),
-    ("deno_exec", "deno"),
-    ("bash_exec", "bash"),
-];
+pub const INTERPRETER_TOOLS: &[(&str, &str)] = &[("bash_exec", "bash")];
 
 /// The interpreter `tool` runs, if it is an interpreter tool.
 pub fn interpreter_for_tool(tool: &str) -> Option<&'static str> {
@@ -52,14 +42,15 @@ pub fn interpreter_for_tool(tool: &str) -> Option<&'static str> {
 }
 
 /// The remote shell could not find `interpreter`, so nothing of the
-/// script ran. Each shell words it its own way:
+/// script ran — `bash_exec` on a host without bash (FreeBSD, OPNsense).
+/// Each shell words it its own way:
 ///
-/// - bash: `bash: line 1: python3: command not found`, exit 127
-/// - dash, FreeBSD sh: `sh: 1: python3: not found`, exit 127
-/// - zsh: `zsh:1: command not found: python3`, exit 127
-/// - csh/tcsh (FreeBSD, OPNsense): `python3: Command not found.`, exit 1
+/// - dash, FreeBSD sh: `sh: 1: bash: not found`, exit 127
+/// - zsh: `zsh:1: command not found: bash`, exit 127
+/// - csh/tcsh (FreeBSD, OPNsense): `bash: Command not found.`, exit 1
 /// - `env` (the root side of the vault sudo path):
-///   `env: 'python3': No such file or directory`, exit 127
+///   `env: 'bash': No such file or directory`, exit 127
+/// - another shell in the bash family: `ksh: bash: command not found`
 ///
 /// A script that fails on its own with one of these lines still needs
 /// the matching exit status, and the name must be the interpreter's.
@@ -115,18 +106,6 @@ pub fn validate_arg(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pick the right "read script from stdin" flag for a given interpreter.
-/// `python -`, `node -`, `ruby -`, `perl -`, `deno run -`, `bun run -` —
-/// most read stdin when the script-path is `-`. Bash family uses `-s`.
-fn stdin_marker(interpreter: &str) -> &'static str {
-    match interpreter {
-        "bash" | "sh" | "zsh" => "-s",
-        "deno" => "run -",
-        "bun" => "run -",
-        _ => "-", // python, python3, node, ruby, perl
-    }
-}
-
 /// Run a script through an interpreter on a remote host. Script body is
 /// piped via SSH stdin so embedded quotes/heredocs/etc. survive
 /// untouched. Args (if any) become positional argv after the script.
@@ -146,7 +125,7 @@ pub async fn run(
         validate_arg(a)?;
     }
 
-    let mut cmd = format!("{interpreter} {}", stdin_marker(interpreter));
+    let mut cmd = format!("{interpreter} -s");
     for a in args {
         cmd.push(' ');
         cmd.push_str(a);
@@ -156,114 +135,6 @@ pub async fn run(
         .await
 }
 
-/// Compact a Node.js / V8 stack trace to "ExceptionType: message
-/// (N frames; last: file:line)". Conservative: returns verbatim stderr
-/// when no stack-frame lines (`    at func (file:line:col)`) are found.
-pub fn compact_node_stack(stderr: &str) -> Cow<'_, str> {
-    let lines: Vec<&str> = stderr.lines().collect();
-    if lines.is_empty() {
-        return Cow::Borrowed(stderr);
-    }
-    let mut frames: Vec<&str> = Vec::new();
-    for line in &lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("at ") {
-            frames.push(trimmed);
-        }
-    }
-    if frames.is_empty() {
-        return Cow::Borrowed(stderr);
-    }
-
-    // Find the exception line: typically the first non-empty,
-    // non-frame, non-source-context line that contains "Error:" or
-    // "Exception:" or similar.
-    let mut exc: Option<&str> = None;
-    for line in &lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if line.trim_start().starts_with("at ") {
-            continue;
-        }
-        if trimmed.contains("Error:")
-            || trimmed.contains("Error ")
-            || trimmed.ends_with("Error")
-            || trimmed.contains("Exception:")
-        {
-            exc = Some(trimmed);
-            break;
-        }
-    }
-
-    let last_frame = frames.last().copied().unwrap_or("");
-    let frame_count = frames.len();
-
-    match exc {
-        Some(e) => Cow::Owned(format!(
-            "{} ({} frames; last: {})\n",
-            e, frame_count, last_frame,
-        )),
-        None => Cow::Borrowed(stderr),
-    }
-}
-
-/// Compact a Python traceback to "ExceptionType: message (at file:line in
-/// func, N frames)". Conservative: if stderr doesn't contain a
-/// recognisable traceback header, returns the original verbatim.
-///
-/// This is wired through `python_exec` directly (not the FilterChain),
-/// because the chain keys on the user's command and `python_exec`'s
-/// internal cmd is `python3 -` regardless of what script ran.
-pub fn compact_python_traceback(stderr: &str) -> Cow<'_, str> {
-    let Some(start) = stderr.find("Traceback (most recent call last):") else {
-        return Cow::Borrowed(stderr);
-    };
-    let preamble = &stderr[..start];
-    let traceback = &stderr[start..];
-
-    let lines: Vec<&str> = traceback.lines().collect();
-    if lines.len() < 3 {
-        return Cow::Borrowed(stderr);
-    }
-
-    // Frames look like:  '  File "<stdin>", line 5, in <module>'
-    let mut last_frame: Option<&str> = None;
-    let mut frame_count = 0u32;
-    for line in &lines {
-        if line.trim_start().starts_with("File ") {
-            frame_count += 1;
-            last_frame = Some(line.trim());
-        }
-    }
-
-    // The exception line is the last non-empty line that doesn't start
-    // with whitespace (frame headers / source lines are indented).
-    let mut exc: Option<&str> = None;
-    for line in lines.iter().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Frame headers and source-context lines are indented; the
-        // exception summary is at column 0.
-        if !line.starts_with(' ') && !line.starts_with('\t') {
-            exc = Some(trimmed);
-            break;
-        }
-    }
-
-    match (exc, last_frame) {
-        (Some(e), Some(f)) => Cow::Owned(format!(
-            "{}{} ({} frames; last: {})\n",
-            preamble, e, frame_count, f,
-        )),
-        (Some(e), None) => Cow::Owned(format!("{}{}\n", preamble, e)),
-        _ => Cow::Borrowed(stderr),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,17 +142,16 @@ mod tests {
     #[test]
     fn interpreter_missing_in_every_shells_wording() {
         for (exit, stderr) in [
-            (127, "bash: line 1: python3: command not found\n"),
-            (127, "bash: python3: command not found\n"),
-            (127, "sh: 1: python3: not found\n"),
-            (127, "python3: not found\n"),
-            (127, "zsh:1: command not found: python3\n"),
-            (1, "python3: Command not found.\n"),
-            (127, "env: 'python3': No such file or directory\n"),
-            (127, "env: python3: No such file or directory\n"),
+            (127, "ksh: line 1: bash: command not found\n"),
+            (127, "sh: 1: bash: not found\n"),
+            (127, "bash: not found\n"),
+            (127, "zsh:1: command not found: bash\n"),
+            (1, "bash: Command not found.\n"),
+            (127, "env: 'bash': No such file or directory\n"),
+            (127, "env: bash: No such file or directory\n"),
         ] {
             assert!(
-                interpreter_missing("python3", Some(exit), stderr),
+                interpreter_missing("bash", Some(exit), stderr),
                 "{exit} {stderr:?}"
             );
         }
@@ -289,23 +159,22 @@ mod tests {
 
     #[test]
     fn interpreter_missing_needs_the_interpreter_and_the_exit() {
-        for (interp, exit, stderr) in [
+        for (exit, stderr) in [
             // Another program missing, as the script's own failure.
-            ("python3", 127, "sh: 1: foo: not found\n"),
-            ("node", 127, "bash: xnode: command not found\n"),
-            ("python", 127, "bash: python3: command not found\n"),
+            (127, "bash: line 3: foo: command not found\n"),
+            (127, "sh: 1: xbash: not found\n"),
+            (127, "bash: line 1: bash5: command not found\n"),
             // Right words, wrong exit: the script printed them itself.
-            ("python3", 1, "python3: command not found\n"),
-            ("python3", 2, "python3: Command not found.\n"),
-            ("python3", 127, "python3: No such file or directory\n"),
-            ("perl", 1, "Traceback (most recent call last):\n"),
+            (1, "bash: command not found\n"),
+            (2, "bash: Command not found.\n"),
+            (127, "bash: No such file or directory\n"),
         ] {
             assert!(
-                !interpreter_missing(interp, Some(exit), stderr),
-                "{interp} {exit} {stderr:?}"
+                !interpreter_missing("bash", Some(exit), stderr),
+                "{exit} {stderr:?}"
             );
         }
-        assert!(!interpreter_missing("python3", None, "python3: not found"));
+        assert!(!interpreter_missing("bash", None, "bash: not found"));
     }
 
     #[test]
@@ -315,6 +184,7 @@ mod tests {
             assert_eq!(interpreter_for_tool(tool), Some(*i));
         }
         assert_eq!(interpreter_for_tool("ssh_exec"), None);
+        assert_eq!(interpreter_for_tool("python_exec"), None);
     }
 
     #[test]
@@ -327,7 +197,8 @@ mod tests {
     #[test]
     fn validate_interpreter_rejects_unknown() {
         assert!(validate_interpreter("notalang").is_err());
-        assert!(validate_interpreter("python; rm -rf /").is_err());
+        assert!(validate_interpreter("python3").is_err());
+        assert!(validate_interpreter("bash; rm -rf /").is_err());
     }
 
     #[test]
@@ -348,77 +219,5 @@ mod tests {
         assert!(validate_arg("foo bar").is_err(), "spaces blocked too");
         assert!(validate_arg("foo\nbar").is_err());
         assert!(validate_arg(&"x".repeat(2000)).is_err());
-    }
-
-    #[test]
-    fn stdin_marker_per_interpreter() {
-        assert_eq!(stdin_marker("python3"), "-");
-        assert_eq!(stdin_marker("python"), "-");
-        assert_eq!(stdin_marker("node"), "-");
-        assert_eq!(stdin_marker("ruby"), "-");
-        assert_eq!(stdin_marker("bash"), "-s");
-        assert_eq!(stdin_marker("sh"), "-s");
-        assert_eq!(stdin_marker("zsh"), "-s");
-        assert_eq!(stdin_marker("deno"), "run -");
-        assert_eq!(stdin_marker("bun"), "run -");
-    }
-
-    #[test]
-    fn compact_traceback_collapses_to_exception_and_last_frame() {
-        let stderr = "Traceback (most recent call last):\n\
-                      \x20 File \"/usr/lib/python3.11/foo.py\", line 12, in bar\n\
-                      \x20\x20\x20 do_thing()\n\
-                      \x20 File \"<stdin>\", line 5, in <module>\n\
-                      \x20\x20\x20 bar()\n\
-                      ValueError: bad input 'xyz'\n";
-        let out = compact_python_traceback(stderr);
-        let s = out.as_ref();
-        assert!(s.contains("ValueError: bad input 'xyz'"));
-        assert!(s.contains("2 frames"));
-        assert!(s.contains("<stdin>"));
-        assert!(!s.contains("/usr/lib/python3.11/foo.py")); // first frame stripped
-    }
-
-    #[test]
-    fn compact_traceback_passes_through_when_no_traceback() {
-        let stderr = "warning: deprecated thing\n";
-        let out = compact_python_traceback(stderr);
-        assert_eq!(out, "warning: deprecated thing\n");
-    }
-
-    #[test]
-    fn compact_node_stack_collapses_v8_trace() {
-        let stderr = "/home/cali/x.js:3\n\
-                      throw new TypeError('foo');\n\
-                      ^\n\
-                      \n\
-                      TypeError: foo\n\
-                      \x20\x20\x20\x20at fn (/home/cali/x.js:3:11)\n\
-                      \x20\x20\x20\x20at /home/cali/x.js:5:1\n\
-                      \x20\x20\x20\x20at Script.runInThisContext (node:vm:144:12)\n";
-        let out = compact_node_stack(stderr);
-        let s = out.as_ref();
-        assert!(s.contains("TypeError: foo"));
-        assert!(s.contains("3 frames"));
-        assert!(s.contains("Script.runInThisContext"));
-    }
-
-    #[test]
-    fn compact_node_stack_passes_through_when_no_frames() {
-        let stderr = "/usr/local/bin/node: bad option\n";
-        let out = compact_node_stack(stderr);
-        assert_eq!(out, "/usr/local/bin/node: bad option\n");
-    }
-
-    #[test]
-    fn compact_traceback_preserves_preamble_warnings() {
-        let stderr = "DeprecationWarning: thing\n\
-                      Traceback (most recent call last):\n\
-                      \x20 File \"<stdin>\", line 1, in <module>\n\
-                      RuntimeError: oh no\n";
-        let out = compact_python_traceback(stderr);
-        let s = out.as_ref();
-        assert!(s.starts_with("DeprecationWarning: thing"));
-        assert!(s.contains("RuntimeError: oh no"));
     }
 }

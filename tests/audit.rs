@@ -549,17 +549,17 @@ async fn contents_are_digests_and_scripts_stay_whole_in_the_record() {
         prompto::agent::hex(&prompto::agent::sha256(secret_body.as_bytes()))
     );
 
-    let code = "import os\ntoken = \"tok-in-code-55\"\nprint('code-body-kept')\n";
+    let code = "set -e\ntoken = \"tok-in-code-55\"\necho 'code-body-kept'\n";
     let resp = call(
         &s,
-        "python_exec",
+        "bash_exec",
         json!({ "host": "noop", "script": code, "args": ["--password", "argv-pw-66"] }),
     )
     .await;
     let r = s.record(&rid(&resp));
     assert_eq!(
         r["args"]["script"],
-        "import os\ntoken = \"***\"\nprint('code-body-kept')\n"
+        "set -e\ntoken = \"***\"\necho 'code-body-kept'\n"
     );
     assert_eq!(r["args"]["args"], json!(["--password", "***"]));
 
@@ -567,11 +567,8 @@ async fn contents_are_digests_and_scripts_stay_whole_in_the_record() {
     let resp = call(&s, "bash_exec", json!({ "host": "noop", "script": bash })).await;
     assert_eq!(s.record(&rid(&resp))["args"]["script"], bash);
 
-    let big = format!(
-        "# {}\nprint(1)\n",
-        "x".repeat(prompto::audit::MAX_ARG_STRING)
-    );
-    let resp = call(&s, "node_exec", json!({ "host": "noop", "script": big })).await;
+    let big = format!("# {}\necho 1\n", "x".repeat(prompto::audit::MAX_ARG_STRING));
+    let resp = call(&s, "bash_exec", json!({ "host": "noop", "script": big })).await;
     let r = s.record(&rid(&resp));
     assert_eq!(r["args"]["script"]["len"], big.len());
     assert_eq!(r["args"]["script"]["truncated"], true);
@@ -1254,4 +1251,71 @@ fn cli_filters_records() {
     assert!(!ok && err.contains("allow or deny"), "{err}");
     let (ok, _, err) = audit_cli(&path, &["--since", "yesterday"]);
     assert!(!ok && err.contains("--since"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// The advisor (task 020)
+// ---------------------------------------------------------------------------
+
+/// A simple `cat` through `ssh_exec` gets one short `file_read` hint, once
+/// per session per hour. The call's audit record names the pattern, and
+/// `prompto_gain` counts the hint and its bytes.
+#[tokio::test]
+async fn advisor_hints_once_and_is_recorded_and_counted() {
+    let s = spawn(AuthMode::Required).await;
+    let args = json!({ "host": "run", "cmd": "cat /etc/hosts" });
+    let first = call(&s, "ssh_exec", args.clone()).await;
+    assert_ok(&first);
+    let blocks = first["result"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{first}");
+    let hint = blocks[1]["text"].as_str().unwrap();
+    assert!(hint.starts_with("[advisor] file_read "), "{hint}");
+    assert!(hint.len() <= 120 && !hint.contains('\n'), "{hint}");
+    assert_eq!(s.record(&rid(&first))["advisor"], "cat");
+
+    let second = call(&s, "ssh_exec", args).await;
+    assert_eq!(second["result"]["content"].as_array().unwrap().len(), 1);
+    assert!(s.record(&rid(&second)).get("advisor").is_none());
+
+    // Compound shell: never a hint.
+    let piped = call(
+        &s,
+        "ssh_exec",
+        json!({ "host": "run", "cmd": "ls -la /etc | head -3" }),
+    )
+    .await;
+    assert_eq!(piped["result"]["content"].as_array().unwrap().len(), 1);
+
+    let gain = result(&call(&s, "prompto_gain", json!({})).await);
+    let adv = &gain["advisor"];
+    assert_eq!(adv["hints"], 1, "{gain}");
+    assert_eq!(adv["bytes"], hint.len(), "{gain}");
+    assert_eq!(adv["by_pattern"]["cat"]["hints"], 1, "{gain}");
+}
+
+/// S0.3: a call to a removed tool (a client with a stale tool list) is
+/// refused with what replaces it, and recorded like any invalid call.
+#[tokio::test]
+async fn a_removed_tool_says_what_replaces_it() {
+    let s = spawn(AuthMode::Required).await;
+    let resp = call(
+        &s,
+        "python_exec",
+        json!({ "host": "run", "script": "print(1)" }),
+    )
+    .await;
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("python_exec was removed in v0.12.2")
+            && msg.contains("ssh_exec with a heredoc"),
+        "{resp}"
+    );
+    let r = s
+        .records()
+        .into_iter()
+        .find(|r| r["tool"] == "python_exec")
+        .unwrap();
+    assert_eq!(r["error_class"], "invalid_args", "{r}");
+    assert_eq!(r["decision"], Value::Null, "{r}");
+    assert!(s.argv_log().is_empty(), "{}", s.argv_log());
 }

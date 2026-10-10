@@ -5,14 +5,13 @@ const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'cons
 /** Chars of one value the approval pane draws; past it, the head and a warning. */
 export const SHOW_MAX = 32 * 1024
 /** What runs, in the order the pane looks for it: drawn first, highlighted. */
-export const MAIN_KEYS = ['cmd', 'script', 'commands', 'task'] as const
+export const MAIN_KEYS = ['cmd', 'script', 'commands'] as const
 
 export type Config = {
   /** `http://host:6337/mcp` */
   mcpUrl: string
   /** `http://host:6337` */
   base: string
-  tokenFile: string
   /** The headers helper, `<plugin root>/bin/prompto-headers`. */
   helper: string
 }
@@ -24,7 +23,6 @@ export function configFrom(options: Readonly<Record<string, unknown>>, root: str
   return {
     mcpUrl,
     base: mcpUrl.replace(/\/mcp$/, ''),
-    tokenFile: String(options.token_file ?? '~/.config/prompto/token'),
     helper: `${root}/bin/prompto-headers`,
   }
 }
@@ -37,7 +35,7 @@ export function argsOf(e: Readonly<Record<string, unknown>>): Record<string, unk
 }
 
 export function hostOf(tool: string, args: Record<string, unknown>): string | null {
-  const h = args.host ?? args.client ?? args.source_host
+  const h = args.host ?? args.source_host
   if (tool === 'rsync_sync' && typeof args.dest_host === 'string') return `${String(h)} -> ${args.dest_host}`
   return typeof h === 'string' ? h : null
 }
@@ -153,7 +151,7 @@ export function cutNote(f: Field): string | null {
 
 /**
  * Everything a call's ticket covers, for the approver: the main field
- * (cmd, script, commands or task) first, then every other argument in
+ * (cmd, script or commands) first, then every other argument in
  * order, `ticket` aside. Nothing is left out; `fields` holds file_write's
  * `content` too, which the pane draws as a diff when it has one.
  */
@@ -176,7 +174,7 @@ export function commandOf(tool: string, args: Record<string, unknown>): string {
 
 /** Where an "approve for N minutes" ticket applies: session, tool, host(s). */
 export function scopeKey(session: string | undefined, tool: string, args: Record<string, unknown>): string {
-  const host = args.host ?? args.client ?? args.source_host ?? ''
+  const host = args.host ?? args.source_host ?? ''
   return [session ?? '', tool, String(host), String(args.dest_host ?? '')].join('|')
 }
 
@@ -249,7 +247,7 @@ function auditText(r: Record<string, unknown>): string {
   const time = s('ts').slice(11, 19)
   if (s('type') === 'kill') return `${time} kill ${s('action')} ${s('scope')} ${s('target')} ${s('reason')}`.trim()
   const args = (r.args ?? {}) as Record<string, unknown>
-  const what = ['cmd', 'script', 'task'].map(k => args[k]).find(v => typeof v === 'string') as string | undefined
+  const what = ['cmd', 'script'].map(k => args[k]).find(v => typeof v === 'string') as string | undefined
   const kind = s('type') === 'tool' ? '' : `${s('type')}:`
   // A precheck or an approval is a decision, not a run.
   const decided = s('type') === 'tool' ? '' : s('decision')

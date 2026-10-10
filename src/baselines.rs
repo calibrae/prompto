@@ -78,23 +78,12 @@ pub const BASELINES: &[(&str, u32)] = &[
     ("ssh_sudo_exec", 550), // + sudo/tty noise
     // N sequential ssh_exec calls; median batch ~5.
     ("ssh_batch", 2500),
-    // ── agent delegation ─────────────────────────────────────────────
-    // v3 claimed 5000 (a 99% saving) on n=1. The premise — remote agent
-    // reads ~5 KB and returns a summary — is plausible but unvalidated.
-    // Trimmed until there's real volume behind it.
-    // CONFIDENCE: low (n=1).
-    ("claude_exec", 3000),
-    // ── script_* ─────────────────────────────────────────────────────
+    // ── bash_exec ────────────────────────────────────────────────────
     // Baseline covers the "ssh + heredoc got mangled, retry" round-trip
-    // these replace by piping the body over stdin. v3 numbers assumed a
-    // full failed attempt plus traceback; observed medians are ~92-118
-    // tok, so the retry allowance is trimmed.
-    ("python_exec", 500),
-    ("node_exec", 450),
+    // it replaces by piping the body over stdin. v3 assumed a full failed
+    // attempt; observed medians are ~92-118 tok, so the retry allowance
+    // is trimmed.
     ("bash_exec", 350),
-    ("ruby_exec", 450),
-    ("perl_exec", 400),
-    ("deno_exec", 450),
     // ── file_* ───────────────────────────────────────────────────────
     // Content-proportional — see the module docs. Median observed read is
     // 583 tok; 900 credits the size cap and the avoided stat-then-cat
@@ -121,20 +110,8 @@ pub const BASELINES: &[(&str, u32)] = &[
     // investigating. Baseline assumes ~30 files with full progress lines.
     // CONFIDENCE: low (no successful calls).
     ("rsync_sync", 1500),
-    // ── mcp_* ────────────────────────────────────────────────────────
-    ("mcp_list", 200),
-    ("mcp_get", 150),
-    ("mcp_add", 180),
-    ("mcp_remove", 140),
-    ("mcp_restart_claudecli", 200),
-    // Probes every server on the client (~3-6 entries). Observed 344 tok.
-    ("mcp_status", 700),
-    // Journal tail. `mcp_logs` is the deprecated alias for `service_logs`
-    // — same baseline, recorded separately so the gain log shows when the
-    // old name has fallen out of use and the alias can be retired.
+    // Journal tail.
     ("service_logs", 400),
-    ("mcp_logs", 400),
-    ("mcp_reconnect_hint", 200),
     // ── self ─────────────────────────────────────────────────────────
     // No SSH equivalent exists, so it claims nothing. This makes the tool
     // score its own output as pure cost (~322 tok median), dragging the

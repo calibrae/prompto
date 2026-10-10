@@ -15,12 +15,6 @@
       "description": "prompto's MCP endpoint (…/mcp); /v1/precheck and friends are next to it",
       "default": "http://localhost:6337/mcp"
     },
-    "token_file": {
-      "type": "string",
-      "title": "Token file",
-      "description": "File holding the agent role token, mode 0600. The plugin's own requests use it; Claude Code passes no plugin options to the MCP connection's headers helper, which reads ~/.config/prompto/token, so keep the token there",
-      "default": "~/.config/prompto/token"
-    },
     "servers": {
       "type": "string",
       "title": "MCP server names",
@@ -48,10 +42,7 @@
     "prompto": {
       "type": "http",
       "url": "${user_config.url}",
-      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/prompto-headers\"",
-      "env": {
-        "PROMPTO_TOKEN_FILE": "${user_config.token_file}"
-      }
+      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/prompto-headers\""
     }
   }
 }

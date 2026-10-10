@@ -32,7 +32,7 @@
 //!
 //! # Arguments and strings
 //!
-//! [`redact`]: commands and every interpreter's script are kept whole
+//! [`redact`]: commands and `bash_exec`'s script are kept whole
 //! (owner decision: the audit records the full command) up to
 //! [`MAX_ARG_STRING`], file contents become `{sha256, len}`, any field
 //! named like a secret ([`is_secret_name`]) becomes `"[redacted]"`, and
@@ -338,8 +338,8 @@ fn is_bare_secret_flag(s: &str) -> bool {
 ///
 /// - a field named like a secret ([`is_secret_name`]) → `"[redacted]"`;
 /// - `content` (`file_write`) and `ticket` (E6) → `{sha256, len}`;
-/// - every other string is kept — `cmd`, `commands`, every interpreter's
-///   `script`, `claude_exec`'s `task` are the command (owner decision) —
+/// - every other string is kept — `cmd`, `commands`, `bash_exec`'s
+///   `script` are the command (owner decision) —
 ///   through [`scrub`], or as `{sha256, len, truncated: true}` above
 ///   [`MAX_ARG_STRING`]; in a list, the element after a bare secret flag
 ///   (`["--password", "x"]`) is scrubbed;
@@ -513,6 +513,10 @@ pub struct Record {
     /// `since` and `reason` (see `crate::kill`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill: Option<crate::kill::Kill>,
+    /// The advisor's hint appended to the result, by pattern (`cat`,
+    /// `repeated_ssh_exec`, … — `crate::advisor::HINTS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<&'static str>,
 }
 
 /// Caps, in chars, on the caller-controlled strings of a record (see
@@ -706,6 +710,7 @@ pub fn tool_record(ctx: &CallCtx, tool: &str, args: Value) -> Record {
         auth_note: ctx.auth_note.clone(),
         mcp_session: None,
         kill: ctx.notes().kill,
+        advisor: None,
     }
 }
 
@@ -1324,6 +1329,7 @@ impl Audit {
             auth_note: None,
             mcp_session,
             kill: None,
+            advisor: None,
         };
         self.write(rec);
     }
@@ -1961,10 +1967,8 @@ mod tests {
         assert_eq!(redact(&b), b);
         let c = json!({ "host": "h", "script": "echo hi\nuname -a" });
         assert_eq!(redact(&c), c);
-        let t = json!({ "host": "h", "task": "why is nginx down" });
-        assert_eq!(redact(&t), t);
-        // Every interpreter's script too (owner decision, task 010).
-        let p = json!({ "host": "h", "script": "print(1)", "args": ["-v"] });
+        // With its argv too (owner decision, task 010).
+        let p = json!({ "host": "h", "script": "echo 1", "args": ["-v"] });
         assert_eq!(redact(&p), p);
     }
 

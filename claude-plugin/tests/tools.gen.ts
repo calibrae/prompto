@@ -9,22 +9,6 @@ export const TOOLS: Record<string, Record<string, string>> = {
     "args": "array",
     "timeout_secs": "integer"
   },
-  "claude_exec": {
-    "host": "string",
-    "task": "string",
-    "tier": "string",
-    "backend": "string",
-    "model": "string",
-    "effort": "string",
-    "session_id": "string",
-    "timeout_secs": "integer"
-  },
-  "deno_exec": {
-    "host": "string",
-    "script": "string",
-    "args": "array",
-    "timeout_secs": "integer"
-  },
   "file_list": {
     "host": "string",
     "path": "string"
@@ -61,49 +45,6 @@ export const TOOLS: Record<string, Record<string, string>> = {
     "name": "string"
   },
   "inventory_list": {},
-  "mcp_add": {
-    "client": "string",
-    "name": "string",
-    "transport": "string",
-    "url_or_cmd": "string",
-    "scope": "string"
-  },
-  "mcp_get": {
-    "client": "string",
-    "name": "string"
-  },
-  "mcp_list": {
-    "client": "string"
-  },
-  "mcp_logs": {
-    "host": "string",
-    "unit": "string",
-    "lines": "integer"
-  },
-  "mcp_reconnect_hint": {},
-  "mcp_remove": {
-    "client": "string",
-    "name": "string",
-    "scope": "string"
-  },
-  "mcp_restart_claudecli": {
-    "client": "string"
-  },
-  "mcp_status": {
-    "client": "string"
-  },
-  "node_exec": {
-    "host": "string",
-    "script": "string",
-    "args": "array",
-    "timeout_secs": "integer"
-  },
-  "perl_exec": {
-    "host": "string",
-    "script": "string",
-    "args": "array",
-    "timeout_secs": "integer"
-  },
   "port_scan": {
     "host": "string",
     "ports": "array",
@@ -111,12 +52,6 @@ export const TOOLS: Record<string, Record<string, string>> = {
   },
   "prompto_gain": {
     "since_secs": "integer"
-  },
-  "python_exec": {
-    "host": "string",
-    "script": "string",
-    "args": "array",
-    "timeout_secs": "integer"
   },
   "rsync_sync": {
     "source_host": "string",
@@ -128,12 +63,6 @@ export const TOOLS: Record<string, Record<string, string>> = {
     "dry_run": "boolean",
     "excludes": "array",
     "dest_key": "string",
-    "timeout_secs": "integer"
-  },
-  "ruby_exec": {
-    "host": "string",
-    "script": "string",
-    "args": "array",
     "timeout_secs": "integer"
   },
   "service_control": {

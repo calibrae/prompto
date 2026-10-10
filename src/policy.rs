@@ -36,7 +36,7 @@
 //! - **host**: one of `hosts` matches the host's inventory name or any of
 //!   its aliases (`*` and `?` are wildcards), or is `group:<g>` with `<g>`
 //!   in the host's inventory `groups`. Tools that target no host
-//!   (`inventory_list`, `prompto_gain`, `mcp_reconnect_hint`) skip this
+//!   (`inventory_list`, `prompto_gain`) skip this
 //!   dimension: a rule grants them when it names the agent and the tool,
 //!   whatever its `hosts` say.
 //! - **tool**: one of `tools` matches the tool name (`*`, `?` wildcards).
@@ -911,7 +911,8 @@ impl std::fmt::Display for Finding {
 /// Check `policy` against the inventory, the agents and the tool list.
 ///
 /// Errors: references to agents, hosts, host groups or tools that don't
-/// exist (a typo there silently grants nothing), and root granted on the
+/// exist (a typo there silently grants nothing; a tool prompto removed,
+/// [`authz::REMOVED_TOOLS`], is only a warning), and root granted on the
 /// host running prompto (inventory `prompto_host`, see
 /// `root_on_prompto_host`) without `crown_jewel_ack = true`. Warnings: agent groups
 /// nobody is in yet, globs that match nothing, disabled agents, exec grants without `sudo = true` on hosts
@@ -999,6 +1000,18 @@ pub fn lint(
             let hit = tools.iter().any(|x| t.matches(x));
             match (hit, t.is_literal()) {
                 (true, _) => {}
+                // A tool removed from prompto: the rule still loads and
+                // grants nothing for it. An old policy file must not
+                // count as broken (`prompto policy lint` fails on errors).
+                (false, true) if authz::removed_tool(t.as_str()).is_some() => push(
+                    Level::Warning,
+                    rule,
+                    format!(
+                        "unknown tool {:?} (removed in {})",
+                        t.as_str(),
+                        authz::REMOVED_IN
+                    ),
+                ),
                 (false, true) => push(Level::Error, rule, format!("unknown tool {:?}", t.as_str())),
                 (false, false) => push(
                     Level::Warning,
@@ -1120,8 +1133,8 @@ pub fn prompto_host_findings(
 }
 
 /// A plain (`sudo = false`) grant, on a `prompto_host`, of a tool that
-/// runs as `ssh_user` there with the `exec` capability — the shells, the
-/// interpreters, `file_*`, `rsync_sync` (either end), `host_diagnose` —
+/// runs as `ssh_user` there with the `exec` capability — the shells,
+/// `bash_exec`, `file_*`, `rsync_sync` (either end), `host_diagnose` —
 /// when that `ssh_user` is prompto's service user. That account reads the
 /// ticket key and TOTP files and `/etc/prompto/env` without any sudo.
 /// Silenced by `crown_jewel_ack` like [`root_on_prompto_host`].
@@ -1730,6 +1743,34 @@ approval = "ticket"
     /// An exec grant without `sudo = true` is a root shell wherever
     /// `ssh_user` is root or can sudo without a password: one warning per
     /// rule, naming the tools and each such host with its reason.
+    /// S0.3: a policy written before the tool removal still loads; the
+    /// removed names are warnings, so `prompto policy lint` passes and
+    /// approvals (blocked only by `prompto_host_errors`) stay on.
+    #[test]
+    fn lint_warns_on_removed_tools_and_they_block_nothing() {
+        let src = "[[rule]]\nagents = [\"dev\"]\nhosts = [\"alpha\"]\n\
+                   tools = [\"claude_exec\", \"python_exec\", \"mcp_logs\", \"file_read\"]\n";
+        let f = lint_of(src);
+        for t in ["claude_exec", "python_exec", "mcp_logs"] {
+            let want = format!(
+                "warning: policy.toml:1: unknown tool \"{t}\" (removed in {})",
+                authz::REMOVED_IN
+            );
+            assert!(f.contains(&want), "missing {want:?} in {f:#?}");
+        }
+        assert!(!f.iter().any(|x| x.starts_with("error")), "{f:#?}");
+        let p = Policy::from_toml_str(src, "policy.toml").unwrap();
+        assert!(prompto_host_findings(&p, &inv(), &tools(), DEFAULT_SERVICE_USER).is_empty());
+        // A removed tool is unknown, not exempt: its typos stay errors.
+        let f = lint_of(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [\"alpha\"]\ntools = [\"claude_exce\"]\n",
+        );
+        assert!(
+            f.contains(&"error: policy.toml:1: unknown tool \"claude_exce\"".to_string()),
+            "{f:#?}"
+        );
+    }
+
     #[test]
     fn lint_warns_on_exec_grants_where_the_shell_is_root() {
         let inv = Inventory::from_toml_str(

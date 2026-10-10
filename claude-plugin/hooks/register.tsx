@@ -56,8 +56,8 @@ const PANE = 'prompto-approval'
 const WAIT_MS = 10 * 60 * 1000
 const VERSION = '0.1.0'
 const USER_AGENT = `prompto-claude-plugin/${VERSION}`
-/** Where bin/prompto-headers looks for the token when told nothing else. */
-const DEFAULT_TOKEN_FILE = '~/.config/prompto/token'
+/** Where bin/prompto-headers reads the token: the only place it is looked for. */
+const TOKEN_FILE = '~/.config/prompto/token'
 
 const pending = atom({ plugin: 'prompto', key: 'pending' } as const, [] as PromptoPending[], { shape: 'pending-2' })
 
@@ -113,7 +113,7 @@ async function authorization($: $, cfg: Config, fresh: boolean): Promise<string>
   if (auth !== undefined && !fresh) return auth
   let run
   try {
-    run = await $.process.run(['sh', cfg.helper, cfg.tokenFile], { timeoutMs: 10_000 })
+    run = await $.process.run(['sh', cfg.helper], { timeoutMs: 10_000 })
   } catch (err) {
     throw new Unreachable(`cannot run prompto-headers: ${String(err)}`)
   }
@@ -256,8 +256,9 @@ async function sendMod(
 
 /**
  * Claude Code's own permission verdict. A deny refuses. An ask is put to
- * the person when the plugin sends the call itself (`askPerson`); else
- * Claude Code asks on its own when the call reaches it.
+ * the person when `askPerson` (the plugin sends the call itself, and no
+ * approval pane will ask); else it counts as answered: by the pane, or by
+ * Claude Code itself when the call reaches it (`engine`).
  */
 async function permitted(
   $: $,
@@ -633,18 +634,16 @@ async function warnIfShadowed($: $, servers: readonly string[]): Promise<void> {
     return
   }
   if (!r.isConnected) {
-    // Claude Code (2.1.295) runs the headers helper with neither the
-    // manifest's `env` nor the settings' `env`: it can only find the
-    // token at its default path.
-    const file = String(S.options.token_file ?? '').trim()
-    const elsewhere = file !== '' && file !== DEFAULT_TOKEN_FILE
-    $.ui.log(
-      `the plugin's MCP server is not connected (${r.reason}): ${clean(r.message)}` +
-        (elsewhere
-          ? `\nIts headers helper can't see the token_file option (${clean(file)}): Claude Code gives it no plugin options. ` +
-            `Put the token at ${DEFAULT_TOKEN_FILE} (mode 0600) for prompto's tools to be listed.`
-          : ''),
-    )
+    // Most often the token file: run the headers helper, whose refusal
+    // says what is wrong with it (missing, mode, owner, ACL). Its output
+    // on success is the header itself, kept in memory only.
+    let why = ''
+    try {
+      await authorization($, cfgOf($), true)
+    } catch (err) {
+      why = `\nThe token file ${TOKEN_FILE} is the likely cause: ${clean((err as Error).message)}`
+    }
+    $.ui.log(`the plugin's MCP server is not connected (${r.reason}): ${clean(r.message)}${why}`)
     return
   }
   if (r.server.startsWith('plugin:')) return
@@ -738,8 +737,10 @@ export const register: Register = (on, options) => {
           deny: `${refusal({ ...a, error_class: 'approval_required' })}\nA human must approve it, and this session has nobody to show the approval pane to. Run it from an interactive Claude Code session with the prompto plugin.`,
         }
       }
-      // Claude Code's verdict first: a call its settings deny never costs a code.
-      const ok = await permitted($, e.tool, tool, args, isMod)
+      // Claude Code's verdict first: a call its settings deny never costs a
+      // code. Its `ask` is answered by the pane, as in `engine`: the code
+      // the person types there is their answer (one prompt, not two).
+      const ok = await permitted($, e.tool, tool, args, false)
       if (ok !== true) return ok
       const decision = await waitForHuman($, e.tool_use_id, next.signal, e.tool, tool, args, session, a)
       if (decision.kind === 'denied') return { deny: `prompto: the human approver refused this call: ${decision.reason}` }

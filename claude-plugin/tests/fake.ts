@@ -24,6 +24,8 @@ export type Fake = {
   calls: () => Seen[]
   approvals: () => Seen[]
   logs: string[]
+  /** The argv of every headers-helper run. */
+  helperRuns: string[][]
 }
 
 /** Install the fake and the engine stubs every test needs. */
@@ -69,9 +71,11 @@ export function install(on: On, opts: Opts = {}): Fake {
     calls: () => fake.seen.filter(s => s.path === '/mcp'),
     approvals: () => fake.seen.filter(s => s.path === '/v1/approve'),
     logs: [],
+    helperRuns: [],
   }
   on('process.run', ($, e) => {
     if (e.argv[0] === 'sh') {
+      fake.helperRuns.push([...e.argv])
       return opts.noToken
         ? { value: { exitCode: 1, stdout: '', stderr: 'prompto-headers: no token file /x' } }
         : { value: { exitCode: 0, stdout: '{"Authorization": "Bearer pto_test"}\n', stderr: '' } }

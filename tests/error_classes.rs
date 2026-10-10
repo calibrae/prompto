@@ -50,15 +50,13 @@ const INVENTORY: &str = r#"
 ip = "127.0.0.40"
 ssh_user = "admin"
 ssh_key = "/dev/null"
-apytti_url = "http://127.0.0.1:9"
-capabilities = ["exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["exec", "sudo_exec", "virt"]
 
 [host.failing]
 ip = "127.0.0.41"
 ssh_user = "admin"
 ssh_key = "/dev/null"
-apytti_url = "http://127.0.0.1:9"
-capabilities = ["exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["exec", "sudo_exec", "virt"]
 
 [host.bare]
 ip = "127.0.0.42"
@@ -175,15 +173,10 @@ fn args_for(tool: &str, host: &str) -> Value {
             "source_host": host, "source_path": "/tmp/a/", "dest_host": host, "dest_path": "/tmp/b/"
         }),
         "inventory_get_host" => json!({ "name": host }),
-        "mcp_list" | "mcp_status" | "mcp_restart_claudecli" => json!({ "client": host }),
-        "mcp_get" | "mcp_remove" => json!({ "client": host, "name": "x" }),
-        "mcp_add" => json!({
-            "client": host, "name": "x", "transport": "http", "url_or_cmd": "http://x"
-        }),
         _ => json!({
             "host": host, "cmd": "true", "commands": ["true"], "script": "true",
             "path": "/tmp/x", "content": "x", "vm": "v", "unit": "u", "action": "restart",
-            "ports": [9], "task": "t", "probe_ms": 50, "step_timeout_secs": 1,
+            "ports": [9], "probe_ms": 50, "step_timeout_secs": 1,
             "total_timeout_secs": 1, "timeout_secs": 5
         }),
     }
@@ -198,13 +191,11 @@ fn invalid_args(tool: &str) -> Value {
         ("unit", json!("u;rm")),
         ("vm", json!("v m")),
         ("commands", json!([])),
-        ("task", json!(" ")),
         ("name", json!("x y")),
         ("cmd", json!(" ")),
         ("action", json!("explode")),
         ("mode", json!("rwx")),
         ("args", json!(["a b"])),
-        ("transport", json!("a b")),
     ];
     for (k, v) in bad {
         if a.get(k).is_some() || ["mode", "args"].contains(&k) {
@@ -218,7 +209,7 @@ fn invalid_args(tool: &str) -> Value {
 fn unparseable(tool: &str) -> Value {
     let mut a = args_for(tool, "failing");
     if let Some(m) = a.as_object_mut() {
-        for k in ["host", "client", "name", "source_host"] {
+        for k in ["host", "name", "source_host"] {
             m.remove(k);
         }
     }
@@ -236,7 +227,7 @@ async fn every_tool_failure_is_classified() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 38, "{tools:?}");
+    assert!(tools.len() >= 24, "{tools:?}");
 
     let mut missing = Vec::new();
     let mut check = |tool: &str, what: &str, resp: &Value| {

@@ -13,7 +13,7 @@
 //! `approval_required`); argument validation is `invalid_args`; a remote
 //! command that ran and failed is classified from its exit status and
 //! stderr by [`classify_exec`] (`ssh_connect`, `ssh_auth`, `timeout`,
-//! `sudo_guard`, `remote_nonzero`); the interpreter tools refine
+//! `sudo_guard`, `remote_nonzero`); `bash_exec` refines
 //! `remote_nonzero` to `interpreter_missing` (`crate::script`), and
 //! `rsync_sync` adds its own `rsync_*` and `dest_*` classes. An error that reaches `finish_tool` without a
 //! class is a bug: it is reported as `internal`, logged, and counted in
@@ -57,10 +57,9 @@ pub enum ErrorClass {
     DestSshAuth,
     /// `rsync` is not installed on one of the two hosts.
     RsyncMissing,
-    /// An interpreter tool's interpreter (`python3`, `node`, `ruby`,
-    /// `perl`, `deno`, `bash`) is not installed or not on the login
-    /// shell's PATH: the shell said "command not found" (exit 127, or 1
-    /// from csh). Nothing of the script ran.
+    /// `bash_exec`'s interpreter, bash, is not installed or not on the
+    /// login shell's PATH (FreeBSD, OPNsense): the shell said "command
+    /// not found" (exit 127, or 1 from csh). Nothing of the script ran.
     InterpreterMissing,
     /// rsync exit 1/4: syntax or usage error, unsupported action.
     RsyncUsage,
@@ -81,9 +80,6 @@ pub enum ErrorClass {
     /// Fetching a secret from vault failed (unreachable, denied, missing
     /// or unusable field). Nothing ran on the host.
     Vault,
-    /// A non-SSH service prompto relays to failed (the apytti gateway
-    /// behind `claude_exec`).
-    Upstream,
     /// Refused by a kill switch (`crate::kill`): global, agent, host or
     /// session. Nothing ran.
     Killed,
@@ -123,7 +119,6 @@ impl ErrorClass {
             Self::Timeout => "timeout",
             Self::SudoGuard => "sudo_guard",
             Self::Vault => "vault",
-            Self::Upstream => "upstream",
             Self::Killed => "killed",
             Self::RefusedTicket => "refused_ticket",
             Self::RemoteNonzero => "remote_nonzero",
@@ -156,7 +151,6 @@ impl ErrorClass {
         Self::Timeout,
         Self::SudoGuard,
         Self::Vault,
-        Self::Upstream,
         Self::Killed,
         Self::RefusedTicket,
         Self::RemoteNonzero,
@@ -454,14 +448,13 @@ mod tests {
             | ErrorClass::Timeout
             | ErrorClass::SudoGuard
             | ErrorClass::Vault
-            | ErrorClass::Upstream
             | ErrorClass::Killed
             | ErrorClass::RefusedTicket
             | ErrorClass::RemoteNonzero
             | ErrorClass::Internal
             | ErrorClass::Aborted => 1,
         };
-        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 26);
+        assert_eq!(ErrorClass::ALL.iter().map(|c| n(*c)).sum::<usize>(), 25);
     }
 
     fn out(code: Option<i32>, stderr: &str, timed_out: bool) -> ExecOutput {

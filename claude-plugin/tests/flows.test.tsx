@@ -706,17 +706,23 @@ test('ask: a Claude Code deny refuses before the pane, without asking for a code
   expect(fake.calls()).toHaveLength(0)
 })
 
-test('ask: a Claude Code ask goes to the person first; their no ends it before the pane', async ($, on) => {
+test('ask: a Claude Code ask is answered by the pane, not by a second question (task 020)', async ($, on) => {
   const clock = mock.clock(on)
   const asked: string[] = []
-  const fake = install(on, { clock, check: 'ask', answer: 'Deny', asked })
+  // Were the person asked first, their answer would end it before the pane.
+  const fake = install(on, { store: { approver: 'alice' }, clock, check: 'ask', answer: 'Deny', asked })
   fake.precheck.ssh_sudo_exec = ASK
   await start($)
-  const out = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'cc2', host: 'h2', cmd: 'id' })
-  expect(asked).toHaveLength(1)
-  expect(out.deny).toContain('denied')
-  expect(fake.logs.join('')).not.toContain('waits for an approval')
-  expect(fake.approvals()).toHaveLength(0)
+  const call = $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'cc2', host: 'h2', cmd: 'id' })
+  const ui = await paneReady($, clock)
+  expect(asked).toHaveLength(0)
+  await ui.input({ key: 'totp-0', text: CODE, kind: 'change' })
+  await ui.press({ key: 'approve' })
+  const out = await done(clock, call)
+  expect(out.deny).toBeUndefined()
+  expect(asked).toHaveLength(0)
+  expect(fake.approvals()).toHaveLength(1)
+  expect(fake.calls()).toHaveLength(1)
 })
 
 test('ask, transport engine: a Claude Code deny refuses before the pane too', { options: { transport: 'engine' } }, async ($, on) => {
@@ -814,22 +820,31 @@ test('file_write whose diff is too long to draw: the new content instead, whole'
   await done(clock, call)
 })
 
-test('a plugin server that didn\'t connect is logged; with token_file elsewhere, why', { options: { token_file: '/srv/tokens/ops' } }, async ($, on) => {
+test('a plugin server that didn\'t connect: the token file\'s problem is logged', async ($, on) => {
   mock.clock(on)
-  const fake = install(on, { mcpServer: null })
+  const fake = install(on, { mcpServer: null, noToken: true })
   await start($)
   const said = fake.logs.join('\n')
   expect(said).toContain("the plugin's MCP server is not connected (failed)")
-  expect(said).toContain("can't see the token_file option (/srv/tokens/ops)")
-  expect(said).toContain('~/.config/prompto/token')
+  expect(said).toContain('The token file ~/.config/prompto/token is the likely cause: prompto-headers: no token file /x')
 })
 
-test('a plugin server that didn\'t connect, token at the default path: no token_file hint', async ($, on) => {
+test('a plugin server that didn\'t connect, token file fine: the token is not blamed', async ($, on) => {
   mock.clock(on)
   const fake = install(on, { mcpServer: null })
   await start($)
   expect(fake.logs.join('\n')).toContain('not connected')
-  expect(fake.logs.join('\n')).not.toContain('token_file')
+  expect(fake.logs.join('\n')).not.toContain('token file')
+  expect(fake.logs.join('\n')).not.toContain('pto_test')
+})
+
+test('the token is read from the default path only: no token_file option, no path passed (task 020)', { options: { token_file: '/srv/tokens/ops' } }, async ($, on) => {
+  mock.clock(on)
+  const fake = install(on)
+  await start($)
+  await $.tool.call({ tool: 'mcp__prompto__ssh_exec', tool_use_id: 'tf1', host: 'h1', cmd: 'id' })
+  expect(fake.helperRuns.length).toBeGreaterThan(0)
+  for (const argv of fake.helperRuns) expect(argv).toEqual(['sh', expect.stringMatching(/\/bin\/prompto-headers$/)])
 })
 
 test('file_write when a deny rule took file_read out of the session: the pane still shows, with the whole content', async ($, on) => {

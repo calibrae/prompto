@@ -90,8 +90,7 @@ ip = "127.0.0.1"
 mac = "02:00:00:00:00:01"
 ssh_user = "admin"
 ssh_key = "/dev/null"
-apytti_url = "http://127.0.0.1:9"
-capabilities = ["wake", "exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["wake", "exec", "sudo_exec", "virt"]
 
 [host.runner]
 ip = "127.0.0.20"
@@ -123,7 +122,7 @@ ssh_key = "/dev/null"
 platform = "windows"
 capabilities = ["exec"]
 
-# Runs commands with no interpreter on PATH.
+# Runs commands with nothing on PATH (no bash).
 [host.bare]
 ip = "127.0.0.25"
 ssh_user = "admin"
@@ -317,12 +316,7 @@ async fn classified_error_merges_request_id_with_the_class() {
 /// Tools that never contact a host: the hostless ones, and
 /// `inventory_get_host`, which only reads the inventory. Everything else
 /// must refuse the caller's own machine.
-const NEVER_CONTACTS_A_HOST: &[&str] = &[
-    "inventory_list",
-    "mcp_reconnect_hint",
-    "prompto_gain",
-    "inventory_get_host",
-];
+const NEVER_CONTACTS_A_HOST: &[&str] = &["inventory_list", "prompto_gain", "inventory_get_host"];
 
 /// The refusal an agent sees for its own host (`loopback`, 127.0.0.1).
 const SELF_TARGET_MSG: &str = "refused_self_target: you are calling from loopback (127.0.0.1) \
@@ -336,15 +330,10 @@ fn self_targeting_args(tool: &str) -> Value {
             "dest_host": "runner", "dest_path": "/tmp/b/"
         }),
         "inventory_get_host" => json!({ "name": "loopback" }),
-        "mcp_list" | "mcp_status" | "mcp_restart_claudecli" => json!({ "client": "loopback" }),
-        "mcp_get" | "mcp_remove" => json!({ "client": "loopback", "name": "x" }),
-        "mcp_add" => json!({
-            "client": "loopback", "name": "x", "transport": "http", "url_or_cmd": "http://x"
-        }),
         _ => json!({
             "host": "loopback", "cmd": "true", "commands": ["true"], "script": "true",
             "path": "/tmp/x", "content": "x", "vm": "v", "unit": "u", "action": "status",
-            "ports": [9], "task": "t", "probe_ms": 50, "step_timeout_secs": 1,
+            "ports": [9], "probe_ms": 50, "step_timeout_secs": 1,
             "total_timeout_secs": 1
         }),
     }
@@ -365,7 +354,7 @@ async fn every_host_contacting_tool_refuses_self_targeting() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 38, "tools/list looks short: {tools:?}");
+    assert!(tools.len() >= 24, "tools/list looks short: {tools:?}");
 
     let mut wrong = Vec::new();
     for tool in &tools {
@@ -544,30 +533,17 @@ async fn simple_command_keeps_plain_sudo_n() {
     );
 }
 
-/// No interpreter on the host: the result says so instead of the generic
-/// `remote_nonzero`.
+/// No bash on the host (FreeBSD, OPNsense): `bash_exec` says so instead
+/// of the generic `remote_nonzero`.
 #[tokio::test]
 async fn missing_interpreter_is_classified() {
     let s = spawn_server().await;
-    for tool in [
-        "python_exec",
-        "node_exec",
-        "ruby_exec",
-        "perl_exec",
-        "deno_exec",
-    ] {
-        let resp = call(&s, tool, json!({ "host": "bare", "script": "1" })).await;
-        let out = ok_payload(&resp);
-        assert_eq!(out["exit_code"], 127, "{tool}: {out}");
-        assert_eq!(out["error_class"], "interpreter_missing", "{tool}: {out}");
-    }
-    // A failing command that is not a missing interpreter keeps its class.
-    let resp = call(
-        &s,
-        "ssh_exec",
-        json!({ "host": "bare", "cmd": "python3 -" }),
-    )
-    .await;
+    let resp = call(&s, "bash_exec", json!({ "host": "bare", "script": "true" })).await;
+    let out = ok_payload(&resp);
+    assert_eq!(out["exit_code"], 127, "{out}");
+    assert_eq!(out["error_class"], "interpreter_missing", "{out}");
+    // The same failure through another tool is that command's own.
+    let resp = call(&s, "ssh_exec", json!({ "host": "bare", "cmd": "bash -s" })).await;
     assert_eq!(ok_payload(&resp)["error_class"], "remote_nonzero");
 }
 
