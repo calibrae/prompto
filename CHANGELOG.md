@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.12.3 — 2026-10-10
 
 ### Breaking: fewer tools, one-line descriptions
 

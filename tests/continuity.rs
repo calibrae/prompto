@@ -586,7 +586,12 @@ async fn a_successor_that_dies_after_ready_never_takes_over() {
     p.signal(libc::SIGUSR2);
     let t = Instant::now();
     // The second probation: the crashed successor's is in the log too.
-    while p.stderr().matches("both accept until its probation ends").count() < 2 {
+    while p
+        .stderr()
+        .matches("both accept until its probation ends")
+        .count()
+        < 2
+    {
         assert!(t.elapsed() < Duration::from_secs(15), "{}", p.stderr());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
