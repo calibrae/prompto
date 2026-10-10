@@ -84,8 +84,9 @@ pub struct ApprovalConfig {
 
 /// `PROMPTO_PRIVATE_MOUNT` default.
 pub const DEFAULT_PRIVATE_MOUNT: &str = "prompto-private";
-/// `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` default.
-pub const DEFAULT_AGENT_READABLE: &str = "prompto/,infra/,nxp/";
+/// `PROMPTO_VAULT_MOUNT` default: the shared mount (sudo passwords),
+/// agent-readable as a whole.
+pub const DEFAULT_SHARED_MOUNT: &str = "secret";
 
 /// A location in vault: a KV v2 mount and a path prefix in it (`""`: the
 /// whole mount). Matched like a vault policy glob `<mount>/<prefix>*`:
@@ -127,8 +128,13 @@ impl std::fmt::Display for VaultPrefix {
 /// live under. So the ticket key and the TOTP secrets are read from
 /// their own KV v2 mount (`PROMPTO_PRIVATE_MOUNT`, default
 /// `prompto-private`) that only prompto's token may read, and prompto
-/// refuses any of them that sits under a location agents can read
-/// (`PROMPTO_AGENT_READABLE_VAULT_PREFIXES`).
+/// refuses any of them that sits under a location agents can read.
+///
+/// The whole shared mount (`PROMPTO_VAULT_MOUNT`) counts as
+/// agent-readable, always: agent gateways cover more and more prefixes
+/// there (`prompto/`, `infra/`, `ai/`, `personal/`, …), and a list of
+/// them goes stale silently. `PROMPTO_AGENT_READABLE_VAULT_PREFIXES`
+/// only adds locations, on other mounts.
 #[derive(Clone, Debug)]
 pub struct PrivateVault {
     /// The KV v2 mount the ticket key and TOTP secrets are read from.
@@ -139,10 +145,7 @@ pub struct PrivateVault {
 
 impl Default for PrivateVault {
     fn default() -> Self {
-        Self {
-            mount: DEFAULT_PRIVATE_MOUNT.into(),
-            agent_readable: parse_prefixes(DEFAULT_AGENT_READABLE, "secret"),
-        }
+        Self::from_parts(DEFAULT_SHARED_MOUNT, None, None)
     }
 }
 
@@ -171,17 +174,39 @@ impl PrivateVault {
     /// From `PROMPTO_PRIVATE_MOUNT`, `PROMPTO_AGENT_READABLE_VAULT_PREFIXES`
     /// and `PROMPTO_VAULT_MOUNT`.
     pub fn from_env() -> Self {
-        let shared = std::env::var("PROMPTO_VAULT_MOUNT").unwrap_or_else(|_| "secret".into());
-        let mount = std::env::var("PROMPTO_PRIVATE_MOUNT")
-            .ok()
+        let shared =
+            std::env::var("PROMPTO_VAULT_MOUNT").unwrap_or_else(|_| DEFAULT_SHARED_MOUNT.into());
+        Self::from_parts(
+            &shared,
+            std::env::var("PROMPTO_PRIVATE_MOUNT").ok().as_deref(),
+            std::env::var("PROMPTO_AGENT_READABLE_VAULT_PREFIXES")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// The shared mount `shared` as a whole, plus the `extra` locations
+    /// (`PROMPTO_AGENT_READABLE_VAULT_PREFIXES`, see [`parse_prefixes`]);
+    /// entries on the shared mount add nothing and are dropped. `private`
+    /// (`PROMPTO_PRIVATE_MOUNT`) defaults to [`DEFAULT_PRIVATE_MOUNT`].
+    pub fn from_parts(shared: &str, private: Option<&str>, extra: Option<&str>) -> Self {
+        let shared = shared.trim().trim_matches('/');
+        let mount = private
             .map(|m| m.trim().trim_matches('/').to_string())
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| DEFAULT_PRIVATE_MOUNT.into());
-        let list = std::env::var("PROMPTO_AGENT_READABLE_VAULT_PREFIXES")
-            .unwrap_or_else(|_| DEFAULT_AGENT_READABLE.into());
+        let mut agent_readable = vec![VaultPrefix {
+            mount: shared.to_string(),
+            prefix: String::new(),
+        }];
+        agent_readable.extend(
+            parse_prefixes(extra.unwrap_or_default(), shared)
+                .into_iter()
+                .filter(|p| p.mount != shared),
+        );
         Self {
             mount,
-            agent_readable: parse_prefixes(&list, shared.trim()),
+            agent_readable,
         }
     }
 
