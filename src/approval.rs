@@ -331,6 +331,12 @@ struct Inner {
 }
 
 /// Used nonces and TOTP steps, in memory and in the state file.
+///
+/// Two prompto processes can share the file — during a binary handover
+/// the old one drains while the new one serves (`crate::drain`) — so
+/// every check-and-record runs under an exclusive `flock` on
+/// `<state>.lock` and first takes in what the other process appended
+/// ([`State::sync`]): a nonce spent by one is spent for both.
 struct State {
     replay: Replay,
     steps: HashMap<String, u64>,
@@ -338,6 +344,27 @@ struct State {
     path: PathBuf,
     /// Lines in the file, to know when to compact it.
     lines: usize,
+    /// `<state>.lock`; `None` if it can't be opened (one process then
+    /// still works as before; two could each accept a nonce once).
+    lock: Option<Arc<File>>,
+    /// Device and inode of `file`: another process's compaction renames
+    /// a new file in place.
+    id: (u64, u64),
+    /// How far into `file` this process has read.
+    offset: u64,
+}
+
+/// Holds the state file's cross-process lock; released on drop.
+struct Flock(Option<Arc<File>>);
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a valid open descriptor; flock has no other preconditions.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 impl State {
@@ -348,39 +375,112 @@ impl State {
             file: Err("not opened".into()),
             path: path.to_path_buf(),
             lines: 0,
+            lock: None,
+            id: (0, 0),
+            offset: 0,
         };
+        s.lock = open_lock(path)
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "cannot open the approval state lock file; a second prompto process \
+                     (binary handover) would not see this one's spent tickets"
+                )
+            })
+            .ok()
+            .map(Arc::new);
+        let _held = s.flock();
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                for l in text.lines() {
-                    let mut f = l.split(' ');
-                    match (f.next(), f.next(), f.next()) {
-                        (Some("n"), Some(exp), Some(nonce)) => {
-                            if let Ok(exp) = exp.parse() {
-                                s.replay.restore(nonce, exp, now);
-                            }
-                        }
-                        (Some("t"), Some(step), Some(name)) => {
-                            if let Ok(step) = step.parse::<u64>() {
-                                let e = s.steps.entry(name.to_string()).or_default();
-                                *e = (*e).max(step);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            Ok(text) => s.absorb(&text, now),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 s.file = Err(format!("cannot read {}: {e}", path.display()));
                 return s;
             }
         }
-        s.file = s.compact(now);
+        s.compact(now);
         s
     }
 
+    /// Take in the file's lines.
+    fn absorb(&mut self, text: &str, now: u64) {
+        for l in text.lines() {
+            let mut f = l.split(' ');
+            match (f.next(), f.next(), f.next()) {
+                (Some("n"), Some(exp), Some(nonce)) => {
+                    if let Ok(exp) = exp.parse() {
+                        self.replay.restore(nonce, exp, now);
+                    }
+                }
+                (Some("t"), Some(step), Some(name)) => {
+                    if let Ok(step) = step.parse::<u64>() {
+                        let e = self.steps.entry(name.to_string()).or_default();
+                        *e = (*e).max(step);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Take the cross-process lock; held until the guard drops.
+    fn flock(&self) -> Flock {
+        flock(self.lock.as_ref())
+    }
+
+    /// Under the lock: take in what another process wrote since this one
+    /// last looked — its appends, or its compacted file (a new inode),
+    /// which is then also the one this process appends to.
+    fn sync(&mut self, now: u64) {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        if (meta.dev(), meta.ino()) != self.id {
+            match std::fs::read_to_string(&self.path) {
+                Ok(text) => {
+                    self.absorb(&text, now);
+                    self.lines = text.lines().count();
+                    self.file = OpenOptions::new()
+                        .append(true)
+                        .open(&self.path)
+                        .map_err(|e| format!("cannot write {}: {e}", self.path.display()));
+                    self.remember_file();
+                }
+                Err(e) => tracing::warn!(error = %e, "cannot re-read the approval state file"),
+            }
+            return;
+        }
+        if meta.len() <= self.offset {
+            return;
+        }
+        let mut text = String::new();
+        let read = File::open(&self.path).and_then(|mut f| {
+            f.seek(SeekFrom::Start(self.offset))?;
+            f.read_to_string(&mut text)
+        });
+        if read.is_err() {
+            return;
+        }
+        // A line still being written (a crash mid-append) waits.
+        let whole = text.rfind('\n').map_or(0, |i| i + 1);
+        self.absorb(&text[..whole], now);
+        self.lines += text[..whole].lines().count();
+        self.offset += whole as u64;
+    }
+
+    /// Note the identity and length of the file now open for appending.
+    fn remember_file(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(Ok(m)) = self.file.as_ref().map(|f| f.metadata()) {
+            self.id = (m.dev(), m.ino());
+            self.offset = m.len();
+        }
+    }
+
     /// Rewrite the file with only what is still live, then append to it.
-    fn compact(&mut self, now: u64) -> Result<File, String> {
+    fn compact(&mut self, now: u64) {
         use std::os::unix::fs::OpenOptionsExt;
         self.replay.prune(now);
         // A step older than the TOTP window can't be replayed anyway.
@@ -412,13 +512,14 @@ impl State {
             OpenOptions::new().append(true).open(&self.path)
         };
         self.lines = self.replay.len() + self.steps.len();
-        write().map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+        self.file = write().map_err(|e| format!("cannot write {}: {e}", self.path.display()));
+        self.remember_file();
     }
 
     /// Append one line, before the use it records takes effect.
     fn append(&mut self, line: &str, now: u64) -> Result<(), String> {
         if self.lines > 4 * (self.replay.len() + self.steps.len()) + 10_000 {
-            self.file = self.compact(now);
+            self.compact(now);
         }
         let f = self.file.as_mut().map_err(|e| e.clone())?;
         // Synced before the use it records takes effect: a power loss
@@ -428,12 +529,43 @@ impl State {
         // calls that take an SSH round trip (and human approvals). It is
         // done under the state lock, which caps ticketed calls at a few
         // hundred a second — far above what approvals are for.
-        f.write_all(format!("{line}\n").as_bytes())
+        let line = format!("{line}\n");
+        f.write_all(line.as_bytes())
             .and_then(|()| f.sync_data())
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
         self.lines += 1;
+        self.offset += line.len() as u64;
         Ok(())
     }
+}
+
+/// `<state>.lock`, owner-only.
+fn open_lock(state: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = state.as_os_str().to_owned();
+    name.push(".lock");
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PathBuf::from(name))
+}
+
+/// Block until `f`'s exclusive lock is held (no-op without a file).
+fn flock(f: Option<&Arc<File>>) -> Flock {
+    use std::os::fd::AsRawFd;
+    if let Some(f) = f {
+        // SAFETY: a valid open descriptor; flock has no other preconditions.
+        loop {
+            let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+    Flock(f.cloned())
 }
 
 /// A rejected approver string as logs and audit records show it: its
@@ -800,6 +932,8 @@ impl Approvals {
         }
         if !claims.scoped {
             let mut st = i.state.lock().unwrap_or_else(|e| e.into_inner());
+            let _shared = st.flock();
+            st.sync(now);
             if st.replay.contains(&claims.nonce) {
                 return refuse(
                     "ticket was already used (tickets are single-use) — get a new one".into(),
@@ -988,7 +1122,10 @@ impl Approvals {
             return Err(fail(INVALID));
         };
         let mut st = i.state.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = st.flock();
+        st.sync(now);
         if st.steps.get(name).is_some_and(|&last| step <= last) {
+            drop(shared);
             drop(st);
             return Err(fail("this code was already used — wait for the next one"));
         }
@@ -997,6 +1134,7 @@ impl Approvals {
             ApproveError::Unavailable("cannot record the approval (state file)".into())
         })?;
         st.steps.insert(name.to_string(), step);
+        drop(shared);
         drop(st);
         i.guard
             .lock()

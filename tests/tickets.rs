@@ -1293,6 +1293,90 @@ async fn restart_keeps_tickets_valid_and_spent_ones_spent() {
     after.verify_approver("ap0", &code(1)).await.unwrap();
 }
 
+/// E11: two live processes on one state file — the old one draining
+/// while the new one serves after a binary handover — never both accept
+/// a ticket or a TOTP code: each check re-reads, under a lock, what the
+/// other recorded, also after a third one compacted the file under them.
+/// Two `Approvals` here are two separate opens of the file and its lock,
+/// as two processes have.
+#[tokio::test]
+async fn two_live_processes_share_spent_tickets_and_totp_steps() {
+    settle().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ApprovalConfig {
+        key_vault_path: None,
+        key_file: None,
+        approvers_path: write_approvers(dir.path(), 1),
+        state_path: dir.path().join("approval-state"),
+        ..Default::default()
+    };
+    let ctx_for = |args: Value| {
+        let mut ctx = prompto::ctx::CallCtx::new(None).with_identity(prompto::agent::Identity {
+            agent: Some(prompto::ctx::Agent {
+                name: "alpha".into(),
+                groups: vec![],
+            }),
+            session_id: Some(SESSION.into()),
+            auth_note: None,
+        });
+        ctx.call = Some(prompto::audit::CallScope::new(
+            "ssh_exec",
+            args.as_object().cloned(),
+        ));
+        ctx
+    };
+    let old = Approvals::with_keys(cfg.clone(), keyset(7));
+    let new = Approvals::with_keys(cfg.clone(), keyset(7));
+    let mint = |a: &Approvals| {
+        a.mint(
+            None,
+            &ctx_for(exec("t1")),
+            Approval::Ticket,
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .0
+    };
+    let use_it = |a: &Approvals, t: &str| {
+        a.require(
+            None,
+            &ctx_for(with_ticket(exec("t1"), t)),
+            "ssh_exec",
+            &Demand {
+                rule: "r".into(),
+                root: false,
+            },
+            Some("t1"),
+            Approval::Ticket,
+        )
+    };
+    let (t1, t2, t3) = (mint(&old), mint(&old), mint(&new));
+
+    use_it(&old, &t1).unwrap();
+    let e = use_it(&new, &t1).unwrap_err();
+    assert!(e.message.contains("already used"), "{}", e.message);
+    use_it(&new, &t2).unwrap();
+    assert!(use_it(&old, &t2).is_err(), "spent by the other process");
+
+    old.verify_approver("ap0", &code(0)).await.unwrap();
+    assert!(
+        new.verify_approver("ap0", &code(0)).await.is_err(),
+        "TOTP step used by the other process"
+    );
+
+    // A third start compacts the file (a rename): both live ones follow.
+    let third = Approvals::with_keys(cfg, keyset(7));
+    assert!(use_it(&third, &t1).is_err() && use_it(&third, &t2).is_err());
+    use_it(&old, &t3).unwrap();
+    assert!(use_it(&new, &t3).is_err(), "after compaction");
+    assert!(use_it(&third, &t3).is_err());
+    new.verify_approver("ap0", &code(1)).await.unwrap();
+    assert!(old.verify_approver("ap0", &code(1)).await.is_err());
+    assert!(third.verify_approver("ap0", &code(1)).await.is_err());
+}
+
 /// An unwritable state file refuses ticketed calls (never accept a
 /// ticket whose use can't be recorded) and leaves the rest alone.
 #[tokio::test]

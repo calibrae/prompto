@@ -96,8 +96,48 @@ impl std::fmt::Display for Full {
 
 impl std::error::Error for Full {}
 
-/// Serialises the API directory's count-then-write.
+/// Serialises the API directory's count-then-write within the process;
+/// [`DirLock`] does it across processes.
 static API_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// An exclusive `flock` on a directory, released on drop: the API
+/// directory's count-then-write, across the two processes of a binary
+/// handover (`crate::drain`). `None` inside if the directory can't be
+/// locked; the in-process mutex still holds.
+pub struct DirLock(Option<std::fs::File>);
+
+impl DirLock {
+    pub fn take(dir: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+        let Ok(f) = std::fs::File::open(dir) else {
+            return Self(None);
+        };
+        loop {
+            // SAFETY: a valid open descriptor; flock has no other preconditions.
+            let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            if r == 0 {
+                return Self(Some(f));
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return Self(None);
+            }
+        }
+    }
+
+    pub fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            use std::os::fd::AsRawFd;
+            // SAFETY: as above.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
 
 /// What a kill switch applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -478,8 +518,10 @@ impl KillSwitch {
     /// that is already set is always fine: it only rewrites the reason).
     pub fn set_agent_session(&self, agent: &str, session: &str, reason: &str) -> Result<PathBuf> {
         let path = self.agent_session_path(agent, session)?;
-        create_private_dir(path.parent().context("kill file has no directory")?)?;
+        let dir = path.parent().context("kill file has no directory")?;
+        create_private_dir(dir)?;
         let _one = API_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let _all = DirLock::take(dir);
         if std::fs::symlink_metadata(&path).is_err() {
             let (global, pairs, other) = self.api_entries()?;
             let mine = pairs.iter().filter(|(a, _)| a == agent).count();
@@ -838,6 +880,31 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let k = KillSwitch::in_dir(d.path());
         (d, k)
+    }
+
+    /// The API directory's count-then-write waits for a lock another
+    /// process holds (a binary handover runs two), so the two can't both
+    /// count below the cap and both write.
+    #[test]
+    fn api_kills_wait_for_the_directory_lock() {
+        let (d, k) = ks();
+        let api = d.path().join("api-kill.d");
+        create_private_dir(&api).unwrap();
+        let held = DirLock::take(&api);
+        assert!(held.held());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            k.set_agent_session("alpha", "s1", "runaway").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "wrote while another process held the directory lock"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
     }
 
     #[test]
