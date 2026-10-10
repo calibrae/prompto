@@ -327,6 +327,19 @@ async fn precheck(s: &Server, tool: &str, args: Value) -> Value {
     v
 }
 
+/// Tests that compare codes across calls ("this one is already used")
+/// must not straddle a 30 s step boundary: wait out the end of a step.
+async fn settle() {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let left = 30_000 - ms % 30_000;
+    if left < 5_000 {
+        tokio::time::sleep(Duration::from_millis(left + 200)).await;
+    }
+}
+
 /// The TOTP code `steps` steps away from now.
 fn code(steps: i64) -> String {
     let now = ticket::unix_now() as i64 + steps * prompto::totp::STEP_SECS as i64;
@@ -996,6 +1009,7 @@ async fn an_agent_token_alone_never_gets_a_human_ticket() {
 #[tokio::test]
 async fn totp_codes_are_single_use_and_guessing_locks_out() {
     let s = spawn().await;
+    settle().await;
     let sudo = exec("t1");
     for step in [-2i64, 2] {
         let (st, v) = approve(&s, "ap0", &code(step), "ssh_sudo_exec", sudo.clone()).await;
@@ -1210,6 +1224,7 @@ async fn audit_records_ticket_hashes_not_tickets() {
 /// after it — once.
 #[tokio::test]
 async fn restart_keeps_tickets_valid_and_spent_ones_spent() {
+    settle().await;
     let dir = tempfile::tempdir().unwrap();
     let cfg = ApprovalConfig {
         key_vault_path: None,
