@@ -467,7 +467,9 @@ pub struct Record {
     /// The deciding rule's `approval` (`none` | `ticket` | `human`).
     pub approval: Option<&'static str>,
     /// Who approved (E6): the approver named in the call's ticket, or in
-    /// an `approve` record the approver who tried.
+    /// an `approve` record the approver who approved. A refused approval
+    /// has only the typed name's length and a short hash
+    /// (`approval::redacted`): it may be a code in the wrong field.
     pub approved_by: Option<String>,
     /// SHA-256 (hex) of the ticket the call carried, or that a precheck
     /// or approval minted — never the ticket itself, which is a bearer
@@ -1047,7 +1049,9 @@ impl AuditLog {
     }
 
     /// Append one line (which must end in `\n`) with a single write.
-    fn append(&self, line: &[u8]) -> io::Result<()> {
+    /// Public for records that are not [`Record`]s (`crate::agent_api`'s
+    /// kill records); it keeps the failure bookkeeping.
+    pub fn append(&self, line: &[u8]) -> io::Result<()> {
         let mut st = lock(&self.state);
         let res = match self.ensure_open(&mut st) {
             Err(e) => Err((e, Failure::Open)),
@@ -1356,9 +1360,13 @@ impl Operator {
         }
     }
 
-    /// `root (sudo: ops)`, `ops`, `uid 1234`.
+    /// `root (sudo: ops)`, `ops`, `uid 1234`; `agent builder` for a kill
+    /// an agent set over HTTP (`crate::agent_api`).
     pub fn display(r: &Value) -> String {
         let s = |k: &str| r.get(k).and_then(Value::as_str);
+        if let Some(a) = s("agent") {
+            return format!("agent {a}");
+        }
         let user = match (s("user"), r.get("uid").and_then(Value::as_u64)) {
             (Some(u), _) => u.to_string(),
             (None, Some(uid)) => format!("uid {uid}"),
@@ -1404,6 +1412,9 @@ pub struct KillRecord {
     pub scope: crate::kill::Scope,
     /// The agent, host or session; `null` for the global switch.
     pub target: Option<String>,
+    /// `agent_session`: the agent whose calls in session `target` stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// As the server will show it (`kill::sanitize_reason`); `null` for
     /// `off` and for a switch set without one.
     pub reason: Option<String>,
@@ -1428,6 +1439,7 @@ impl KillRecord {
             action: if on { "on" } else { "off" },
             scope,
             target: target.map(|t| clamp(t, MAX_FIELD)),
+            agent: None,
             reason: on
                 .then(|| crate::kill::sanitize_reason(reason))
                 .flatten()
@@ -1833,6 +1845,23 @@ pub fn table_row(r: &Value) -> [String; 8] {
     }
     let detail = if s("type") == "auth" {
         format!("{} {}", s("path"), s("reason"))
+    } else if s("type") == "audit_read" {
+        // GET /v1/audit: what the agent asked for, and what it got.
+        let q = |k: &str| match r.pointer(&format!("/query/{k}")) {
+            Some(Value::String(v)) => format!(" {k}={v}"),
+            Some(Value::Number(n)) => format!(" {k}={n}"),
+            _ => String::new(),
+        };
+        let got = match r.get("count").and_then(Value::as_u64) {
+            Some(n) => format!("{n} records"),
+            None => s("refused").to_string(),
+        };
+        format!(
+            "read its records:{}{}{} -> {got}",
+            q("host"),
+            q("session"),
+            q("limit")
+        )
     } else {
         let args = r.get("args").cloned().unwrap_or(Value::Null);
         let cmd = ["cmd", "commands", "script", "task"]
@@ -1871,6 +1900,7 @@ pub fn table_row(r: &Value) -> [String; 8] {
         cell(s("agent"), CELL_MAX),
         match s("type") {
             "auth" => "(auth)".into(),
+            "audit_read" => "(audit read)".into(),
             // Not a call that ran: say what it was.
             t @ ("precheck" | "approve") => cell(&format!("{t}:{}", s("tool")), CELL_MAX),
             _ => cell(s("tool"), CELL_MAX),
@@ -2576,6 +2606,21 @@ mod tests {
         assert_eq!(table_row(&v)[3], "-");
         assert_eq!(table_row(&v)[7], "kill=global");
         assert!(!f("web1").matches(&v));
+    }
+
+    #[test]
+    fn an_audit_read_is_a_row_of_its_own() {
+        let ok = json!({ "ts": "2026-10-10T12:00:00.000Z", "type": "audit_read", "agent": "alpha",
+                         "query": { "host": "t1", "session": null, "limit": 5 }, "count": 2, "ok": true });
+        let row = table_row(&ok);
+        assert_eq!(
+            (row[1].as_str(), row[2].as_str()),
+            ("alpha", "(audit read)")
+        );
+        assert_eq!(row[7], "read its records: host=t1 limit=5 -> 2 records");
+        let no =
+            json!({ "type": "audit_read", "agent": "alpha", "query": {}, "refused": "too many" });
+        assert_eq!(table_row(&no)[7], "read its records: -> too many");
     }
 
     /// A file the CLI creates but can't hand to its directory's owner

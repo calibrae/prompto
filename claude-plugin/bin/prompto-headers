@@ -1,0 +1,51 @@
+#!/bin/sh
+# prompto-headers [token-file]: print prompto's Authorization header as the
+# JSON object a Claude Code headersHelper returns.
+#
+# The token file (default $PROMPTO_TOKEN_FILE, else ~/.config/prompto/token)
+# must be a regular file owned by this user, mode 0600 (or 0400): anything
+# group- or world-readable is refused, so a mistake fails loudly instead of
+# leaking the role token. A mode with an ACL marker (`+`, or macOS's `@`)
+# passes only when the ACL grants nobody else read; when that can't be
+# told (no getfacl, no `ls -e`), it is refused. Its first line is the token.
+#
+# The checks and the read are separate steps on the path (POSIX sh has no
+# fstat): a file swapped in between would be read unchecked. Only someone
+# who can write the token's directory can do that, and they can already
+# replace the token.
+f=${1:-${PROMPTO_TOKEN_FILE:-$HOME/.config/prompto/token}}
+case $f in "~/"*) f=$HOME/${f#"~/"} ;; esac
+die() { echo "prompto-headers: $*" >&2; exit 1; }
+
+# Does the ACL of $1 let nobody but its owner read it? Unknown is no.
+acl_private() {
+  if command -v getfacl >/dev/null 2>&1; then
+    # Linux: user::, mask:: aside, no entry may grant read.
+    acl=$(getfacl -cpn -- "$1" 2>/dev/null) || return 1
+    printf '%s\n' "$acl" | grep -Eq '^(user:[^:]+|group:[^:]*|other:[^:]*):r' && return 1
+    return 0
+  fi
+  # macOS: `ls -le` lists the ACL entries under the file's line.
+  acl=$(ls -led -- "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$acl" | sed 1d | grep -Eq 'allow.*read' && return 1
+  return 0
+}
+
+[ -f "$f" ] || die "no token file $f (put the role token there, mode 0600)"
+[ -L "$f" ] && die "$f is a symlink; use the file itself"
+# shellcheck disable=SC2012 # ls -ln is the portable way to read mode and uid
+set -- $(ls -ln -- "$f")
+case $1 in
+  # `.`: an SELinux context, which grants nothing.
+  -rw-------|-r--------|-rw-------.|-r--------.) ;;
+  -rw-------[+@]|-r--------[+@])
+    acl_private "$f" || die "$f is mode $1: an ACL or extended attributes may let others read it (setfacl -b $f, or chmod -N $f on macOS)" ;;
+  *) die "$f is mode $1: it must be readable by you only (chmod 600 $f)" ;;
+esac
+[ "$3" = "$(id -u)" ] || die "$f is owned by uid $3, not you ($(id -u))"
+tok=$(head -n 1 -- "$f" | tr -d '\r\n\t ')
+[ -n "$tok" ] || die "$f is empty"
+case $tok in
+  *[!A-Za-z0-9_.~+/=-]*) die "$f does not hold a token (unexpected characters)" ;;
+esac
+printf '{"Authorization": "Bearer %s"}\n' "$tok"

@@ -1,0 +1,12 @@
+{
+  "name": "prompto",
+  "owner": { "name": "calibrae" },
+  "metadata": { "description": "The Claude Code plugin of prompto (homelab MCP server)" },
+  "plugins": [
+    {
+      "name": "prompto",
+      "source": "./",
+      "description": "prompto in Claude Code: session context, prechecks and tickets, the approval pane, /prompto"
+    }
+  ]
+}

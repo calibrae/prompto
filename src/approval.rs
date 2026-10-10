@@ -436,11 +436,20 @@ impl State {
     }
 }
 
+/// A rejected approver string as logs and audit records show it: its
+/// length and a short hash, never the text — it may be a TOTP code typed
+/// into the wrong field, or a guess at a name.
+pub fn redacted(name: &str) -> String {
+    let hash = crate::agent::hex(&crate::agent::sha256(name.as_bytes()));
+    format!("<{} chars, sha256 {}>", name.chars().count(), &hash[..12])
+}
+
 /// Why `/v1/approve` refused.
 #[derive(Debug)]
 pub enum ApproveError {
-    /// Locked out until (unix seconds).
-    Locked(String, u64),
+    /// Locked out until (unix seconds). The message names no approver:
+    /// the name was the caller's to type, and may not be one.
+    Locked(u64),
     /// Wrong, reused or expired code, unknown or revoked approver.
     Refused(String),
     /// The approver's secret or the state file could not be read; not
@@ -912,7 +921,7 @@ impl Approvals {
         // is keyed by name).
         if crate::agent::validate_name("approver", name).is_err() {
             tracing::warn!(
-                approver = %crate::audit::clamp(name, 64),
+                approver = %redacted(name),
                 "approval refused: malformed approver name"
             );
             return Err(ApproveError::Refused(INVALID.into()));
@@ -930,7 +939,7 @@ impl Approvals {
             .unwrap_or_else(|e| e.into_inner())
             .locked(name, known, now)
         {
-            return Err(ApproveError::Locked(name.to_string(), until));
+            return Err(ApproveError::Locked(until));
         }
         let fail = |why: &str| {
             let locked = i
@@ -938,15 +947,21 @@ impl Approvals {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .fail(name, known, now);
+            // An unknown name may be a code typed into the wrong field.
+            let shown = if known {
+                name.to_string()
+            } else {
+                redacted(name)
+            };
             tracing::warn!(
-                approver = name,
+                approver = %shown,
                 known,
                 why,
                 locked = locked.is_some(),
                 "approval refused"
             );
             match locked {
-                Some(until) => ApproveError::Locked(name.to_string(), until),
+                Some(until) => ApproveError::Locked(until),
                 None => ApproveError::Refused(why.to_string()),
             }
         };

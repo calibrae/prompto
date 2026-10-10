@@ -54,12 +54,16 @@ use serde_json::{Map, Value, json};
 #[derive(Clone)]
 pub struct ApiState {
     pub store: InventoryStore,
+    /// `PROMPTO_AUTH` (`crate::agent_api` needs to tell `off` apart).
+    pub mode: crate::agent::AuthMode,
     /// `None` with `PROMPTO_AUTH=off`: no policy, so nothing needs an
     /// approval.
     pub policy: Option<Enforcer>,
     pub approvals: Approvals,
     pub audit: Audit,
     pub kill: crate::kill::KillSwitch,
+    /// `GET /v1/audit`'s per-agent rate limit.
+    pub reads: crate::agent_api::ReadLimit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +226,16 @@ fn call_ctx(
     Ok(ctx)
 }
 
+/// A body axum couldn't take: 413 when it is over the route's limit,
+/// else 400 with the reason.
+pub(crate) fn body_rejected(e: JsonRejection) -> Response {
+    let status = match e.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, Json(json!({ "error": e.body_text() }))).into_response()
+}
+
 fn bad_request(msg: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -263,7 +277,7 @@ pub async fn precheck(
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return bad_request(e.body_text()),
+        Err(e) => return body_rejected(e),
     };
     let ctx = match call_ctx(&headers, &req.tool, req.arguments, req.session) {
         Ok(c) => c,
@@ -284,6 +298,9 @@ pub async fn precheck(
             covered,
         } => {
             out["approval"] = required.as_str().into();
+            // Whether the call is root-capable: a client offering "approve
+            // similar calls" needs to know (a root scope is opt-in).
+            out["root"] = notes_root(&ctx).into();
             if covered {
                 out["reason"] = "the ticket in `arguments` is valid for this call".into();
                 ("allow", None, None, rule)
@@ -391,7 +408,7 @@ pub async fn approve(
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return bad_request(e.body_text()),
+        Err(e) => return body_rejected(e),
     };
     let ctx = match call_ctx(&headers, &req.tool, req.arguments, req.session) {
         Ok(c) => c,
@@ -410,7 +427,12 @@ pub async fn approve(
             rec.rule = rule.clone();
         }
         rec.approval = Some(Approval::Human.as_str());
-        rec.approved_by = Some(approver.clone());
+        // Who approved; for a refusal only a trace of what was typed.
+        rec.approved_by = Some(if minted.is_some() {
+            approver.clone()
+        } else {
+            crate::approval::redacted(&req.approver)
+        });
         rec.scope_minutes = req.scope_minutes;
         rec.ticket_sha256 = minted.as_ref().map(|(t, _)| sha256_hex(t));
         rec.reason = Some(reason.clone());
@@ -492,10 +514,10 @@ pub async fn approve(
         .await
     {
         let (status, msg) = match e {
-            ApproveError::Locked(name, until) => (
+            ApproveError::Locked(until) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "approver {name} is locked out after too many wrong codes, until {}",
+                    "this approver is locked out after too many wrong codes, until {}",
                     chrono::DateTime::from_timestamp(until as i64, 0)
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_default()

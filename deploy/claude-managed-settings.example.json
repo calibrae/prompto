@@ -1,0 +1,22 @@
+{
+  "extraKnownMarketplaces": {
+    "prompto": {
+      "source": { "source": "directory", "path": "/opt/prompto/claude-plugin" }
+    }
+  },
+  "enabledPlugins": {
+    "prompto@prompto": true
+  },
+  "prependPlugins": ["cc-plugin-sec-default@builtin", "prompto@prompto"],
+  "//": "To allow only the mods the organization installs, rename the next key to allowManagedModsOnly. It blocks every other plugin's mod, the person's own included.",
+  "//allowManagedModsOnly": true,
+  "pluginConfigs": {
+    "prompto@prompto": {
+      "options": {
+        "url": "https://prompto.example.com/mcp",
+        "token_file": "~/.config/prompto/token",
+        "servers": "prompto"
+      }
+    }
+  }
+}

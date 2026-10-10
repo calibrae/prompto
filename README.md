@@ -60,7 +60,8 @@ For HTTP transport (default):
 
 ```bash
 PROMPTO_INVENTORY=./prompto.toml ./target/release/prompto
-# listens on 0.0.0.0:6337 — POST /mcp, GET /log, POST /v1/precheck, POST /v1/approve
+# listens on 0.0.0.0:6337 — POST /mcp, GET /log, POST /v1/precheck, POST /v1/approve,
+# GET /v1/whoami, GET /v1/audit, POST /v1/kill
 ```
 
 ## Inventory
@@ -275,7 +276,7 @@ prompto policy check --agent builder --host build-2 --tool file_write --sudo
 
 ## Tickets and approvals
 
-A policy rule can demand more than a match: `approval = "ticket"` (the call must be prechecked) or `approval = "human"` (a person must approve this exact call). The proof is a **ticket**: a short string prompto signs, which the client passes back as the call's `ticket` argument. Every tool accepts it; it is not in the tools' advertised schemas (it would cost every client tokens on every `tools/list`); the Claude Code plugin (roadmap E7) will add it for you. Enforcement is always prompto's: a call without a valid ticket is refused wherever policy demands one, whatever the client does.
+A policy rule can demand more than a match: `approval = "ticket"` (the call must be prechecked) or `approval = "human"` (a person must approve this exact call). The proof is a **ticket**: a short string prompto signs, which the client passes back as the call's `ticket` argument. Every tool accepts it; it is not in the tools' advertised schemas (it would cost every client tokens on every `tools/list`); the [Claude Code plugin](#claude-code-plugin) adds it for you. Enforcement is always prompto's: a call without a valid ticket is refused wherever policy demands one, whatever the client does.
 
 **The flow:**
 
@@ -287,7 +288,7 @@ POST /v1/approve   {tool, arguments, approver, totp_code[, scope_minutes[, allow
 call with {…arguments, "ticket": "pt1.…"}      ──► runs, once
 ```
 
-**`POST /v1/precheck`** (same bearer token and `X-Prompto-Session` as `/mcp`; body `{"tool": …, "arguments": {…}, "session": optional}`) runs the call's whole authorization — kill switches, host, capability, self-targeting guard, policy, and any `ticket` already in `arguments` — and **runs nothing**: no SSH, no ticket spent. It answers `{"decision": "allow" | "deny" | "ask", "rule", "reason", "approval", "request_id"}`, plus `error_class` on `deny` and `ticket` + `expires_at` when a `ticket` rule allowed it. `session` in the body, if sent, must match the header.
+**`POST /v1/precheck`** (same bearer token and `X-Prompto-Session` as `/mcp`; body `{"tool": …, "arguments": {…}, "session": optional}`) runs the call's whole authorization — kill switches, host, capability, self-targeting guard, policy, and any `ticket` already in `arguments` — and **runs nothing**: no SSH, no ticket spent. It answers `{"decision": "allow" | "deny" | "ask", "rule", "reason", "approval", "request_id"}`, plus `error_class` on `deny`, `ticket` + `expires_at` when a `ticket` rule allowed it, and on `allow` / `ask` `root`: whether the call is root-capable (a client offering "approve similar calls" needs it: a root scope is opt-in). `session` in the body, if sent, must match the header.
 
 **`POST /v1/approve`** (body `{"tool", "arguments", "session"?, "approver", "totp_code", "scope_minutes"?, "allow_root_scope"?}`) re-runs the same authorization (no approval for a call policy denies; `409` when no approval is needed), checks the approver's code, and returns a ticket with `approval = "human"` and `approved_by = <approver>`. Status: `200`; `403` deny or wrong code; `429` approver locked out; `400` bad request; `503` tickets unavailable.
 
@@ -349,6 +350,16 @@ sudo prompto approver add bob --replace           # re-enroll (lost phone)
 - **The startup check.** prompto treats the **whole of `PROMPTO_VAULT_MOUNT`** (default `secret`, the sudo passwords' mount) as agent-readable: agent gateways tend to cover more and more of it (`prompto/`, `infra/`, `ai/`, `personal/`, …), and a list of prefixes goes stale silently. The private mount is the only valid home for the ticket key and TOTP secrets. `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` adds more locations agents can read, as `<mount>:<prefix>` (`<mount>:` = all of it); a bare prefix means the shared mount, which is covered already. Prefixes match like a vault policy glob, as plain string prefixes. If the ticket key or an active approver's secret is agent-readable, prompto **turns approvals off** — nothing is minted or accepted, calls that need a ticket are refused saying the operator must move a secret — and logs `APPROVALS DISABLED — …` with the path and what to do. It checks at startup, every minute, on SIGHUP and at every approval (`approvers.toml` is re-read each time). Add every other mount your agents' vault access covers; prompto can't see other tokens' policies.
 - **Files** (`totp_file`, `PROMPTO_TICKET_KEY_FILE`) must be owned by the service user, mode `0600` (prompto refuses group/other-readable ones), in a directory only it can enter. **Anyone who is root on the machine running prompto reads them — and `/etc/prompto/env`, whose vault token reads the private mount.** So does any agent that policy lets run root there, or a shell as a user that can sudo there. Mark that machine `prompto_host = true` in the inventory: `policy lint` then reports every such grant — and every grant of a shell or file tool there as the service user itself — as an error (see [Policy](#policy-policytoml)), and approvals stay off while one is in the live policy, unless the rule says `crown_jewel_ack = true`. Don't run prompto on a machine agents administer.
 
+## What an agent may ask about itself
+
+Behind the same authentication as `/mcp`, for clients such as the [Claude Code plugin](#claude-code-plugin):
+
+- **`GET /v1/whoami`** → `{"agent", "groups", "session", "auth"}`: what prompto sees for this token and `X-Prompto-Session` (`agent: null` with `PROMPTO_AUTH=off`).
+- **`GET /v1/audit?host=&session=&limit=`** → `{"records", "count", "truncated"}`: the caller's **own** audit records (calls, prechecks, approvals and the kills it set), newest last; `limit` 1–200, default 20; only the live log's last 8 MiB are searched (`truncated` says the window was full), off the async runtime. Without `host` that is every record of its own, on every host: they are its own, so nothing is gated. With `host`, policy must grant the agent some host-targeting tool there (the `inventory_list` rule): an agent taken off a host doesn't read its history there, and unknown hosts are refused the same way (403). `anonymous` and `PROMPTO_AUTH=off` get 403: there is no identity to filter on. Records are as stored (already redacted). At most 30 reads per agent per minute (429 beyond), and every read, served or refused, is itself an [`audit_read` record](#audit-log).
+- **`POST /v1/kill`**: see [Kill switches](#kill-switches).
+
+Bodies are small: 64 KiB at most for these three (413 beyond); `/v1/precheck` and `/v1/approve` carry a whole call's arguments, `file_write`'s content included, and take up to 2 MiB.
+
 ## `GET /log`
 
 ```
@@ -381,6 +392,8 @@ Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (
 - **`auth_note`:** with `PROMPTO_AUTH=optional`, a caller whose token is revoked or invalid runs as `anonymous`; its records say so (`"auth_note": "revoked token for builder"` / `"invalid token"`).
 - **Bounded:** every string a client chooses (a typed host name, an unknown tool name, `User-Agent`, the session header, `path`, `reason`) is scrubbed as above and cut to 256 chars (`path`: 512).
 - **`kill`:** a call refused by a [kill switch](#kill-switches) (`error_class: "killed"`, `decision: "deny"`) carries the switch: `"kill": {"scope": "host", "target": "build-1", "since": "2026-10-09T12:00:00Z", "reason": "disk failing"}` (`scope` is `global`, `agent`, `host` or `session`; `global` has no `target`). journald: `AUDIT_KILL_SCOPE`, `AUDIT_KILL_TARGET`, `AUDIT_KILL_REASON`. The `prompto audit` table shows `kill=<scope> <target>` in the detail column.
+- **Audit reads:** each `GET /v1/audit` is a `"type": "audit_read"` record: `agent`, `session_id`, `client_ip`, `user_agent`, the `query` (`host`, `session`, `limit`), and `count` and `truncated` (served, `decision: "allow"`) or `refused` (`decision: "deny"`: no grant on the host, or the rate limit). The table shows `(audit read)` with what was asked and how many records came back. They are not themselves handed back by `/v1/audit`.
+- **Refused approvers:** an `approve` record, or an HTTP global kill, whose approval was refused names no approver: `approved_by` is the typed name's length and a short hash (`<6 chars, sha256 1a2b3c4d5e6f>`), because what was typed may be a TOTP code in the wrong field, or a guess at a name. The journal does the same for unknown and malformed names (a known approver with a wrong code is named there).
 - **Kill switch changes** made with `prompto kill`/`unkill` are `"type": "kill"` records written by the CLI: `{"ts":…,"type":"kill","request_id":…,"action":"on","scope":"host","target":"build-1","reason":"disk failing","file":"/etc/prompto/kill.d/host-build-1","by":{"uid":0,"user":"root","sudo_user":"alice"}}`. See [kill switches](#kill-switches).
 - **`aborted`:** a call cut off before it finished (prompto shut down or the handler panicked mid-call) still gets its record, with `error_class: "aborted"`. Whether the action took effect is unknown.
 
@@ -423,6 +436,8 @@ prompto kill status                                 # what is on, since when, wh
 | agent | `kill.d/agent-<name>` | every call by that agent, everywhere |
 | host | `kill.d/host-<name>` | every call that targets the host (`host`, `client`, rsync's `source_host` and `dest_host`), by any agent; `GET /log` for it (403) |
 | session | `kill.d/session-<id>` | every call carrying that `X-Prompto-Session` |
+| an agent's own session | `$PROMPTO_KILL_API_DIR/session-<agent>.<id>` | that agent's calls carrying that session (set with `POST /v1/kill`, below) |
+| global, over HTTP | `$PROMPTO_KILL_API_DIR/global` | every tool call (set with `POST /v1/kill` and an approver's TOTP code) |
 
 - **The file is the switch.** `kill.d` sits next to the global file (`/etc/prompto/kill.d`, or `PROMPTO_KILL_DIR`). A file's existence is what counts; its first line, if any, is the reason (shown with control characters removed, cut to 200 chars) and its mtime the time it was set. Writing the files by hand works exactly like the CLI: `sudo touch /etc/prompto/kill`, `echo "disk" | sudo tee /etc/prompto/kill.d/host-build-1`. The CLI writes them `0644` (`kill.d` `0755`) so the service can read them; it only ever reads them (`ProtectSystem=strict` makes `/etc` read-only to it anyway).
 - **Checked first, on every call.** Before argument parsing, the host lookup, the self-targeting guard, policy and the audit preflight. A killed call says it is killed, not why it would have failed otherwise, and a broken audit log can't stop a kill. Cost: a `stat` per applicable file per call; nothing is cached, so there is nothing to reload.
@@ -438,6 +453,15 @@ prompto kill status                                 # what is on, since when, wh
 - **A switch the server can't check fails closed.** At startup, if the service user can't `stat` the global file or search `kill.d` (any error other than "absent": permission denied, a symlink loop), prompto **refuses to start**, naming the path: fix the permissions, or point `PROMPTO_KILL_FILE` / `PROMPTO_KILL_DIR` somewhere it can. With the standard install (`/etc/prompto` `0750 root:prompto`) it can. If a path becomes uncheckable while running, every call that needs it is refused as `killed`, reason `kill switch unreadable: <path>: <error>` (`"unreadable": true` in the record's `kill`), and the journal gets `KILL SWITCH UNREADABLE` (at most once a minute; each refusal is logged too).
 - **Who set it is audited.** Each `prompto kill …` / `unkill …` that changes a switch appends a `"type": "kill"` record to the audit log: `action` (`on`/`off`), `scope`, `target`, `reason`, the kill `file`, and `by` (the real uid, its name, and `SUDO_USER` when run through sudo). `prompto audit` shows them as `(kill)` rows with the operator in the agent column. The CLI appends without touching the file's owner or mode; if the file doesn't exist it creates it as the server would (`0640`, owned by the owner of its directory, group `PROMPTO_AUDIT_GROUP` or the directory's). If the record can't be written the switch **still applies** and the CLI says so on stderr: the panic button wins. A switch made by hand (`touch`) has no such record; the calls it refuses are recorded either way.
 
+**From the agent's side: `POST /v1/kill`** (same bearer token and `X-Prompto-Session` as `/mcp`; the Claude Code plugin's `/prompto kill`). The server can't write `/etc/prompto` (`ProtectSystem=strict`), so these switches live in `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`, inside the state directory), and are checked, listed (`prompto kill status`) and probed at startup like the others.
+
+- `{"scope": "session", "reason"?}` stops **the caller's own** calls in **its own** session: the switch names the agent *and* the session, so another agent claiming the same session ID is not stopped (the session is context, not proof). It needs a named agent (`anonymous` and `PROMPTO_AUTH=off` get 403) and a session (header or `session` in the body, which must agree). **It stops a cooperative session, not a determined agent:** `X-Prompto-Session` is the client's word, so an agent that sends another session ID goes on. It is the plugin's "stop this session" button; `prompto kill agent <name>` is the real stop. An agent holds at most 100 live session kills (and the directory 1000 switches in all): beyond that it gets 429 until an operator lifts some.
+- `{"scope": "global", "approver", "totp_code", "reason"?}` stops every call, as `prompto kill on`. The role token alone can't do this: the code is checked like an approval's (single-use, lockout after 5 wrong codes); 400 without one, 403 wrong, 429 locked out, 503 when approvals are off.
+- `reason` is cut to 256 characters, its first line only, with control and bidi characters removed. Bodies over 64 KiB get 413.
+- Neither can be lifted over HTTP. `prompto kill off` lifts the global one too, and `prompto unkill session <id>` every agent's kill of that session.
+- Each one, refused attempts included, is a `"type": "kill"` audit record with `by: {agent, session_id, client_ip}` (and `approved_by` for the global one; for a refused one, only a length and a hash of what was typed).
+- **That directory is the service's own:** prompto creates it `0700` and its switches `0600`, owned by the user it runs as (one left `0755` by an earlier version is tightened at the next write). So `prompto kill status` and `unkill session` need root there, as with `sudo`. Anything running as the prompto user can lift an HTTP kill: that is the service itself, which could stop enforcing anyway. The operator's switches (`/etc/prompto/kill`, `kill.d`) stay root-owned and out of its reach.
+
 **Which tool for which job:**
 
 | To stop… | Do | Effective |
@@ -447,7 +471,8 @@ prompto kill status                                 # what is on, since when, wh
 | one agent, for good | `prompto agent revoke <name>` (the token is refused with 401 / runs as `anonymous`) | next request |
 | one host, every agent | `prompto kill host <name>`, or drop it from the inventory + SIGHUP | next call |
 | one agent on one host | drop the host from that agent's policy rules (no SIGHUP needed) | next call |
-| one runaway Claude session | `prompto kill session <id>` (the `session_id` in its audit records) | next call |
+| one runaway Claude session | `prompto kill session <id>` (the `session_id` in its audit records), or `/prompto kill` in it | next call |
+| everything, from an agent's terminal | `/prompto kill global` + an approver's TOTP code | next call |
 
 ## Token-savings analytics
 
@@ -485,6 +510,7 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_AUDIT_GROUP` | unset | Group (name or gid) for an audit file prompto creates itself. |
 | `PROMPTO_KILL_FILE` | `/etc/prompto/kill` | The global [kill switch](#kill-switches). Also used by `prompto kill`. |
 | `PROMPTO_KILL_DIR` | `<PROMPTO_KILL_FILE>.d` | Agent, host and session kill switches. |
+| `PROMPTO_KILL_API_DIR` | `/var/lib/prompto/kill.d` | The kill switches `POST /v1/kill` sets (an agent's own session; the global one with an approver's code). Must be writable by the service (under `ReadWritePaths`); missing is fine. Created `0700`, switches `0600`. Also used by `prompto kill` (as root). |
 | `PROMPTO_TICKET_KEY_VAULT_PATH` | unset | KV v2 path, on `PROMPTO_PRIVATE_MOUNT`, of the [ticket](#tickets-and-approvals) signing keys (fields `current`, `previous`). Setting this or the next enables tickets (with `PROMPTO_AUTH` on). |
 | `PROMPTO_TICKET_KEY_FILE` | unset | The same keys in an owner-only file (current, then previous). The fallback when vault can't be read. |
 | `PROMPTO_APPROVERS` | `/etc/prompto/approvers.toml` | Human approvers and where their TOTP secrets are. Read at every approval. Also used by `prompto approver`. |
@@ -537,6 +563,31 @@ claude mcp add-json --scope user prompto \
 ```
 
 Keep `token` at `0600`. Rotating then means replacing one file, and the token never appears in Claude Code's config or a shell history.
+
+## Claude Code plugin
+
+`claude-plugin/` is a Claude Code plugin (a *mod*, Claude Code ≥ 2.1.295) for prompto. **It is UX and context, never the boundary**: prompto checks every call whatever the plugin does, and a session without it (`--safe-mode`, another client) simply gets `approval_required` where a ticket is needed. What it adds:
+
+- **The session on every call.** Claude Code's own MCP connection takes its headers once, from a `headersHelper` that runs before any session exists (and never learns the session ID). So by default (`transport = "mod"`) the plugin sends prompto calls itself, over HTTP, with the role token and `X-Prompto-Session: <Claude session ID>`, and hands the result back as the tool's. The session is what makes the audit trail, `/prompto kill` and scoped approvals useful, which is why `mod` is the default. Claude Code's permission verdict for the tool still applies (a rule that denies it denies it; an `ask` is put to the person).
+
+  **The trade-off, plainly:** in `mod`, Claude Code never sends prompto calls itself, so **your settings' `PreToolUse`/`PostToolUse` hooks don't see them, and in auto mode the classifier doesn't judge them** (an `ask` goes to the person instead). If you rely on either for prompto's tools, set `transport = "engine"`: calls then go over Claude Code's own connection, hooks and classifier included, with the ticket added, but without a session (no scoped approvals, no `/prompto audit` or `/prompto kill` of the session).
+- **Precheck and tickets.** Before each call it asks `/v1/precheck` about exactly the arguments it will send. On `deny` the call is refused with prompto's reason and rule. On `allow` it is sent, with the ticket if prompto minted one. It never adds or changes an argument after the precheck: a ticket covers those arguments only. If the precheck can't be reached, the call is sent anyway without a ticket, and prompto decides. A call that needs a ticket then comes back `approval_required`, with a note saying why none was requested. That is safe because prompto enforces; refusing would only break calls that need nothing. If nothing can be sent at all (no token, or the hook failed), the call is refused, never sent another way.
+- **The approval pane.** For `ask` (a `human` rule), Claude Code's own verdict comes first: a call its settings deny is refused without asking anyone for a code, and an `ask` is put to the person before the pane. The pane then shows **everything the ticket will cover**: the host, the tool, the rule that asked, the command (`cmd`, `script`, `commands` or `task`) first and highlighted, then **every other argument** (`timeout_secs`, `args`, `sudo`, `mode`…), none left out. For `file_write`, a **diff** against the current file, read with `file_read` through prompto (so policy applies to that read too) and only when Claude Code's settings allow `file_read` outright; otherwise, or when the diff is too long to draw, the **whole new content**. A value over 32 KiB is drawn as its head with its size and SHA-256 and a warning: *content truncated in this view: you are approving all N bytes*. Everything drawn (arguments, reasons, prompto's messages, audit lines) has terminal control and bidi characters (U+202A–U+202E, U+2066–U+2069, …) shown as escapes (`\x1b`, `\u{202e}`), never acted on. Below that, the agent's last calls on that host (`/v1/audit`). The person types their approver name and **TOTP code**, then picks **Approve once**, **Approve N minutes** (`scope_minutes`; for a root-capable call only after ticking the explicit root-scope toggle), or **Deny** with a reason the model reads. Esc or closing the pane denies. The call waits up to 10 minutes; if the plugin reloads meanwhile, the call is lost and its pane item says *stale* (Deny dismisses it; ask the agent to retry). The code exists only in the plugin's memory between the keystroke and `POST /v1/approve`. It is never stored, logged, drawn back, put in a tool argument or written to the transcript. It **is visible while being typed**: Claude Code 2.1.295 has no masked input, which is accepted for now; approving on a separate device (another factor behind prompto's approver interface) is the direction for later. A code-shaped value typed into the name or reason field (`123456`, `123 456`, `12-34-56`) is refused, cleared and never sent; prompto itself never records a refused approver name, only its length and a hash. In a non-interactive session (`claude -p`) a human-approval call is refused at once.
+- **`/prompto`**: `whoami`; `audit [n]` (this session's calls); `kill [reason]` (stop this agent's calls in this session; an operator lifts it. It stops a cooperative session, this plugin's: the session ID is the client's word, so `prompto kill agent <name>` is the real stop); `kill global` (everything, with an approver's code in the pane); `approve` (reopen the pane).
+- **A skill** (`prompto-tools`) that teaches the agent to prefer typed tools to `ssh_exec`, never to target its own machine, how tickets and approvals work, and what each `error_class` means.
+
+**Install** (one machine, from a clone):
+
+```bash
+install -d -m 0700 ~/.config/prompto
+( umask 077; cat > ~/.config/prompto/token )          # the role token, then Ctrl-D
+claude plugin marketplace add /path/to/prompto/claude-plugin
+claude plugin install prompto@prompto
+```
+
+Then set its options (`/plugin configure prompto@prompto`, or `pluginConfigs` in settings): `url` (prompto's `…/mcp`), `token_file` (default `~/.config/prompto/token`; must be yours, mode 0600. **Keep the token at the default path**: Claude Code 2.1.295 runs the MCP connection's `headersHelper` with neither the plugin's options nor its `env`, nor the settings' `env`, so that connection, which lists prompto's tools, only finds the token there. `token_file` is honoured by the plugin's own requests, and the plugin says so in the log when the connection fails with `token_file` set elsewhere), `servers` (other MCP server names that are this prompto, comma-separated, if you also registered it with `claude mcp add`), `transport` (`mod` or `engine`) and `scope_minutes` (default 10). The plugin registers its own MCP server for `url`, whose `headersHelper` is `bin/prompto-headers`. That script refuses a token file anyone else can read: a mode other than `0600`/`0400`, a symlink, another owner, or an ACL (`+`, or macOS's `@`) granting anyone else read; when it can't inspect the ACL (no `getfacl`, no `ls -e`) it refuses too. If you already added prompto with `claude mcp add` at the same URL, Claude Code keeps yours and drops the plugin's duplicate; list your server's name in `servers`. The plugin checks at the start of each session and, when `servers` doesn't name the server Claude Code kept, says so in a toast and the log: those calls would otherwise bypass it. For development, `claude --plugin-dir claude-plugin` loads it for one session; `claude plugin test claude-plugin` runs its tests (a stubbed prompto, no network).
+
+**Managed deployment** (agent machines): `deploy/claude-managed-settings.example.json` is an example for Claude Code's managed settings (`/etc/claude-code/managed-settings.json` on Linux, `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS). It declares the plugin's folder as a local marketplace, enables the plugin and seats it with `prependPlugins` (keeping `cc-plugin-sec-default@builtin`, Claude Code's own security plugin, first), so a person's own plugins sit beneath it and can't rewrite its calls. `allowManagedModsOnly` (in the example as a disabled `//allowManagedModsOnly` key: JSON has no comments) stops every mod the organization didn't install from loading, the person's own included; rename the key to turn it on. Claude Code seats a plugin as the organization's only when it is read in place from a local directory marketplace that lists it by a relative path, as here. A plugin installed from a copy (cache, archive, git) runs in the user tier. Even seated first, the plugin is only convenience: a person who removes it, or runs `--safe-mode`, loses the session context and the pane, and their ticketed calls are refused by prompto.
 
 ## Deployment
 
