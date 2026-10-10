@@ -8,7 +8,7 @@
 //!     --url http://sbx-core:6337 --tokens ~/.config/prompto/loadgen \
 //!     --secs 1800 --out calls.jsonl [--events events.txt] \
 //!     [--long-min 60 --long-max 180] [--host sbx-t1 --vault-host sbx-t2 \
-//!      --refused-host sbx-bsd]
+//!      --refused-host sbx-bsd] [--retry-secs 0]
 //! ```
 //!
 //! `--tokens` is a directory of token files, one per agent, mode 0600,
@@ -30,7 +30,13 @@
 //!
 //! Half the agents speak the 2026-07-28 stateless protocol, half do an
 //! `initialize` first like older clients. Connections are pooled and
-//! reused like a real client's; nothing is retried.
+//! reused like a real client's. Nothing is retried unless `--retry-secs`
+//! is given: then, as a client should across a plain restart, a request
+//! that provably did not run — the connection was refused, or prompto
+//! answered `503` with `Retry-After` while draining — is sent again,
+//! once a second, for up to that long. A request that may have run (a
+//! reset or a timeout after it was sent) is never retried. Retries are
+//! counted per call and in the summary.
 //!
 //! Each call is one JSON line in `--out`. At the end a summary (counts and
 //! latencies per call type, every unexpected outcome) goes to stdout.
@@ -57,6 +63,7 @@ struct Cfg {
     host: String,
     vault_host: String,
     refused_host: String,
+    retry_secs: u64,
 }
 
 #[derive(Clone)]
@@ -131,6 +138,7 @@ struct Rec {
     agent: String,
     outcome: String,
     detail: String,
+    retries: u32,
 }
 
 fn now_ms() -> u64 {
@@ -169,7 +177,17 @@ impl Run {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn record(&self, agent: &Agent, kind: &'static str, t: u64, ms: u64, ok: bool, o: &Outcome) {
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        agent: &Agent,
+        kind: &'static str,
+        t: u64,
+        ms: u64,
+        ok: bool,
+        o: &Outcome,
+        retries: u32,
+    ) {
         let rec = Rec {
             t,
             kind,
@@ -178,10 +196,11 @@ impl Run {
             agent: agent.name.clone(),
             outcome: o.label(),
             detail: if ok { String::new() } else { o.detail() },
+            retries,
         };
         let line = json!({
             "t": rec.t, "agent": rec.agent, "kind": kind, "ms": ms, "ok": ok,
-            "outcome": rec.outcome, "detail": rec.detail,
+            "outcome": rec.outcome, "detail": rec.detail, "retries": retries,
         });
         if let Ok(mut f) = self.out.lock() {
             let _ = writeln!(f, "{line}");
@@ -202,6 +221,32 @@ impl Run {
             .header("x-prompto-session", &agent.session)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
+    }
+
+    /// Send the request `mk` builds; with `--retry-secs`, again while it
+    /// provably did not run (see the module docs). The response, and how
+    /// many times it was retried.
+    async fn send(
+        &self,
+        mk: impl Fn() -> reqwest::RequestBuilder,
+    ) -> (reqwest::Result<reqwest::Response>, u32) {
+        let until = Instant::now() + Duration::from_secs(self.cfg.retry_secs);
+        let mut retries = 0;
+        loop {
+            let r = mk().send().await;
+            let not_run = match &r {
+                Err(e) => e.is_connect(),
+                Ok(resp) => {
+                    resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        && resp.headers().contains_key("retry-after")
+                }
+            };
+            if !not_run || Instant::now() >= until {
+                return (r, retries);
+            }
+            retries += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     async fn initialize(&self, agent: &Agent) -> Result<(), String> {
@@ -226,28 +271,40 @@ impl Run {
         Ok(())
     }
 
-    async fn call(&self, agent: &Agent, tool: &str, args: Value) -> Outcome {
+    async fn call(&self, agent: &Agent, tool: &str, args: Value) -> (Outcome, u32) {
         let id = self.id();
-        let mut req = self.post(agent, "/mcp");
+        let mut headers: Vec<(&str, String)> = Vec::new();
         let body = if agent.modern {
-            req = req
-                .header("mcp-protocol-version", "2026-07-28")
-                .header("mcp-method", "tools/call")
-                .header("mcp-name", tool);
+            headers.push(("mcp-protocol-version", "2026-07-28".into()));
+            headers.push(("mcp-method", "tools/call".into()));
+            headers.push(("mcp-name", tool.into()));
             json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
                 "name":tool,"arguments":args,"_meta":{
                     "io.modelcontextprotocol/protocolVersion":"2026-07-28",
                     "io.modelcontextprotocol/clientInfo":{"name":"loadgen","version":"0"},
                     "io.modelcontextprotocol/clientCapabilities":{}}}})
         } else {
-            req = req.header("mcp-protocol-version", "2025-03-26");
+            headers.push(("mcp-protocol-version", "2025-03-26".into()));
             if let Some(s) = agent.mcp_session.lock().unwrap().clone() {
-                req = req.header("mcp-session-id", s);
+                headers.push(("mcp-session-id", s));
             }
             json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
                 "name":tool,"arguments":args}})
         };
-        let resp = match req.json(&body).send().await {
+        let (resp, retries) = self
+            .send(|| {
+                let mut req = self.post(agent, "/mcp");
+                for (k, v) in &headers {
+                    req = req.header(*k, v);
+                }
+                req.json(&body)
+            })
+            .await;
+        (self.outcome(resp).await, retries)
+    }
+
+    async fn outcome(&self, resp: reqwest::Result<reqwest::Response>) -> Outcome {
+        let resp = match resp {
             Ok(r) => r,
             Err(e) => return Outcome::Transport(format!("{e:#}")),
         };
@@ -292,9 +349,17 @@ impl Run {
     ) -> Outcome {
         let t = now_ms();
         let i = Instant::now();
-        let o = self.call(agent, tool, args).await;
+        let (o, retries) = self.call(agent, tool, args).await;
         let ok = check(&o);
-        self.record(agent, kind, t, i.elapsed().as_millis() as u64, ok, &o);
+        self.record(
+            agent,
+            kind,
+            t,
+            i.elapsed().as_millis() as u64,
+            ok,
+            &o,
+            retries,
+        );
         o
     }
 
@@ -414,13 +479,16 @@ impl Run {
         let args = json!({"host": self.cfg.host, "script": format!("echo ticket-{n}")});
         let t = now_ms();
         let i = Instant::now();
+        let mut retries = 0;
         let pre = async {
-            let r = self
-                .post(agent, "/v1/precheck")
-                .json(&json!({"tool": "bash_exec", "arguments": args}))
-                .send()
-                .await
-                .map_err(|e| Outcome::Transport(format!("{e:#}")))?;
+            let (r, n) = self
+                .send(|| {
+                    self.post(agent, "/v1/precheck")
+                        .json(&json!({"tool": "bash_exec", "arguments": args}))
+                })
+                .await;
+            retries = n;
+            let r = r.map_err(|e| Outcome::Transport(format!("{e:#}")))?;
             let status = r.status().as_u16();
             let text = r
                 .text()
@@ -433,7 +501,8 @@ impl Run {
                 _ => Err(Outcome::Http(status, text)),
             }
         };
-        let ticket = match pre.await {
+        let pre = pre.await;
+        let ticket = match pre {
             Ok(tk) => {
                 self.record(
                     agent,
@@ -442,6 +511,7 @@ impl Run {
                     i.elapsed().as_millis() as u64,
                     true,
                     &Outcome::Ok(Value::Null),
+                    retries,
                 );
                 tk
             }
@@ -453,6 +523,7 @@ impl Run {
                     i.elapsed().as_millis() as u64,
                     false,
                     &o,
+                    retries,
                 );
                 return;
             }
@@ -501,6 +572,7 @@ fn parse_args() -> Result<(Cfg, PathBuf), String> {
         host: get("host", "sbx-t1"),
         vault_host: get("vault-host", "sbx-t2"),
         refused_host: get("refused-host", "sbx-bsd"),
+        retry_secs: num("retry-secs", 0)?,
     };
     Ok((cfg, tokens))
 }
@@ -569,6 +641,15 @@ fn summary(run: &Run) -> bool {
         run.cfg.secs,
         recs.len(),
         bad.len()
+    );
+    let retried: Vec<&Rec> = recs.iter().filter(|r| r.retries > 0).collect();
+    println!(
+        "retried (refused or 503 while nothing served, nothing ran): {} calls, {} retries, \
+         at most {} for one call; retry budget {} s\n",
+        retried.len(),
+        retried.iter().map(|r| u64::from(r.retries)).sum::<u64>(),
+        retried.iter().map(|r| r.retries).max().unwrap_or(0),
+        run.cfg.retry_secs
     );
     println!("| call type | calls | as expected | unexpected | p50 ms | p99 ms | max ms |");
     println!("|---|---:|---:|---:|---:|---:|---:|");
