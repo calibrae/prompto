@@ -560,11 +560,16 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive
-    await $.command.register({
-      name: 'prompto',
-      description: "prompto: whoami, this session's audit, kill this session (or everything), the approval pane",
-      argumentHint: 'whoami | audit [n] | kill [global] [reason] | approve',
-    })
+    try {
+      await $.command.register({
+        name: 'prompto',
+        description: "prompto: whoami, this session's audit, kill this session (or everything), the approval pane",
+        argumentHint: 'whoami | audit [n] | kill [global] [reason] | approve',
+      })
+    } catch (err) {
+      // The calls are what matter; the command is a convenience.
+      $.ui.log(`prompto: /prompto is unavailable: ${(err as Error).message}`)
+    }
     return next(e)
   })
 

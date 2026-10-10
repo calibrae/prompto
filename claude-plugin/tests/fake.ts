@@ -38,6 +38,8 @@ export type Opts = {
   stateWrites?: string[]
   /** Questions asked through AskUserQuestion. */
   asked?: string[]
+  /** `/prompto` can't be registered (another command has the name). */
+  commandTaken?: boolean
   /** What `$.store` holds at the start. */
   store?: Record<string, unknown>
   /** The mocked clock: `sleep` waits on it (so the hook's polling waits for the test). */
@@ -106,7 +108,10 @@ export function install(on: On, opts: Opts = {}): Fake {
     fake.logs.push(`log:${JSON.stringify(e)}`)
     return { value: undefined }
   })
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('command.register', ($, e) => {
+    if (opts.commandTaken) throw new Error(`"/${e.name}" refused: it is the plugin's /prompto:prompto`)
+    return { value: { command: e.name } }
+  })
   on('http.fetch', ($, e) => {
     const url = new URL(e.url)
     const headers = { ...(e.init?.headers ?? {}) }

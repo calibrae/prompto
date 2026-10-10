@@ -87,7 +87,7 @@ export type Precheck = {
 
 /** prompto's refusal, with its rule. */
 export function refusal(a: Precheck): string {
-  const rule = a.rule ? ` [rule ${a.rule}]` : ''
+  const rule = a.rule && !(a.reason ?? '').includes(a.rule) ? ` [rule ${a.rule}]` : ''
   return `prompto refused this call (${a.error_class ?? 'deny'}): ${a.reason ?? ''}${rule}`
 }
 

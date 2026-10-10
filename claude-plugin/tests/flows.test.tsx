@@ -113,6 +113,10 @@ test('deny: refused with prompto\'s reason and rule, nothing sent', async ($, on
   expect(out.deny).toContain('refused_policy')
   expect(out.deny).toContain('no grant for ssh_sudo_exec on h2')
   expect(out.deny).toContain('default-deny')
+  // The rule once: precheck reasons often name it already.
+  fake.precheck.ssh_sudo_exec = { decision: 'deny', error_class: 'approval_required', rule: 'r1', reason: 'rule r1 requires a human approval' }
+  const again = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'tu3b', host: 'h2', cmd: 'id' })
+  expect(again.deny!.split('r1').length - 1).toBe(1)
   expect(fake.calls()).toHaveLength(0)
 })
 
@@ -406,6 +410,16 @@ test('a permission ask answered Allow sends the call', async ($, on) => {
   const fake = install(on, { check: 'ask', answer: 'Allow' })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__prompto__ssh_exec', tool_use_id: 'tu20b', host: 'h1', cmd: 'id' })
+  expect(out.deny).toBeUndefined()
+  expect(fake.calls()).toHaveLength(1)
+})
+
+test('a /prompto that can\'t be registered doesn\'t stop the plugin', async ($, on) => {
+  mock.clock(on)
+  const fake = install(on, { commandTaken: true })
+  await start($)
+  expect(fake.logs.join('\n')).toContain('/prompto is unavailable')
+  const out = await $.tool.call({ tool: 'mcp__prompto__ssh_exec', tool_use_id: 'tu40', host: 'h1', cmd: 'id' })
   expect(out.deny).toBeUndefined()
   expect(fake.calls()).toHaveLength(1)
 })
