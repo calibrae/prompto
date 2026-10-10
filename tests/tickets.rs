@@ -39,8 +39,7 @@ ip = "127.0.0.30"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 aliases = ["one"]
-apytti_url = "http://127.0.0.1:9"
-capabilities = ["exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["exec", "sudo_exec", "virt"]
 
 [host.t2]
 ip = "127.0.0.31"
@@ -713,16 +712,11 @@ fn args_for(tool: &str) -> Value {
             "dest_host": "t2", "dest_path": "/tmp/b/"
         }),
         "inventory_get_host" => json!({ "name": "t1" }),
-        "inventory_list" | "prompto_gain" | "mcp_reconnect_hint" => json!({}),
-        "mcp_list" | "mcp_status" | "mcp_restart_claudecli" => json!({ "client": "t1" }),
-        "mcp_get" | "mcp_remove" => json!({ "client": "t1", "name": "x" }),
-        "mcp_add" => json!({
-            "client": "t1", "name": "x", "transport": "http", "url_or_cmd": "http://x"
-        }),
+        "inventory_list" | "prompto_gain" => json!({}),
         _ => json!({
             "host": "t1", "cmd": "true", "commands": ["true"], "script": "true",
             "path": "/tmp/x", "content": "x", "vm": "v", "unit": "u", "action": "status",
-            "ports": [9], "task": "t", "probe_ms": 50, "step_timeout_secs": 1,
+            "ports": [9], "probe_ms": 50, "step_timeout_secs": 1,
             "total_timeout_secs": 1
         }),
     }
@@ -755,7 +749,7 @@ async fn precheck_agrees_with_every_tool_and_runs_nothing() {
             (name, args)
         })
         .collect();
-    assert!(tools.len() >= 38, "tools/list looks short");
+    assert!(tools.len() >= 24, "tools/list looks short");
     let mut sudo_write = args_for("file_write");
     sudo_write["sudo"] = true.into();
     tools.push(("file_write".into(), sudo_write));
@@ -806,7 +800,7 @@ async fn precheck_agrees_with_every_tool_and_runs_nothing() {
     );
     // Not vacuous: nearly every tool went through both paths.
     assert!(
-        ticketed >= 28 && asked >= 7,
+        ticketed >= 18 && asked >= 6,
         "ticketed {ticketed}, asked {asked}"
     );
 }

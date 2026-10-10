@@ -50,7 +50,30 @@ use crate::inventory::{Capability, HostConfig, Inventory};
 use crate::policy::Enforcer;
 
 /// Tools that target no host. Policy matches them on agent and tool only.
-pub const HOSTLESS_TOOLS: &[&str] = &["inventory_list", "prompto_gain", "mcp_reconnect_hint"];
+pub const HOSTLESS_TOOLS: &[&str] = &["inventory_list", "prompto_gain"];
+
+/// Tools prompto no longer has (S0.3: unused in production). Old
+/// `policy.toml` files may still name them: `policy::lint` warns rather
+/// than errs, and such a rule simply matches no call.
+pub const REMOVED_TOOLS: &[&str] = &[
+    "claude_exec",
+    "python_exec",
+    "node_exec",
+    "ruby_exec",
+    "perl_exec",
+    "deno_exec",
+    "mcp_add",
+    "mcp_remove",
+    "mcp_restart_claudecli",
+    "mcp_list",
+    "mcp_get",
+    "mcp_status",
+    "mcp_logs",
+    "mcp_reconnect_hint",
+];
+
+/// The release that removed [`REMOVED_TOOLS`].
+pub const REMOVED_IN: &str = "v0.12.2";
 
 /// Tools that are root-capable whatever their arguments, besides those
 /// gated on `sudo_exec` (which run as root by definition). `vm_stop` can
@@ -60,7 +83,6 @@ pub const ROOT_TOOLS: &[&str] = &[
     "host_sleep",
     "service_control",
     "service_logs",
-    "mcp_logs",
     "vm_stop",
 ];
 
@@ -77,14 +99,6 @@ pub const ARBITRARY_EXEC_TOOLS: &[(&str, Capability)] = &[
     ("ssh_exec", Capability::Exec),
     ("ssh_batch", Capability::Exec),
     ("bash_exec", Capability::Exec),
-    ("python_exec", Capability::Exec),
-    ("node_exec", Capability::Exec),
-    ("ruby_exec", Capability::Exec),
-    ("perl_exec", Capability::Exec),
-    ("deno_exec", Capability::Exec),
-    ("claude_exec", Capability::ClaudeExec),
-    // A stdio server's command runs on the client whenever claude starts.
-    ("mcp_add", Capability::ClaudeAdmin),
     // Writing a file the user's shell reads (~/.bashrc, ~/.ssh/rc, a
     // crontab, a systemd user unit) is code execution as ssh_user. Its
     // `sudo = true` variant is root-capable (`SUDO_FLAG_TOOLS`); this is
@@ -114,12 +128,6 @@ pub const ORDINARY_TOOLS: &[&str] = &[
     "port_scan",
     "inventory_list",
     "inventory_get_host",
-    "mcp_list",
-    "mcp_get",
-    "mcp_remove",
-    "mcp_restart_claudecli",
-    "mcp_status",
-    "mcp_reconnect_hint",
     "prompto_gain",
 ];
 
@@ -177,32 +185,20 @@ pub fn requirements(tool: &str, args: &serde_json::Value) -> Option<Requirements
     use Capability::*;
     let host = |need| Some(Requirements::Hosts(vec![("host", need)]));
     match tool {
-        "inventory_list" | "prompto_gain" | "mcp_reconnect_hint" => Some(Requirements::Hostless),
+        "inventory_list" | "prompto_gain" => Some(Requirements::Hostless),
         "inventory_get_host" => Some(Requirements::Lookup("name")),
         "host_status" | "port_scan" => host(Need::Exists),
         "host_wake" => host(Need::Cap(Wake)),
-        "host_sleep" | "ssh_sudo_exec" | "service_control" | "service_logs" | "mcp_logs" => {
+        "host_sleep" | "ssh_sudo_exec" | "service_control" | "service_logs" => {
             host(Need::Cap(SudoExec))
         }
         "vm_list" | "vm_state" | "vm_start" | "vm_stop" | "vm_ensure_up" => host(Need::Cap(Virt)),
-        "ssh_exec" | "ssh_batch" | "python_exec" | "node_exec" | "ruby_exec" | "perl_exec"
-        | "deno_exec" | "bash_exec" | "file_list" | "file_stat" | "file_read" | "host_diagnose" => {
-            host(Need::Cap(Exec))
-        }
+        "ssh_exec" | "ssh_batch" | "bash_exec" | "file_list" | "file_stat" | "file_read"
+        | "host_diagnose" => host(Need::Cap(Exec)),
         "file_write" => {
             let sudo = args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false);
             host(Need::Cap(if sudo { SudoExec } else { Exec }))
         }
-        "claude_exec" => host(Need::Cap(ClaudeExec)),
-        "mcp_list"
-        | "mcp_get"
-        | "mcp_add"
-        | "mcp_remove"
-        | "mcp_restart_claudecli"
-        | "mcp_status" => Some(Requirements::Hosts(vec![(
-            "client",
-            Need::Cap(ClaudeAdmin),
-        )])),
         "rsync_sync" => Some(Requirements::Hosts(vec![
             ("source_host", Need::Cap(Exec)),
             ("dest_host", Need::Cap(Exec)),
@@ -371,7 +367,7 @@ pub fn lookup(
 }
 
 /// Authorize a tool that targets no host (`inventory_list`,
-/// `prompto_gain`, `mcp_reconnect_hint`): policy on agent × tool. Returns
+/// `prompto_gain`): policy on agent × tool. Returns
 /// the allowing rule (`None` with policy off).
 pub fn authorize_tool(
     policy: Option<&Enforcer>,
@@ -499,7 +495,7 @@ capabilities = []
             "host_status",
             "port_scan",
             "host_wake",
-            "mcp_restart_claudecli",
+            "service_logs",
             "some_future_tool",
         ] {
             let r = authorize(
@@ -755,6 +751,30 @@ capabilities = ["exec"]
         )
         .unwrap();
         assert_eq!(a.rule, None);
+    }
+
+    /// S0.3: a removed tool is gone from `tools/list`, from every
+    /// classification list, from precheck's table and from the gain
+    /// baselines.
+    #[test]
+    fn removed_tools_are_gone_everywhere() {
+        let live = crate::mcp::Prompto::tool_names();
+        for t in REMOVED_TOOLS {
+            assert!(!live.iter().any(|l| l == t), "{t} is still served");
+            assert!(
+                !ROOT_TOOLS.contains(t)
+                    && !SUDO_FLAG_TOOLS.contains(t)
+                    && !is_arbitrary_exec(t)
+                    && !ORDINARY_TOOLS.contains(t)
+                    && !HOSTLESS_TOOLS.contains(t),
+                "{t} is still classified"
+            );
+            assert_eq!(requirements(t, &serde_json::json!({})), None, "{t}");
+            assert!(
+                !crate::baselines::BASELINES.iter().any(|(b, _)| b == t),
+                "{t} has a baseline"
+            );
+        }
     }
 
     #[test]

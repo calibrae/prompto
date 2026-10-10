@@ -274,7 +274,7 @@ pub struct Subject<'a> {
 }
 
 /// Argument fields that name a target host, across every tool.
-pub const HOST_ARGS: &[&str] = &["host", "client", "source_host", "dest_host"];
+pub const HOST_ARGS: &[&str] = &["host", "source_host", "dest_host"];
 
 /// The host names a call's raw arguments target ([`HOST_ARGS`]): each as
 /// typed and, when it resolves, its inventory name and every alias — so

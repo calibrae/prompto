@@ -1111,6 +1111,10 @@ fn run_policy_cli(cfg: &Config, args: &[String]) -> Result<i32> {
             for f in &findings {
                 println!("{f}");
             }
+            let inv_warnings = inv.warnings();
+            for w in &inv_warnings {
+                println!("warning: inventory: {w}");
+            }
             let errors = findings
                 .iter()
                 .filter(|f| f.level == policy::Level::Error)
@@ -1118,7 +1122,7 @@ fn run_policy_cli(cfg: &Config, args: &[String]) -> Result<i32> {
             eprintln!(
                 "{} rules, {errors} errors, {} warnings",
                 p.rules.len(),
-                findings.len() - errors
+                findings.len() - errors + inv_warnings.len()
             );
             Ok(if errors > 0 { 1 } else { 0 })
         }

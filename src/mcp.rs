@@ -21,11 +21,9 @@ use std::time::Duration;
 use mcp_gain::Tracker;
 
 use crate::advisor::Advisor;
-use crate::apytti_client::{ApyttiClient, AskRequest as ApyttiAsk};
 use crate::audit::{self, Audit};
 use crate::authz::{self, Authorized, Need};
 use crate::batch;
-use crate::claudemgr::{self, Scope};
 use crate::ctx::CallCtx;
 use crate::diagnose;
 use crate::error_class::{self, ClassifiedError, Classify, ErrorClass};
@@ -33,13 +31,12 @@ use crate::files;
 use crate::filters::FilterChain;
 use crate::host;
 use crate::inventory::{Capability, HostConfig, InventoryStore};
-use crate::mcpprobe;
 use crate::policy::Visibility;
 use crate::portscan;
-use crate::router::{self, Tier};
 use crate::rsync;
 use crate::script;
 use crate::ssh::SshClient;
+use crate::systemd;
 use crate::virt;
 
 /// Refuse a systemd-only tool on a host that hasn't got systemd.
@@ -156,72 +153,10 @@ pub struct BatchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ClaudeExecArgs {
-    /// Inventory host with `claude_exec` (apytti gateway must be reachable).
-    pub host: String,
-    /// What you want the remote agent to do, in plain language.
-    /// The agent runs ON the target host and can use its tools (Bash,
-    /// Read, etc.) to investigate before answering.
-    pub task: String,
-    /// Semantic resource hint: fast (Haiku, triage) | balanced (Sonnet,
-    /// diagnostic) | deep (Opus, real fuckeries). Default: balanced.
-    #[serde(default)]
-    pub tier: Option<Tier>,
-    /// Override apytti backend (claude / gemini / copilot / ollama).
-    #[serde(default)]
-    pub backend: Option<String>,
-    /// Override model within the chosen backend.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Override effort (low / medium / high).
-    #[serde(default)]
-    pub effort: Option<String>,
-    /// Resume an earlier remote-agent conversation.
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Hard wall-time cap for the whole call (seconds). Default 120.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GainArgs {
     /// Lookback window in seconds. Omit for all-time.
     #[serde(default)]
     pub since_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct McpClientArgs {
-    /// Inventory host with `claude_admin`.
-    pub client: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct McpGetArgs {
-    pub client: String,
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct McpAddArgs {
-    pub client: String,
-    pub name: String,
-    /// "http" for streamable-HTTP, "stdio" for child-process.
-    pub transport: String,
-    /// URL for http, executable path for stdio.
-    pub url_or_cmd: String,
-    /// user (default) | project | local.
-    #[serde(default)]
-    pub scope: Option<Scope>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct McpRemoveArgs {
-    pub client: String,
-    pub name: String,
-    #[serde(default)]
-    pub scope: Option<Scope>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -230,18 +165,6 @@ pub struct ScriptExecArgs {
     /// Source code, piped via SSH stdin.
     pub script: String,
     /// Positional args (no whitespace, no shell metas).
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PythonExecArgs {
-    pub host: String,
-    /// Python source, piped via SSH stdin.
-    pub script: String,
-    /// argv tail (no whitespace, no shell metas).
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -332,7 +255,7 @@ pub struct FileWriteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct McpLogsArgs {
+pub struct ServiceLogsArgs {
     pub host: String,
     pub unit: String,
     /// Default 50, clamped 1..1000.
@@ -355,21 +278,6 @@ struct ScriptExecResult {
     timed_out: bool,
     /// `true` if stderr was compacted from a longer trace.
     stderr_compacted: bool,
-    original_stderr_bytes: usize,
-    final_stderr_bytes: usize,
-}
-
-#[derive(Serialize)]
-struct PythonExecResult {
-    stdout: String,
-    /// Compacted via `script::compact_python_traceback` when a traceback
-    /// is detected — falls back to verbatim stderr otherwise.
-    stderr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
-    timed_out: bool,
-    /// `true` if the stderr was compacted from a longer traceback.
-    traceback_compacted: bool,
     original_stderr_bytes: usize,
     final_stderr_bytes: usize,
 }
@@ -511,47 +419,6 @@ impl Prompto {
                 (t.name.to_string(), schema)
             })
             .collect()
-    }
-
-    /// Shared body for the trivial interpreter wrappers (ruby/perl/deno
-    /// at present). No language-specific compactor — pass-through with
-    /// the standard ScriptExecResult shape.
-    async fn script_exec_simple(
-        &self,
-        tool: &'static str,
-        interpreter: &'static str,
-        args: ScriptExecArgs,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let to = args.timeout_secs.map(Duration::from_secs);
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(&ctx, tool, &args.host, Need::Cap(Capability::Exec))?;
-            let host = &target.host;
-            let raw = script::run(
-                &self.ssh,
-                &ctx,
-                host,
-                interpreter,
-                &args.script,
-                &args.args,
-                to,
-                false,
-            )
-            .await?;
-            let len = raw.stderr.len();
-            Ok(ScriptExecResult {
-                stdout: raw.stdout,
-                stderr: raw.stderr,
-                exit_code: raw.exit_code,
-                timed_out: raw.timed_out,
-                stderr_compacted: false,
-                original_stderr_bytes: len,
-                final_stderr_bytes: len,
-            })
-        }
-        .await;
-        self.finish_tool(&ctx, tool, Some(&host_name), res)
     }
 
     /// Run the filter chain on an `ExecOutput.stdout` and bundle the
@@ -1147,176 +1014,6 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Delegate a task to a Claude agent running on the target host (intelligent compaction). The remote agent reads verbose output, runs whatever commands it needs, and returns one tight summary — vs ssh_exec where YOU pull raw output and parse it. Best for triage, log analysis, multi-step diagnostics. Routes through apytti gateway on the host. Tier hint (fast/balanced/deep) maps to model+effort; explicit backend/model/effort fields override. Slower than ssh_exec (3-30s) and non-deterministic — don't use for structured tasks where filters already do the job."
-    )]
-    async fn claude_exec(
-        &self,
-        Parameters(args): Parameters<ClaudeExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let total_timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
-        let res: anyhow::Result<_> = async {
-            if args.task.trim().is_empty() {
-                crate::fail!(InvalidArgs, "task is empty");
-            }
-            let target = self.authorize(
-                &ctx,
-                "claude_exec",
-                &args.host,
-                Need::Cap(Capability::ClaudeExec),
-            )?;
-            let host = &target.host;
-            let Some(url) = host.apytti_url.as_deref() else {
-                crate::fail!(RefusedCapability, "host {} has no apytti_url", args.host);
-            };
-
-            let route = router::route(
-                args.tier,
-                args.backend.as_deref(),
-                args.model.as_deref(),
-                args.effort.as_deref(),
-            );
-
-            let client = ApyttiClient::new(url.to_string());
-            let req = ApyttiAsk {
-                prompt: &args.task,
-                backend: Some(route.backend.as_str()),
-                model: Some(route.model.as_str()),
-                effort: Some(route.effort.as_str()),
-                session_id: args.session_id.as_deref(),
-            };
-            let resp = client.ask(req, total_timeout).await?;
-            Ok(serde_json::json!({
-                "host": args.host,
-                "response": resp.response,
-                "session_id": resp.session_id,
-                "cost_usd": resp.cost_usd,
-                "backend": resp.backend.unwrap_or_else(|| route.backend.clone()),
-                "model": route.model,
-                "effort": route.effort,
-                "tier": route.tier,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "claude_exec", Some(&host_name), res)
-    }
-
-    #[tool(
-        description = "Run Python on a remote host. Script body piped via SSH stdin — no shell quoting hell. args → sys.argv[1:]. Tracebacks auto-compacted."
-    )]
-    async fn python_exec(
-        &self,
-        Parameters(args): Parameters<PythonExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let to = args.timeout_secs.map(Duration::from_secs);
-        let res: anyhow::Result<_> = async {
-            let target =
-                self.authorize(&ctx, "python_exec", &args.host, Need::Cap(Capability::Exec))?;
-            let host = &target.host;
-            let raw = script::run(
-                &self.ssh,
-                &ctx,
-                host,
-                "python3",
-                &args.script,
-                &args.args,
-                to,
-                false,
-            )
-            .await?;
-            let original_stderr = raw.stderr.len();
-            let compacted = script::compact_python_traceback(&raw.stderr);
-            let traceback_compacted = compacted.len() != original_stderr;
-            let stderr = compacted.into_owned();
-            let final_stderr = stderr.len();
-            Ok(PythonExecResult {
-                stdout: raw.stdout,
-                stderr,
-                exit_code: raw.exit_code,
-                timed_out: raw.timed_out,
-                traceback_compacted,
-                original_stderr_bytes: original_stderr,
-                final_stderr_bytes: final_stderr,
-            })
-        }
-        .await;
-        self.finish_tool(&ctx, "python_exec", Some(&host_name), res)
-    }
-
-    #[tool(
-        description = "Run Node.js on a remote host. Script body via SSH stdin. Stack traces auto-compacted."
-    )]
-    async fn node_exec(
-        &self,
-        Parameters(args): Parameters<ScriptExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let to = args.timeout_secs.map(Duration::from_secs);
-        let res: anyhow::Result<_> = async {
-            let target =
-                self.authorize(&ctx, "node_exec", &args.host, Need::Cap(Capability::Exec))?;
-            let host = &target.host;
-            let raw = script::run(
-                &self.ssh,
-                &ctx,
-                host,
-                "node",
-                &args.script,
-                &args.args,
-                to,
-                false,
-            )
-            .await?;
-            let original = raw.stderr.len();
-            let compacted = script::compact_node_stack(&raw.stderr);
-            let was_compacted = compacted.len() != original;
-            let stderr = compacted.into_owned();
-            let final_len = stderr.len();
-            Ok(ScriptExecResult {
-                stdout: raw.stdout,
-                stderr,
-                exit_code: raw.exit_code,
-                timed_out: raw.timed_out,
-                stderr_compacted: was_compacted,
-                original_stderr_bytes: original,
-                final_stderr_bytes: final_len,
-            })
-        }
-        .await;
-        self.finish_tool(&ctx, "node_exec", Some(&host_name), res)
-    }
-
-    #[tool(description = "Run Ruby on a remote host. Script body via SSH stdin.")]
-    async fn ruby_exec(
-        &self,
-        Parameters(args): Parameters<ScriptExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.script_exec_simple("ruby_exec", "ruby", args).await
-    }
-
-    #[tool(description = "Run Perl on a remote host. Script body via SSH stdin.")]
-    async fn perl_exec(
-        &self,
-        Parameters(args): Parameters<ScriptExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.script_exec_simple("perl_exec", "perl", args).await
-    }
-
-    #[tool(
-        description = "Run Deno (TS/JS) on a remote host via `deno run -`. Script body via SSH stdin."
-    )]
-    async fn deno_exec(
-        &self,
-        Parameters(args): Parameters<ScriptExecArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.script_exec_simple("deno_exec", "deno", args).await
-    }
-
-    #[tool(
         description = "List a directory on a remote host (a symlink to a directory lists the directory). Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link } plus, when set, link_target, device, xattrs, acl, security_context; lines that could not be parsed come back in `unparsed`."
     )]
     async fn file_list(
@@ -1619,7 +1316,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Drive a systemd unit (start/stop/restart/reload/enable/disable/status/is-active/is-enabled). status output is auto-compacted (journal tail dropped — use mcp_logs for logs)."
+        description = "Drive a systemd unit (start/stop/restart/reload/enable/disable/status/is-active/is-enabled). status output is auto-compacted (journal tail dropped — use service_logs for logs)."
     )]
     async fn service_control(
         &self,
@@ -1647,7 +1344,7 @@ impl Prompto {
                     ACTIONS
                 );
             }
-            crate::claudemgr::validate_unit_name(&args.unit)?;
+            systemd::validate_unit_name(&args.unit)?;
             let target = self.authorize(
                 &ctx,
                 "service_control",
@@ -1818,232 +1515,26 @@ impl Prompto {
         self.finish_tool(&ctx, "ssh_sudo_exec", Some(&host_name), res)
     }
 
-    #[tool(description = "List MCP servers registered on a client (`claude mcp list`).")]
-    async fn mcp_list(
-        &self,
-        Parameters(args): Parameters<McpClientArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_list",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let raw = claudemgr::list(&self.ssh, &ctx, host).await?;
-            Ok(serde_json::json!({ "client": args.client, "stdout": raw }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_list", Some(&client), res)
-    }
-
-    #[tool(description = "Show one MCP server's config on a client (`claude mcp get <name>`).")]
-    async fn mcp_get(
-        &self,
-        Parameters(args): Parameters<McpGetArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_get",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let raw = claudemgr::get(&self.ssh, &ctx, host, &args.name).await?;
-            Ok(serde_json::json!({ "client": args.client, "name": args.name, "stdout": raw }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_get", Some(&client), res)
-    }
-
-    #[tool(
-        description = "Register an MCP server on a client. Edits on-disk config; interactive sessions need /mcp to refresh."
-    )]
-    async fn mcp_add(
-        &self,
-        Parameters(args): Parameters<McpAddArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_add",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let scope = args.scope.unwrap_or(Scope::User);
-            let out = claudemgr::add(
-                &self.ssh,
-                &ctx,
-                host,
-                &args.name,
-                &args.transport,
-                &args.url_or_cmd,
-                scope,
-            )
-            .await?;
-            Ok(serde_json::json!({
-                "client": args.client,
-                "name": args.name,
-                "stdout": out,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_add", Some(&client), res)
-    }
-
-    #[tool(description = "Unregister an MCP server on a client.")]
-    async fn mcp_remove(
-        &self,
-        Parameters(args): Parameters<McpRemoveArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_remove",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let scope = args.scope.unwrap_or(Scope::User);
-            let out = claudemgr::remove(&self.ssh, &ctx, host, &args.name, scope).await?;
-            Ok(serde_json::json!({
-                "client": args.client,
-                "name": args.name,
-                "stdout": out,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_remove", Some(&client), res)
-    }
-
-    #[tool(
-        description = "Restart claudecli (Telegram bridge) on a client. systemctl-then-tmux fallback. Best-effort."
-    )]
-    async fn mcp_restart_claudecli(
-        &self,
-        Parameters(args): Parameters<McpClientArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_restart_claudecli",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let detail = claudemgr::restart_claudecli(&self.ssh, &ctx, host).await?;
-            Ok(serde_json::json!({ "client": args.client, "result": detail }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_restart_claudecli", Some(&client), res)
-    }
-
-    #[tool(
-        description = "Health-check every MCP server on a client. Distinguishes 'unreachable' (real outage) from 'reachable but session stale' (/mcp will fix)."
-    )]
-    async fn mcp_status(
-        &self,
-        Parameters(args): Parameters<McpClientArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let client = args.client.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "mcp_status",
-                &args.client,
-                Need::Cap(Capability::ClaudeAdmin),
-            )?;
-            let host = &target.host;
-            let raw = claudemgr::list(&self.ssh, &ctx, host).await?;
-            let entries = mcpprobe::parse_mcp_list(&raw);
-
-            let mut probes = Vec::with_capacity(entries.len());
-            for e in &entries {
-                probes.push(mcpprobe::probe(e, Duration::from_millis(500)).await);
-            }
-
-            let total = probes.len();
-            let reachable = probes.iter().filter(|p| p.tcp_reachable).count();
-            let unreachable = probes
-                .iter()
-                .filter(|p| !p.tcp_reachable && !p.skipped)
-                .count();
-            let skipped = probes.iter().filter(|p| p.skipped).count();
-            Ok(serde_json::json!({
-                "client": args.client,
-                "total": total,
-                "reachable": reachable,
-                "unreachable": unreachable,
-                "skipped": skipped,
-                "servers": probes,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "mcp_status", Some(&client), res)
-    }
-
     #[tool(
         description = "Read logs for ANY systemd unit on a host — this is how you find out why something failed to start or crashed. Tails the journal (`journalctl -u <unit>`). lines default 50, clamped 1..1000. Pairs with service_control, which drives the unit. Requires sudo_exec."
     )]
     async fn service_logs(
         &self,
-        Parameters(args): Parameters<McpLogsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.journal_tail("service_logs", args).await
-    }
-
-    /// Deprecated alias for [`service_logs`], kept so existing callers
-    /// and pinned configs don't break.
-    ///
-    /// The `mcp_` prefix was always wrong: this tool tails ANY systemd
-    /// unit and gates on `sudo_exec`, not `claude_admin` — it never
-    /// belonged to the MCP fleet-management family. The prefix grouped it
-    /// by implementation lineage rather than by what a caller wants, so
-    /// "why did prometheus fail to start" never found it. Discovered when
-    /// an embedding-based tool router refused to route to it, which was
-    /// the router being right.
-    #[tool(
-        name = "mcp_logs",
-        description = "DEPRECATED alias for service_logs. Use service_logs."
-    )]
-    async fn mcp_logs(
-        &self,
-        Parameters(args): Parameters<McpLogsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        // Recorded under its own name so the gain log shows how much the
-        // old name is still used, i.e. when the alias can be retired.
-        self.journal_tail("mcp_logs", args).await
-    }
-
-    /// Shared body for `service_logs` and its `mcp_logs` alias.
-    async fn journal_tail(
-        &self,
-        tool: &'static str,
-        args: McpLogsArgs,
+        Parameters(args): Parameters<ServiceLogsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ctx = self.new_ctx();
         let host_name = args.host.clone();
         let lines = args.lines.unwrap_or(50);
         let res: anyhow::Result<_> = async {
-            let target = self.authorize(&ctx, tool, &args.host, Need::Cap(Capability::SudoExec))?;
+            let target = self.authorize(
+                &ctx,
+                "service_logs",
+                &args.host,
+                Need::Cap(Capability::SudoExec),
+            )?;
             let host = &target.host;
-            require_systemd(host, &args.host, tool)?;
-            let stdout =
-                claudemgr::journalctl_tail(&self.ssh, &ctx, host, &args.unit, lines).await?;
+            require_systemd(host, &args.host, "service_logs")?;
+            let stdout = systemd::journalctl_tail(&self.ssh, &ctx, host, &args.unit, lines).await?;
             Ok(serde_json::json!({
                 "host": args.host,
                 "unit": args.unit,
@@ -2052,29 +1543,7 @@ impl Prompto {
             }))
         }
         .await;
-        self.finish_tool(&ctx, tool, Some(&host_name), res)
-    }
-
-    #[tool(
-        description = "Advice for recovering from MCP-server disconnects (interactive sessions need /mcp; claude -p refreshes per-message)."
-    )]
-    async fn mcp_reconnect_hint(&self) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let hint = "If an MCP server appears disconnected:\n\
-            1. Run `mcp_status <client>` first — distinguishes 'daemon down' from 'session stale'.\n\
-            2. Daemon down: check `mcp_logs <host> <unit>`; if needed, restart via `ssh_sudo_exec`.\n\
-            3. Session stale (probe says reachable, but your tool calls still fail):\n\
-               • Interactive Claude Code session: type `/mcp` and reconnect the server.\n\
-               • Telegram via claudecli: `mcp_restart_claudecli <client>` — claudecli runs\n\
-                 `claude -p` per message, so the next message handshakes fresh.\n\
-            prompto refuses every one of these against the caller's own machine: on the client\n\
-            itself, run the equivalent (`claude mcp list`, `systemctl restart …`) in your local shell.\n\
-               • There is no in-session re-handshake hook today; this hint is the honest answer.";
-        let res = self
-            .authorize_tool(&ctx, "mcp_reconnect_hint")
-            .map(|()| serde_json::json!({ "hint": hint }))
-            .map_err(anyhow::Error::from);
-        self.finish_tool(&ctx, "mcp_reconnect_hint", None, res)
+        self.finish_tool(&ctx, "service_logs", Some(&host_name), res)
     }
 
     #[tool(
@@ -2185,7 +1654,7 @@ fn error_parts(
 /// The host a record made from raw arguments names (`rsync_sync`'s
 /// `dest_host` is added by `audit_record`).
 fn record_host(args: &serde_json::Value) -> Option<String> {
-    ["host", "client", "source_host"]
+    ["host", "source_host"]
         .iter()
         .find_map(|k| args.get(*k)?.as_str())
         .map(str::to_string)
@@ -2259,13 +1728,12 @@ impl ServerHandler for Prompto {
 /// the `Tools: …` list and assert every advertised tool has a gain
 /// baseline — a tool with no entry silently records as pure cost.
 pub const fn instructions() -> &'static str {
-    "prompto — homelab power, libvirt, SSH exec, and remote `claude mcp` management over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, claude_exec, python_exec, node_exec, bash_exec, ruby_exec, perl_exec, deno_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, inventory_list, inventory_get_host, service_logs, mcp_list, mcp_get, mcp_add, mcp_remove, mcp_restart_claudecli, mcp_status, mcp_logs, mcp_reconnect_hint, prompto_gain. \
-                 Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`, `claude_admin`, `claude_exec`). Inventory is operator-managed — edit /etc/prompto.toml and SIGHUP to reload. \
+    "prompto — homelab power, libvirt and SSH exec over MCP. \
+                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, bash_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, service_logs, inventory_list, inventory_get_host, prompto_gain. \
+                 Prefer a typed tool (file_*, service_*, host_*, vm_*) over ssh_exec when one fits. \
+                 Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`). Inventory is operator-managed — edit /etc/prompto.toml and SIGHUP to reload. \
                  vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
-                 The mcp_* tools shell out to `claude mcp …` on a `claude_admin`-capable client. They edit on-disk config; running interactive sessions still need `/mcp` to refresh, but stateless callers (claudecli's `claude -p`) pick up changes on their next invocation. \
-                 prompto_gain returns the token-savings summary for this instance. \
-                 Reload the inventory live by sending SIGHUP to the server process."
+                 prompto_gain returns the token-savings summary for this instance."
 }
 
 #[cfg(test)]

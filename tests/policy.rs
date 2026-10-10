@@ -44,8 +44,7 @@ ssh_user = "admin"
 ssh_key = "/dev/null"
 aliases = ["one"]
 groups = ["lab"]
-apytti_url = "http://127.0.0.1:9"
-capabilities = ["wake", "exec", "sudo_exec", "virt", "claude_admin", "claude_exec"]
+capabilities = ["wake", "exec", "sudo_exec", "virt"]
 
 [host.t2]
 ip = "127.0.0.31"
@@ -263,15 +262,10 @@ fn args_for(tool: &str) -> Value {
             "dest_host": "t2", "dest_path": "/tmp/b/"
         }),
         "inventory_get_host" => json!({ "name": "t1" }),
-        "mcp_list" | "mcp_status" | "mcp_restart_claudecli" => json!({ "client": "t1" }),
-        "mcp_get" | "mcp_remove" => json!({ "client": "t1", "name": "x" }),
-        "mcp_add" => json!({
-            "client": "t1", "name": "x", "transport": "http", "url_or_cmd": "http://x"
-        }),
         _ => json!({
             "host": "t1", "cmd": "true", "commands": ["true"], "script": "true",
             "path": "/tmp/x", "content": "x", "vm": "v", "unit": "u", "action": "status",
-            "ports": [9], "task": "t", "probe_ms": 50, "step_timeout_secs": 1,
+            "ports": [9], "probe_ms": 50, "step_timeout_secs": 1,
             "total_timeout_secs": 1
         }),
     }
@@ -286,7 +280,7 @@ async fn list_tools(s: &Server) -> Vec<String> {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 38, "tools/list looks short: {tools:?}");
+    assert!(tools.len() >= 24, "tools/list looks short: {tools:?}");
     tools
 }
 
@@ -389,11 +383,7 @@ async fn every_tool_is_classified() {
     // t2 has exec and sudo_exec only.
     for (tool, cap) in ARBITRARY_EXEC_TOOLS {
         let mut args = args_for(tool);
-        for k in ["host", "client"] {
-            if args.get(k).is_some() {
-                args[k] = "t2".into();
-            }
-        }
+        args["host"] = "t2".into();
         let resp = call(&s, Some("pto_alpha"), tool, args).await;
         let lacks = resp["error"]["data"]["error_class"] == "refused_capability";
         if lacks == (cap.as_str() == "exec") {
@@ -661,7 +651,7 @@ async fn auth_off_applies_no_policy() {
 /// Inventory output with auth off, as captured from the pre-E3-follow-up
 /// build (hosts sorted by name, `request_id` dropped): visibility
 /// filtering must not change a byte of it.
-const GOLDEN_LIST: &str = r#"{"count":3,"hosts":[{"name":"loopback","ip":"127.0.0.1","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"]},{"name":"t1","ip":"127.0.0.30","mac":"02:00:00:00:00:30","ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":["one"],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["wake","exec","sudo_exec","virt","claude_admin","claude_exec"],"groups":["lab"]},{"name":"t2","ip":"127.0.0.31","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":"lab/t2","hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"],"groups":["lab"]}]}"#;
+const GOLDEN_LIST: &str = r#"{"count":3,"hosts":[{"name":"loopback","ip":"127.0.0.1","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"]},{"name":"t1","ip":"127.0.0.30","mac":"02:00:00:00:00:30","ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":["one"],"sudo_password_vault_path":null,"hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["wake","exec","sudo_exec","virt"],"groups":["lab"]},{"name":"t2","ip":"127.0.0.31","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":"lab/t2","hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"],"groups":["lab"]}]}"#;
 const GOLDEN_GET_T2: &str = r#"{"name":"t2","queried_as":null,"ip":"127.0.0.31","mac":null,"ssh_user":"admin","ssh_port":22,"platform":"linux","chassis":"cold_iron","aliases":[],"sudo_password_vault_path":"lab/t2","hypervisor":null,"request_id_env":"export","extra_ips":[],"capabilities":["exec","sudo_exec"],"groups":["lab"]}"#;
 
 /// A tool result without its `request_id`, hosts sorted by name (the

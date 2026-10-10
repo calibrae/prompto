@@ -15,15 +15,18 @@ pub enum Capability {
     Exec,
     SudoExec,
     Virt,
-    /// Host carries a `claude` CLI prompto can drive (`claude mcp …`).
-    /// Add to hosts where you want prompto to manage MCP server registration
-    /// remotely — typically the macOS boxes that have npm-installed `claude`.
+    /// Removed in v0.12.2 with the `mcp_*` tools ([`REMOVED_CAPABILITIES`]).
+    /// Still parsed so old inventories load; stripped at load, so no
+    /// loaded host carries it.
     ClaudeAdmin,
-    /// Host runs an [apytti](https://github.com/calibrae/apytti) gateway
-    /// reachable from prompto. Required to use `claude_exec` against this
-    /// host. The host's `apytti_url` must be set.
+    /// Removed in v0.12.2 with `claude_exec`, like [`Capability::ClaudeAdmin`].
     ClaudeExec,
 }
+
+/// Capabilities no tool uses any more. An inventory may still list them:
+/// [`Inventory::from_toml_str`] drops them, notes them on the host
+/// ([`HostConfig::removed`]) and logs a warning once per process.
+pub const REMOVED_CAPABILITIES: &[Capability] = &[Capability::ClaudeAdmin, Capability::ClaudeExec];
 
 impl Capability {
     pub fn as_str(self) -> &'static str {
@@ -204,10 +207,10 @@ pub struct HostConfig {
     /// actionable: "use vm_start hypervisor winguest" rather than "winguest is a VM".
     #[serde(default)]
     pub hypervisor: Option<String>,
-    /// URL of the apytti gateway running on this host (e.g. `http://192.0.2.20:7781`).
-    /// Required when the `claude_exec` capability is granted.
-    #[serde(default)]
-    pub apytti_url: Option<String>,
+    /// The apytti gateway of the removed `claude_exec`: accepted so old
+    /// inventories load, otherwise ignored (noted in [`Self::removed`]).
+    #[serde(default, skip_serializing)]
+    apytti_url: Option<String>,
     /// Extra names this host answers to. A box can carry a service
     /// identity and a hardware name — e.g. `router` (the role) on a box
     /// everyone calls `minipc`. One machine, so one entry, reachable by
@@ -264,9 +267,31 @@ pub struct HostConfig {
     /// can sudo, unless the rule says `crown_jewel_ack = true`.
     #[serde(default)]
     pub prompto_host: bool,
+    /// What this entry says that prompto no longer has (`capability
+    /// claude_admin`, `apytti_url`, …), dropped at load. Reported by
+    /// [`Inventory::warnings`].
+    #[serde(skip)]
+    pub removed: Vec<String>,
 }
 
 impl HostConfig {
+    /// Strip what belonged to removed tools, noting it in `removed`.
+    fn drop_removed(&mut self) {
+        let mut removed = Vec::new();
+        self.capabilities.retain(|c| {
+            let gone = REMOVED_CAPABILITIES.contains(c);
+            let note = format!("capability {}", c.as_str());
+            if gone && !removed.contains(&note) {
+                removed.push(note);
+            }
+            !gone
+        });
+        if self.apytti_url.take().is_some() {
+            removed.push("apytti_url".into());
+        }
+        self.removed = removed;
+    }
+
     pub fn has(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
     }
@@ -326,9 +351,6 @@ impl HostConfig {
         if self.sudo_password_vault_field.is_some() && self.sudo_password_vault_path.is_none() {
             bail!("host {name}: sudo_password_vault_field needs sudo_password_vault_path");
         }
-        if self.has(Capability::ClaudeExec) && self.apytti_url.is_none() {
-            bail!("host {name}: claude_exec capability requires `apytti_url`");
-        }
         if let Some(mac) = &self.mac {
             crate::wol::parse_mac(mac).with_context(|| format!("host {name}: invalid mac"))?;
         }
@@ -373,6 +395,7 @@ impl Inventory {
     pub fn from_toml_str(s: &str) -> Result<Self> {
         let mut inv: Inventory = toml::from_str(s).context("parse inventory TOML")?;
         for (name, host) in inv.hosts.iter_mut() {
+            host.drop_removed();
             host.validate(name)?;
             for e in host.extra_ips.iter_mut() {
                 *e = e.to_canonical();
@@ -435,7 +458,43 @@ impl Inventory {
                 Some(_) => {}
             }
         }
+        inv.warn_removed_once();
         Ok(inv)
+    }
+
+    /// Things the inventory says that load but mean nothing any more, one
+    /// line per host, sorted: what `inv_check` and `prompto policy lint`
+    /// print as warnings.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .hosts
+            .iter()
+            .filter(|(_, h)| !h.removed.is_empty())
+            .map(|(name, h)| {
+                format!(
+                    "host {name}: {} removed in {} and ignored; delete it from the inventory",
+                    h.removed.join(", "),
+                    crate::authz::REMOVED_IN
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Log [`Self::warnings`] the first time an inventory with any loads
+    /// in this process (start-up or a reload), not on every reload.
+    fn warn_removed_once(&self) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let w = self.warnings();
+        if !w.is_empty() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                hosts = %w.join("; "),
+                "inventory: the claude_admin / claude_exec capabilities and apytti_url belong \
+                 to tools removed in {}; they are ignored (logged once)",
+                crate::authz::REMOVED_IN
+            );
+        }
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -529,6 +588,63 @@ impl InventoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S0.3: an inventory written for the removed tools still loads. The
+    /// capabilities and `apytti_url` are dropped (no host carries them,
+    /// so nothing can be gated on them) and reported as warnings.
+    #[test]
+    fn removed_capabilities_load_and_are_dropped() {
+        let inv = Inventory::from_toml_str(
+            r#"
+[host.mac]
+ip = "192.0.2.40"
+ssh_user = "u"
+ssh_key = "/k"
+apytti_url = "http://192.0.2.40:7781"
+capabilities = ["exec", "claude_admin", "claude_exec", "claude_admin"]
+
+[host.plain]
+ip = "192.0.2.41"
+ssh_user = "u"
+ssh_key = "/k"
+capabilities = ["exec"]
+"#,
+        )
+        .unwrap();
+        let mac = inv.get("mac").unwrap();
+        assert_eq!(mac.capabilities, vec![Capability::Exec]);
+        for cap in REMOVED_CAPABILITIES {
+            assert!(!mac.has(*cap), "{cap:?}");
+            assert!(inv.require("mac", *cap).is_err(), "{cap:?}");
+        }
+        assert_eq!(
+            inv.warnings(),
+            vec![format!(
+                "host mac: capability claude_admin, capability claude_exec, apytti_url removed \
+                 in {} and ignored; delete it from the inventory",
+                crate::authz::REMOVED_IN
+            )]
+        );
+        assert!(inv.get("plain").unwrap().removed.is_empty());
+        let json = serde_json::to_string(&inv).unwrap();
+        assert!(
+            !json.contains("apytti") && !json.contains("claude_"),
+            "{json}"
+        );
+    }
+
+    /// `claude_exec` without `apytti_url` used to be a load error; now
+    /// both are just ignored. A typo is still an error.
+    #[test]
+    fn removed_capabilities_need_nothing_and_typos_still_fail() {
+        let base = "[host.h]\nip = \"192.0.2.42\"\nssh_user = \"u\"\nssh_key = \"/k\"\n";
+        let inv =
+            Inventory::from_toml_str(&format!("{base}capabilities = [\"claude_exec\"]\n")).unwrap();
+        assert!(inv.get("h").unwrap().capabilities.is_empty());
+        let e = Inventory::from_toml_str(&format!("{base}capabilities = [\"claude_exce\"]\n"))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("claude_exce"), "{e:#}");
+    }
 
     fn sample() -> &'static str {
         r#"

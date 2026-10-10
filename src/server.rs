@@ -347,7 +347,7 @@ async fn log_tail(
     // Validate up front so a malformed unit is a 400 (caller's fault),
     // not a 502 from the exec layer. `journalctl_tail` re-checks — this
     // is for the status code, never the safety.
-    if let Err(e) = crate::claudemgr::validate_unit_name(&q.unit) {
+    if let Err(e) = crate::systemd::validate_unit_name(&q.unit) {
         return Err((StatusCode::BAD_REQUEST, e));
     }
     // Same gate as the tool, under the tool's name, so `/log` keeps
@@ -382,7 +382,7 @@ async fn log_tail(
         n.rule = target.rule.clone();
     });
     let lines = q.lines.unwrap_or(50);
-    crate::claudemgr::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines)
+    crate::systemd::journalctl_tail(&state.ssh, ctx, &target.host, &q.unit, lines)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
