@@ -9,7 +9,7 @@
 - **Socket activation** (optional `deploy/prompto.socket`): an inherited `LISTEN_FDS` socket is used instead of `PROMPTO_BIND`.
 - **Two processes at once are safe:** the approval state file is locked and re-read on every ticket and TOTP check; the kill API directory's count-then-write is locked across processes.
 - `ssh` now runs in a process group of its own, killed whole when a call is dropped before it ends (timeout, drain deadline, client gone), so a `ProxyCommand` goes with it.
-- `deploy/prompto.service`: `Type=notify`, `NotifyAccess=main`, `KillMode=mixed`, `TimeoutStopSec=660`, `ExecReload` = SIGHUP, `PROMPTO_ENV_FILE`. **Install the new unit with the new binary** (a `Type=notify` unit with an older binary never becomes ready); the first upgrade to this version is a plain restart.
+- `deploy/prompto.service`: `Type=notify`, `NotifyAccess=main`, `KillMode=mixed`, `TimeoutStopSec=660`, `ExecReload` = SIGHUP, an `ExecStop` that waits for the drain (systemd doesn't wait for a main process it didn't start, which is what a handover leaves), `PROMPTO_ENV_FILE`. **Install the new unit with the new binary** (a `Type=notify` unit with an older binary never becomes ready); the first upgrade to this version is a plain restart.
 - `examples/loadgen.rs`: N fake agents with their own tokens, mixed long/short/file/sudo/ticket/refused calls, every outcome checked against its expectation.
 
 ## v0.12.2 — 2026-10-10

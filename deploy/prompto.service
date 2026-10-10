@@ -27,6 +27,11 @@ User=prompto
 Group=prompto
 ExecStart=/opt/prompto/bin/prompto
 ExecReload=/bin/kill -HUP $MAINPID
+# After a handover the main process is not systemd's child, and systemd
+# then sends its stop SIGTERM without waiting for the drain: ExecStop
+# sends it and waits until prompto (which first waits for a draining
+# predecessor) has exited.
+ExecStop=/bin/sh -c 'kill -TERM $$1 2>/dev/null; while kill -0 $$1 2>/dev/null; do sleep 0.2; done' prompto-stop $MAINPID
 KillMode=mixed
 TimeoutStopSec=660
 Restart=on-failure
