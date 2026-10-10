@@ -224,5 +224,114 @@ for g in sbx-t1 sbx-t2; do
 done
 $S sbx-core 'sudo systemctl enable --now prompto-dev; sleep 2; systemctl is-active prompto-dev'
 }
-step_1; step_2; step_3; step_4; step_5; step_6
+step_7() {
+# Task 017: three-platform targets. sbx-bsd (FreeBSD, csh, password sudo; up-bsd.sh)
+# and sbx-mac (macOS VM through the one-way tunnel; mac-bench/README.md, host key
+# already in prompto's known_hosts) join the lab group; sbx-core is marked as the
+# prompto host (approval-gate lint) with no capabilities and no grants.
+$S sbx-core 'sudo bash -s' <<'REMOTE'
+set -euo pipefail
+K=/var/lib/prompto/.ssh/known_hosts
+grep -q '^192\.168\.122\.13 ' $K || ssh-keyscan -T 5 192.168.122.13 2>/dev/null >> $K
+grep -q '^\[host\.sbx-bsd\]' /etc/prompto.toml || cat >> /etc/prompto.toml <<'TOML'
+
+[host.sbx-bsd]
+ip = "192.168.122.13"
+ssh_user = "ops"
+ssh_key  = "/etc/prompto/keys/prompto_ed25519"
+platform = "freebsd"
+capabilities = ["exec", "sudo_exec"]
+sudo_password_vault_path = "prompto/sudo-default"
+nopasswd_sudo = false
+groups = ["lab"]
+
+# macOS VM on another machine, through a one-way tunnel that only sbx-core can open.
+[host.sbx-mac]
+ip = "192.168.122.1"
+ssh_port = 2222
+ssh_user = "ops"
+ssh_key = "/etc/prompto/keys/prompto_ed25519"
+platform = "macos"
+capabilities = ["exec", "sudo_exec"]
+sudo_password_vault_path = "prompto/sudo-mac"
+nopasswd_sudo = false
+groups = ["lab", "macos"]
+
+# The machine running prompto. No capabilities: never a target.
+# ssh_user/ssh_key are required by the schema and unused.
+[host.sbx-core]
+ip = "192.168.122.10"
+ssh_user = "ops"
+ssh_key = "/etc/prompto/keys/prompto_ed25519"
+platform = "linux"
+capabilities = []
+prompto_host = true
+TOML
+cat > /etc/prompto/policy.toml <<'TOML'
+# Sandbox policy (task 007, lab group widened in task 017).
+# sbx-dev-agent: exec tools on the lab group (sbx-t1, sbx-t2, sbx-bsd, sbx-mac),
+# root on sbx-t1 only. sbx-ops-agent (group ops): exec + root on the lab group;
+# root on sbx-t2 needs a human approval, which keeps the vault sudo path on
+# sbx-t2 and the TOTP approval exercised by the smoke test.
+# sbx-core is prompto_host = true and in no group: no rule reaches it.
+
+# Task 014: plain bash_exec on sbx-t1 needs a precheck ticket.
+[[rule]]
+id = "dev-ticket-t1"
+agents = ["sbx-dev-agent"]
+hosts = ["sbx-t1"]
+tools = ["bash_exec"]
+approval = "ticket"
+
+[[rule]]
+id = "dev-exec"
+agents = ["sbx-dev-agent"]
+hosts = ["group:lab"]
+tools = ["ssh_exec", "ssh_batch", "bash_exec", "python_exec", "file_*", "rsync_sync", "host_status", "host_diagnose", "port_scan", "inventory_*", "prompto_gain"]
+
+[[rule]]
+id = "dev-root-t1"
+agents = ["sbx-dev-agent"]
+hosts = ["sbx-t1"]
+tools = ["ssh_sudo_exec", "file_write", "service_control", "service_logs"]
+sudo = true
+
+[[rule]]
+id = "ops-exec"
+agents = ["group:ops"]
+hosts = ["group:lab"]
+tools = ["ssh_exec", "ssh_batch", "bash_exec", "python_exec", "file_*", "rsync_sync", "host_status", "host_diagnose", "port_scan", "inventory_*", "prompto_gain"]
+
+# Task 014: root on sbx-t2 needs a human approval (TOTP) for sbx-ops-agent.
+[[rule]]
+id = "ops-root-t2-human"
+agents = ["sbx-ops-agent"]
+hosts = ["sbx-t2"]
+tools = ["ssh_sudo_exec", "file_write", "service_control", "service_logs"]
+sudo = true
+approval = "human"
+
+[[rule]]
+id = "ops-root"
+agents = ["group:ops"]
+hosts = ["group:lab"]
+tools = ["ssh_sudo_exec", "file_write", "service_control", "service_logs"]
+sudo = true
+TOML
+chown root:prompto /etc/prompto/policy.toml; chmod 640 /etc/prompto/policy.toml
+systemctl kill -s HUP prompto-dev
+# Throwaway, sandbox-only key for rsync_sync between the lab targets (the rsync
+# runs on the source host): generated on sbx-t1, copied to sbx-t2 and sbx-bsd as
+# ~/.ssh/sbx_rsync_017, authorized on all three for the lab subnet only. The mac
+# has no route to the lab network, so its rsync pairs fail as dest_ssh_connect.
+P="sudo -u prompto ssh -i /etc/prompto/keys/prompto_ed25519 -o BatchMode=yes"
+$P ops@192.168.122.11 'test -f ~/.ssh/sbx_rsync_017 || ssh-keygen -q -t ed25519 -N "" -C sbx-rsync-017-throwaway -f ~/.ssh/sbx_rsync_017'
+PUB=$($P ops@192.168.122.11 'cat ~/.ssh/sbx_rsync_017.pub')
+for ip in 192.168.122.11 192.168.122.12 192.168.122.13; do
+  $P ops@192.168.122.11 'cat ~/.ssh/sbx_rsync_017' | $P ops@$ip 'umask 077; mkdir -p ~/.ssh; cat > ~/.ssh/sbx_rsync_017.tmp; mv ~/.ssh/sbx_rsync_017.tmp ~/.ssh/sbx_rsync_017'
+  echo "from=\"192.168.122.0/24\" $PUB" | $P ops@$ip 'grep -q sbx-rsync-017-throwaway ~/.ssh/authorized_keys || cat >> ~/.ssh/authorized_keys'
+done
+REMOTE
+}
+step_1; step_2; step_3; step_4; step_5; step_6; step_7
 # Smoke test: sandbox/smoke (curl JSON-RPC from sbx-dev) - see /tmp/smoke.sh on sbx-dev.
