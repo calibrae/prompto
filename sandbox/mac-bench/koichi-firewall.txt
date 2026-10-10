@@ -1,0 +1,15 @@
+# Sandbox host, in the input chain of table inet prompto_sandbox
+# (/etc/nftables/prompto-sandbox.nft), right after the DHCP accept and before the daddr drop:
+    iifname "virbr0" ip saddr 192.168.122.10 ip daddr 192.168.122.1 tcp dport 2222 accept
+    iifname "virbr0" tcp dport 2222 counter drop
+    iifname "virbr0" tcp dport 22 counter drop
+# (the accept alone is NOT enough, see below; the second line stops every other guest.
+#  The third keeps guests off the sandbox host's own sshd: firewalld's libvirt zone allows ssh
+#  by default, and nothing in the sandbox needs to log in to its host.)
+#
+# firewalld's libvirt zone ends in a reject and only allows dhcp/dns/ssh/tftp, and it is a
+# separate hook that an earlier nft accept does not short-circuit. So also (runtime + permanent):
+firewall-cmd --zone=libvirt --add-rich-rule='rule family=ipv4 source address=192.168.122.10 destination address=192.168.122.1 port port=2222 protocol=tcp accept'
+firewall-cmd --permanent --zone=libvirt --add-rich-rule='rule family=ipv4 source address=192.168.122.10 destination address=192.168.122.1 port port=2222 protocol=tcp accept'
+# Reload only the sandbox table: prepend "delete table inet prompto_sandbox" to a copy of the file
+# and `nft -f` that (atomic); never put the delete in the persistent file.
