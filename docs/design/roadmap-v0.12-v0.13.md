@@ -221,6 +221,7 @@ The migration runs end to end in the sandbox, under load, before it touches prod
 
   Every unexpected failure is fixed or the step redesigned.
 - **S12.5 Runbook.** Each step lists its precondition, command, verification, rollback and the continuity evidence from S12.4.
+- **S12.6 (candidate, not scheduled) launchd backend for `service_*` on macOS.** `service_control` / `service_logs` are systemd-only and refuse a macOS host today. A backend would map the actions onto `launchctl` (`kickstart -k`, `bootout`/`bootstrap`, `enable`/`disable`, `print` for status) for `system/<label>` and `gui/<uid>/<label>` domains, and logs onto `log show --predicate 'subsystem == …'`. Raised by the macOS bench (task 016); decide scope (system vs user agents, plist installation out of scope) before building.
 
 ---
 
