@@ -2,10 +2,9 @@
 //! never gets re-parsed by an intermediate shell. Removes the quoting
 //! hell of `ssh_exec "bash -c '...'"`.
 //!
-//! `bash_exec` and `host_diagnose` call [`run`] with `bash` and an
-//! optional argv. This module is plumbing only. (The other interpreter
-//! tools were removed in v0.12.2; `ssh_exec` with a heredoc replaces
-//! them.)
+//! `bash_exec` calls [`run`] with `bash` and an optional argv. This
+//! module is plumbing only. (The other interpreter tools were removed in
+//! v0.12.2; `ssh_exec` with a heredoc replaces them.)
 
 use anyhow::Result;
 use std::time::Duration;

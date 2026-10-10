@@ -280,7 +280,7 @@ async fn list_tools(s: &Server) -> Vec<String> {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(tools.len() >= 24, "tools/list looks short: {tools:?}");
+    assert!(tools.len() >= 21, "tools/list looks short: {tools:?}");
     tools
 }
 

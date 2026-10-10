@@ -1,10 +1,28 @@
 # Changelog
 
-## Unreleased
+## v0.12.3 — 2026-10-10
+
+### Breaking: fewer tools, one-line descriptions
+
+Clients load every tool's description into every conversation, so descriptions now work like skills: short in `tools/list`, the detail where it is needed.
+
+| Removed | Calls | Use instead |
+|---|---|---|
+| `host_diagnose` | 1 in 5 months | `host_status`, then `ssh_exec` (`uptime`, `free -m`, `df -h`, `systemctl --failed`, …) |
+| `file_stat` | | `file_list` with `stat_only: true`: the same result (`{ host, stat, raw }`), plus `path` |
+| `vm_state` | | `vm_list` with `vm: "<name>"`: `[{ "name", "state" }]`, the list's row shape; an error if there is no such domain, as before |
+
+- **Descriptions:** every tool's is one line of at most 100 characters (what it does, and the one thing that most often goes wrong); parameters are described only where the name doesn't say it, in at most 60; no "PREFER OVER …" or token-cost claims. The server `instructions` no longer list the tools (`tools/list` does). A unit test holds the limits.
+- **Where the guidance went:** the plugin skill (`claude-plugin/skills/prompto-tools/SKILL.md`) gains a section on what the one-liners don't say: filters, sudo semantics, `ssh_batch`, the `rsync_sync` precondition and `dest_key`, `file_read` truncation, `file_list` entries and `stat_only`, `vm_ensure_up`, `vm_stop`, removed tools. Error messages and advisor hints already carry the fixes.
+- **Measured** (`tools/list` and `initialize` over stdio): 24 → 21 tools; `tools/list` 12,858 → 8,985 bytes (−30%); `instructions` 803 → 310 bytes; tool descriptions average 154 → 75 characters, longest 543 → 96; parameter descriptions 33 → 24, longest 281 → 56 characters.
+- **Kept separate:** `vm_start`, `vm_stop`, `vm_ensure_up`, `host_sleep`, `service_control` (destructive: policy grants them on their own) and `bash_exec`.
+- **A call to a removed tool** is refused with its replacement and the release that removed it (`vm_state was removed in v0.12.3: use vm_list with vm=<name>: [{name, state}]`). `policy lint` warns on a rule naming one the same way: `unknown tool "vm_state" (removed in v0.12.3: use vm_list with vm=<name>: [{name, state}])`. Such a rule grants nothing, so **a policy that granted `file_stat` or `vm_state` without `file_list` / `vm_list` (or a glob such as `file_*`, `vm_*`) needs them added.**
+- **Advisor:** `stat <path>` now points at `file_list` with `stat_only`. Each distinct hint has its own hourly cooldown (it was per suggested tool), so the `ls` and `stat` hints, both `file_list`, don't silence each other.
+- `prompto_gain`: `file_list` and `vm_list` keep their baselines, so a `stat_only` call (the old `file_stat`, baseline 150) is credited as a listing (400).
 
 ### Continuity of service (roadmap E11)
 
-- **Graceful drain.** SIGTERM (and SIGINT) no longer kills calls in flight: prompto stops accepting connections, answers requests still arriving on open connections with a retryable `503` (`Retry-After`, `Connection: close`), lets the calls in flight finish for up to `PROMPTO_DRAIN_SECS` (default 600), then exits. At the deadline the remote side of each call still running is reaped, then the calls get an `aborted` error and an `aborted` audit record, and their local `ssh` process group is killed. A second SIGTERM cuts the drain short.
+- **Graceful drain.** SIGTERM (and SIGINT) no longer kills calls in flight: prompto stops accepting connections, answers requests still arriving on open connections with a retryable `503` (`Retry-After`, `Connection: close`), lets the calls in flight finish for up to `PROMPTO_DRAIN_SECS` (default 600), then exits. At the deadline the remote side of each call still running is reaped, then the calls get an `aborted` error and an `aborted` audit record, and their local `ssh` process group is killed. A second SIGTERM cuts the drain short; stop signals that arrive during a handover's probation (a SIGINT with the SIGTERM, a repeat) abandon the handover and count as one stop, so the drain runs in full.
 - **The reaper kills the call's session, not every process carrying its request ID:** sshd runs a command in a session of its own; the reaper (a second connection, as root when the call ran as root) kills that session's processes — `nohup` jobs included, since `nohup` doesn't leave the session — and spares what left it (`setsid`, daemons, services started through the init system). It runs while the call's connection is still up. The export prefix is now `export PROMPTO_REQUEST_ID=… PROMPTO_CALL_SID=$$;` (the vault sudo path sets both too), recording the session. Each reap gets a `"type": "reap"` audit record under the call's identity (`prompto audit` shows it as `reap:<tool>`; agents see the reaps of their own calls in `/v1/audit`).
 - **Binary handover, no gap.** `systemctl kill -s SIGUSR2 --kill-whom=main prompto` after installing a new binary: the new process inherits the listening socket; after a 5 s probation during which both processes accept, it becomes the unit's main process and the old one drains. A successor that can't start, or that dies during its probation, leaves the old process serving. `PROMPTO_ENV_FILE` is re-read for the successor. Works on macOS too (the inherited-socket check no longer relies on `SO_ACCEPTCONN`, which macOS refuses).
 - **Socket activation** (optional `deploy/prompto.socket`): an inherited `LISTEN_FDS` socket is used instead of `PROMPTO_BIND`.
@@ -12,6 +30,13 @@
 - `ssh` now runs in a process group of its own, killed whole when a call is dropped before it ends (timeout, drain deadline, client gone), so a `ProxyCommand` goes with it.
 - `deploy/prompto.service`: `Type=notify`, `NotifyAccess=main`, `KillMode=mixed`, `TimeoutStopSec=660`, `ExecReload` = SIGHUP, an `ExecStop` that waits for the drain (systemd doesn't wait for a main process it didn't start, which is what a handover leaves), `PROMPTO_ENV_FILE`. **Install the new unit with the new binary** (a `Type=notify` unit with an older binary never becomes ready); the first upgrade to this version is a plain restart.
 - `examples/loadgen.rs`: N fake agents with their own tokens, mixed long/short/file/sudo/ticket/refused calls, every outcome checked against its expectation.
+- **Deploys use the handover** (README, "Restarts and deploys"): a plain `systemctl restart` refuses new calls until its drain ends, and MCP clients such as Claude Code's connection don't retry. Reboots are the only expected plain restarts.
+
+### Upgrade note
+
+1. Install `deploy/prompto.service` with the binary; this one upgrade is a plain restart (later ones: the handover).
+2. Policy: add `file_list` / `vm_list` where a rule granted `file_stat` / `vm_state` without them (`prompto policy lint` warns on each such rule). Nothing else in the configuration changes.
+3. Clients see 21 tools with short descriptions; one holding the old list gets the replacement when it calls a removed tool.
 
 ## v0.12.2 — 2026-10-10
 

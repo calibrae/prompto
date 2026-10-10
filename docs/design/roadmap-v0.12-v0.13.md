@@ -62,6 +62,7 @@ A market survey found nothing that combines typed machine tools, per-agent ident
     - **Old config loads:** old inventories (`claude_admin`, `claude_exec`, `apytti_url`) load, with the removed items dropped and logged once. A policy rule naming a removed tool is a lint warning (`removed in v0.12.2`), not an error.
     - **Error classes:** `interpreter_missing` now means bash missing (`bash_exec` on FreeBSD); `upstream` is gone.
   - **Advisor** (same task): an `ssh_exec` that is a simple instance of a typed tool (`cat`/`head`/`tail` → `file_read`, `ls` → `file_list`, `stat` → `file_stat`, `systemctl` → `service_control`, `journalctl -u` → `service_logs`, heredoc writes → `file_write`) gets a one-line hint. Every hint fires at most once per hour per session (agent + IP without one). `prompto_gain` counts hints and bytes per pattern, and the audit record names the pattern.
+  - **Follow-up (task 023, v0.12.3): fewer tools, skill-style descriptions.** `host_diagnose` dropped (1 call in 5 months); `file_stat` merged into `file_list` (`stat_only`) and `vm_state` into `vm_list` (`vm`); the destructive tools stay separate so policy can grant them separately. Every description is one line (≤ 100 characters), parameters are described only where needed, and the guidance moved to the plugin skill, error messages and advisor hints. `tools/list` went from 24 tools / 12,858 bytes to 21 / 8,985, the instructions from 803 to 310 bytes.
 - **S0.4 nginx attribution:** add `$host` to the mista access log format. Decide what happens to direct `:6337` access once auth exists. Once auth is in prompto, both paths are equivalent.
 
 ### E1 — Call context & central authorization (refactor, no behaviour change)
@@ -261,6 +262,7 @@ The control plane (prompto, OpenBao, Kanidm, the TLS front) lives in one VM, whi
 | v0.12.0 ✅ | E0, E1, E2, E3, E4, E5 — attributable, policed, audited, killable (shipped 2026-10-09) |
 | v0.12.1 ✅ | E6, E7 — precheck, tickets, Claude Code plugin with approval pane |
 | v0.12.2 ✅ | S0.3 — 14 unused tools removed; advisor steers to the typed tools; plugin: one prompt per approval, no `token_file` |
+| v0.12.3 | E11 — graceful drain, two-phase handover, session reaper; S0.3 follow-up — 21 tools, one-line descriptions |
 | v0.12.x | E9 — Kanidm OIDC; flip to `required` |
 | v0.13.0 | E8 — per-call SSH certificates, static key retired host by host |
 | (gate) | E11 + E12: continuity proven and the migration rehearsed in the sandbox. Production moves only after this |

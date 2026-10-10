@@ -52,62 +52,111 @@ use crate::policy::Enforcer;
 /// Tools that target no host. Policy matches them on agent and tool only.
 pub const HOSTLESS_TOOLS: &[&str] = &["inventory_list", "prompto_gain"];
 
-/// Tools prompto no longer has (S0.3: unused in production), with what
-/// to use instead. Old `policy.toml` files may still name them:
-/// `policy::lint` warns rather than errs, and such a rule simply matches
-/// no call. A call to one is refused with the replacement
-/// ([`removed_tool`]).
-pub const REMOVED_TOOLS: &[(&str, &str)] = &[
-    ("claude_exec", "use host_diagnose, service_logs or ssh_exec"),
-    (
-        "python_exec",
-        "use ssh_exec with a heredoc: python3 - <<'EOF' … EOF",
-    ),
-    (
-        "node_exec",
-        "use ssh_exec with a heredoc: node - <<'EOF' … EOF",
-    ),
-    (
-        "ruby_exec",
-        "use ssh_exec with a heredoc: ruby - <<'EOF' … EOF",
-    ),
-    (
-        "perl_exec",
-        "use ssh_exec with a heredoc: perl - <<'EOF' … EOF",
-    ),
-    (
-        "deno_exec",
-        "use ssh_exec with a heredoc: deno run - <<'EOF' … EOF",
-    ),
-    ("mcp_add", "use ssh_exec \"claude mcp add …\" on the client"),
-    (
-        "mcp_remove",
-        "use ssh_exec \"claude mcp remove …\" on the client",
-    ),
-    ("mcp_list", "use ssh_exec \"claude mcp list\" on the client"),
-    ("mcp_get", "use ssh_exec \"claude mcp get …\" on the client"),
-    (
-        "mcp_status",
-        "use ssh_exec \"claude mcp list\" on the client",
-    ),
-    (
-        "mcp_restart_claudecli",
-        "use service_control or ssh_exec on the client",
-    ),
-    ("mcp_logs", "use service_logs (same arguments)"),
-    ("mcp_reconnect_hint", "run /mcp in the client"),
-];
-
-/// What replaces `tool`, if prompto removed it ([`REMOVED_TOOLS`]).
-pub fn removed_tool(tool: &str) -> Option<&'static str> {
-    REMOVED_TOOLS
-        .iter()
-        .find(|(t, _)| *t == tool)
-        .map(|(_, instead)| *instead)
+/// A tool prompto no longer has, the release that removed it and what
+/// to use instead.
+pub struct RemovedTool {
+    pub name: &'static str,
+    pub release: &'static str,
+    pub instead: &'static str,
 }
 
-/// The release that removed [`REMOVED_TOOLS`].
-pub const REMOVED_IN: &str = "v0.12.2";
+const fn removed(name: &'static str, release: &'static str, instead: &'static str) -> RemovedTool {
+    RemovedTool {
+        name,
+        release,
+        instead,
+    }
+}
+
+/// Tools prompto no longer has: unused in production (S0.3, v0.12.2), or
+/// merged into a tool of the same risk (v0.12.3). Old `policy.toml` files
+/// may still name them: `policy::lint` warns rather than errs, and such
+/// a rule simply matches no call. A call to one is refused with the
+/// replacement ([`removed_tool`]).
+pub const REMOVED_TOOLS: &[RemovedTool] = &[
+    removed("claude_exec", "v0.12.2", "use service_logs or ssh_exec"),
+    removed(
+        "python_exec",
+        "v0.12.2",
+        "use ssh_exec with a heredoc: python3 - <<'EOF' … EOF",
+    ),
+    removed(
+        "node_exec",
+        "v0.12.2",
+        "use ssh_exec with a heredoc: node - <<'EOF' … EOF",
+    ),
+    removed(
+        "ruby_exec",
+        "v0.12.2",
+        "use ssh_exec with a heredoc: ruby - <<'EOF' … EOF",
+    ),
+    removed(
+        "perl_exec",
+        "v0.12.2",
+        "use ssh_exec with a heredoc: perl - <<'EOF' … EOF",
+    ),
+    removed(
+        "deno_exec",
+        "v0.12.2",
+        "use ssh_exec with a heredoc: deno run - <<'EOF' … EOF",
+    ),
+    removed(
+        "mcp_add",
+        "v0.12.2",
+        "use ssh_exec \"claude mcp add …\" on the client",
+    ),
+    removed(
+        "mcp_remove",
+        "v0.12.2",
+        "use ssh_exec \"claude mcp remove …\" on the client",
+    ),
+    removed(
+        "mcp_list",
+        "v0.12.2",
+        "use ssh_exec \"claude mcp list\" on the client",
+    ),
+    removed(
+        "mcp_get",
+        "v0.12.2",
+        "use ssh_exec \"claude mcp get …\" on the client",
+    ),
+    removed(
+        "mcp_status",
+        "v0.12.2",
+        "use ssh_exec \"claude mcp list\" on the client",
+    ),
+    removed(
+        "mcp_restart_claudecli",
+        "v0.12.2",
+        "use service_control or ssh_exec on the client",
+    ),
+    removed("mcp_logs", "v0.12.2", "use service_logs (same arguments)"),
+    removed("mcp_reconnect_hint", "v0.12.2", "run /mcp in the client"),
+    removed(
+        "host_diagnose",
+        "v0.12.3",
+        "use host_status, then ssh_exec (uptime, df -h, systemctl --failed …)",
+    ),
+    removed(
+        "file_stat",
+        "v0.12.3",
+        "use file_list with stat_only=true (same result)",
+    ),
+    removed(
+        "vm_state",
+        "v0.12.3",
+        "use vm_list with vm=<name>: [{name, state}]",
+    ),
+];
+
+/// The tool prompto removed under this name, if any ([`REMOVED_TOOLS`]).
+pub fn removed_tool(tool: &str) -> Option<&'static RemovedTool> {
+    REMOVED_TOOLS.iter().find(|r| r.name == tool)
+}
+
+/// The release that removed the `claude_admin` / `claude_exec`
+/// capabilities and `apytti_url` along with their tools (S0.3).
+pub const CLAUDE_CAPS_REMOVED_IN: &str = "v0.12.2";
 
 /// Tools that are root-capable whatever their arguments, besides those
 /// gated on `sudo_exec` (which run as root by definition). `vm_stop` can
@@ -151,14 +200,11 @@ pub const ARBITRARY_EXEC_TOOLS: &[(&str, Capability)] = &[
 pub const ORDINARY_TOOLS: &[&str] = &[
     "host_wake",
     "host_status",
-    "host_diagnose",
     "vm_list",
-    "vm_state",
     "vm_start",
     "vm_ensure_up",
     "file_read",
     "file_list",
-    "file_stat",
     "port_scan",
     "inventory_list",
     "inventory_get_host",
@@ -226,9 +272,8 @@ pub fn requirements(tool: &str, args: &serde_json::Value) -> Option<Requirements
         "host_sleep" | "ssh_sudo_exec" | "service_control" | "service_logs" => {
             host(Need::Cap(SudoExec))
         }
-        "vm_list" | "vm_state" | "vm_start" | "vm_stop" | "vm_ensure_up" => host(Need::Cap(Virt)),
-        "ssh_exec" | "ssh_batch" | "bash_exec" | "file_list" | "file_stat" | "file_read"
-        | "host_diagnose" => host(Need::Cap(Exec)),
+        "vm_list" | "vm_start" | "vm_stop" | "vm_ensure_up" => host(Need::Cap(Virt)),
+        "ssh_exec" | "ssh_batch" | "bash_exec" | "file_list" | "file_read" => host(Need::Cap(Exec)),
         "file_write" => {
             let sudo = args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false);
             host(Need::Cap(if sudo { SudoExec } else { Exec }))
@@ -787,13 +832,13 @@ capabilities = ["exec"]
         assert_eq!(a.rule, None);
     }
 
-    /// S0.3: a removed tool is gone from `tools/list`, from every
+    /// A removed tool is gone from `tools/list`, from every
     /// classification list, from precheck's table and from the gain
     /// baselines.
     #[test]
     fn removed_tools_are_gone_everywhere() {
         let live = crate::mcp::Prompto::tool_names();
-        for (t, _) in REMOVED_TOOLS {
+        for t in REMOVED_TOOLS.iter().map(|r| &r.name) {
             assert!(!live.iter().any(|l| l == t), "{t} is still served");
             assert!(
                 !ROOT_TOOLS.contains(t)
@@ -808,6 +853,15 @@ capabilities = ["exec"]
                 !crate::baselines::BASELINES.iter().any(|(b, _)| b == t),
                 "{t} has a baseline"
             );
+        }
+        // No replacement sends the caller to another removed tool.
+        for r in REMOVED_TOOLS {
+            let words = r
+                .instead
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            for w in words {
+                assert!(removed_tool(w).is_none(), "{}: {}", r.name, r.instead);
+            }
         }
     }
 

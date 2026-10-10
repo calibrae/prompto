@@ -15,7 +15,6 @@ pub mod batch;
 pub mod caller;
 pub mod canon;
 pub mod ctx;
-pub mod diagnose;
 pub mod drain;
 pub mod error_class;
 pub mod files;

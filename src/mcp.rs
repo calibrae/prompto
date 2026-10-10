@@ -25,7 +25,6 @@ use crate::audit::{self, Audit};
 use crate::authz::{self, Authorized, Need};
 use crate::batch;
 use crate::ctx::CallCtx;
-use crate::diagnose;
 use crate::error_class::{self, ClassifiedError, Classify, ErrorClass};
 use crate::files;
 use crate::filters::FilterChain;
@@ -41,7 +40,7 @@ use crate::virt;
 
 /// Refuse a systemd-only tool on a host that hasn't got systemd.
 ///
-/// These tools are NOT adapted the way `file_stat`/`file_list` are:
+/// These tools are NOT adapted the way `file_list` is:
 /// launchd and rc.d are different service models, not different flags,
 /// so a translation would be a guess dressed as support. Better to say
 /// what's missing and point at the tool that does work.
@@ -96,26 +95,34 @@ pub struct Prompto {
     tool_router: ToolRouter<Prompto>,
 }
 
+// Parameter doc comments are the `description`s clients load with
+// `tools/list`: only where the name and type don't say it, one short
+// line. Anything longer belongs in the plugin skill or the README.
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HostArgs {
-    /// Host name as defined in the inventory (e.g. "gpu-rig").
     pub host: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct VmArgs {
-    /// Hypervisor host name in the inventory.
     pub host: String,
-    /// libvirt domain name (alphanumerics + `-`, `_`, `.` only).
     pub vm: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VmListArgs {
+    pub host: String,
+    /// Only this domain (an error if it doesn't exist)
+    #[serde(default)]
+    pub vm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct VmStopArgs {
     pub host: String,
     pub vm: String,
-    /// Per-step timeout in seconds for the dompmsuspend → shutdown → destroy
-    /// chain. Defaults to the server's `PROMPTO_STOP_VM_STEP_SECS`.
+    /// Per fallback step; default PROMPTO_STOP_VM_STEP_SECS
     #[serde(default)]
     pub step_timeout_secs: Option<u64>,
 }
@@ -124,8 +131,7 @@ pub struct VmStopArgs {
 pub struct VmEnsureUpArgs {
     pub host: String,
     pub vm: String,
-    /// Total timeout (seconds) for the host-wake + vm-start sequence to
-    /// succeed end-to-end. Defaults to 180.
+    /// Whole wake + start sequence; default 180
     #[serde(default)]
     pub total_timeout_secs: Option<u64>,
 }
@@ -133,7 +139,6 @@ pub struct VmEnsureUpArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecArgs {
     pub host: String,
-    /// Command, interpreted by the remote shell.
     pub cmd: String,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -142,10 +147,10 @@ pub struct ExecArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchArgs {
     pub host: String,
-    /// Shell commands to run in order. Each runs under `bash -c`
-    /// (`sh -c` on FreeBSD hosts).
+    // Each runs under `bash -c` (`sh -c` on FreeBSD hosts).
+    /// Shell commands, run in order
     pub commands: Vec<String>,
-    /// Stop on first non-zero exit. Default true; skipped entries get exit_code=null.
+    /// Default true; skipped commands get exit_code=null
     #[serde(default)]
     pub fail_fast: Option<bool>,
     #[serde(default)]
@@ -154,7 +159,7 @@ pub struct BatchArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GainArgs {
-    /// Lookback window in seconds. Omit for all-time.
+    /// Lookback window; omit for all-time
     #[serde(default)]
     pub since_secs: Option<u64>,
 }
@@ -162,9 +167,9 @@ pub struct GainArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScriptExecArgs {
     pub host: String,
-    /// Source code, piped via SSH stdin.
+    /// Script body, sent over stdin
     pub script: String,
-    /// Positional args (no whitespace, no shell metas).
+    /// Positional args: no whitespace or shell metacharacters
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -172,38 +177,39 @@ pub struct ScriptExecArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PathArgs {
+pub struct FileListArgs {
     pub host: String,
     pub path: String,
+    /// The path's own metadata instead of a listing
+    #[serde(default)]
+    pub stat_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RsyncSyncArgs {
     pub source_host: String,
-    /// Trailing `/` matters: `/foo/` → contents, `/foo` → the dir.
+    /// Trailing `/` copies the contents, not the directory
     pub source_path: String,
     pub dest_host: String,
     pub dest_path: String,
-    /// `-a` (archive). Default true.
+    /// rsync -a; default true
     #[serde(default)]
     pub archive: Option<bool>,
-    /// `--delete`. Default false.
+    /// rsync --delete; default false
     #[serde(default)]
     pub delete: Option<bool>,
-    /// `--dry-run`. Default false.
+    /// rsync --dry-run; default false
     #[serde(default)]
     pub dry_run: Option<bool>,
-    /// `--exclude=PATTERN` values.
+    /// rsync --exclude patterns
     #[serde(default)]
     pub excludes: Vec<String>,
-    /// Optional identity file for the source→dest hop, as a path ON THE
-    /// SOURCE HOST. Omit to let the source host pick (its ~/.ssh/config,
-    /// default keys, agent) — correct for hosts that already trust each
-    /// other. This is NOT prompto's key path; prompto's keys do not exist
-    /// on the source box.
+    // Omitted, the source host picks (its ~/.ssh/config, default keys,
+    // agent). prompto's own keys do not exist on the source box.
+    /// Key file ON source_host for the hop; usually omit
     #[serde(default)]
     pub dest_key: Option<String>,
-    /// Default 300s.
+    /// Default 300
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -212,13 +218,14 @@ pub struct RsyncSyncArgs {
 pub struct PortScanArgs {
     pub host: String,
     pub ports: Vec<u16>,
-    /// Per-port budget (ms). Default 500, clamped 50..5000.
+    /// Per port; default 500, 50..5000
     #[serde(default)]
     pub probe_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InventoryHostNameArgs {
+    /// Host name or alias
     pub name: String,
 }
 
@@ -226,16 +233,18 @@ pub struct InventoryHostNameArgs {
 pub struct ServiceControlArgs {
     pub host: String,
     pub unit: String,
-    /// start | stop | restart | reload | enable | disable | status | is-active | is-enabled.
+    // start | stop | restart | reload | enable | disable | status |
+    // is-active | is-enabled; anything else is refused with that list.
+    /// start, stop, restart, reload, status, enable, is-active…
     pub action: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileReadArgs {
     pub host: String,
-    /// No shell metas, no whitespace.
+    /// No whitespace or shell metacharacters
     pub path: String,
-    /// Default 64 KB, clamped to 1 MB.
+    /// Default 64 KB, max 1 MB
     #[serde(default)]
     pub max_bytes: Option<u64>,
 }
@@ -244,12 +253,11 @@ pub struct FileReadArgs {
 pub struct FileWriteArgs {
     pub host: String,
     pub path: String,
-    /// Piped via SSH stdin (no shell quoting).
     pub content: String,
-    /// Octal mode applied via chmod after write.
+    /// Octal, e.g. "0644"; chmod after the write
     #[serde(default)]
     pub mode: Option<String>,
-    /// Write as root (needs `sudo_exec`). Default false.
+    /// Write as root; default false
     #[serde(default)]
     pub sudo: Option<bool>,
 }
@@ -258,7 +266,7 @@ pub struct FileWriteArgs {
 pub struct ServiceLogsArgs {
     pub host: String,
     pub unit: String,
-    /// Default 50, clamped 1..1000.
+    /// Default 50, max 1000
     #[serde(default)]
     pub lines: Option<u32>,
 }
@@ -772,7 +780,7 @@ impl Prompto {
         Err(McpError::internal_error(msg, Some(data)))
     }
 
-    #[tool(description = "Wake a host via WOL magic packet.")]
+    #[tool(description = "Wake a host with a Wake-on-LAN packet.")]
     async fn host_wake(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -793,7 +801,7 @@ impl Prompto {
         self.finish_tool(&ctx, "host_wake", Some(&host_name), res)
     }
 
-    #[tool(description = "TCP-probe a host's SSH port. Returns up | unreachable | off.")]
+    #[tool(description = "TCP-probe a host's SSH port (no login): up | unreachable | off.")]
     async fn host_status(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -809,7 +817,7 @@ impl Prompto {
         self.finish_tool(&ctx, "host_status", Some(&host_name), res)
     }
 
-    #[tool(description = "Shutdown a host (`shutdown -h now` as root).")]
+    #[tool(description = "Power a host off (`shutdown -h now` as root).")]
     async fn host_sleep(
         &self,
         Parameters(args): Parameters<HostArgs>,
@@ -831,10 +839,12 @@ impl Prompto {
         self.finish_tool(&ctx, "host_sleep", Some(&args.host), res)
     }
 
-    #[tool(description = "List libvirt domains on a host (`virsh list --all`).")]
+    #[tool(
+        description = "List libvirt domains with their state; `vm` gives just that one (error if it doesn't exist)."
+    )]
     async fn vm_list(
         &self,
-        Parameters(args): Parameters<HostArgs>,
+        Parameters(args): Parameters<VmListArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ctx = self.new_ctx();
         let host_name = args.host.clone();
@@ -842,30 +852,21 @@ impl Prompto {
             let target =
                 self.authorize(&ctx, "vm_list", &args.host, Need::Cap(Capability::Virt))?;
             let host = &target.host;
-            virt::list(&self.ssh, &ctx, host).await
+            // One domain: `virsh domstate`, which (unlike filtering the
+            // list) says so when there is no such domain. Same row shape.
+            match &args.vm {
+                Some(vm) => {
+                    let state = virt::domstate(&self.ssh, &ctx, host, vm).await?;
+                    Ok(vec![virt::VmRow {
+                        name: vm.clone(),
+                        state,
+                    }])
+                }
+                None => virt::list(&self.ssh, &ctx, host).await,
+            }
         }
         .await;
         self.finish_tool(&ctx, "vm_list", Some(&host_name), res)
-    }
-
-    #[tool(
-        description = "Get libvirt domain state (`virsh domstate`): running | shut off | pmsuspended | …"
-    )]
-    async fn vm_state(
-        &self,
-        Parameters(args): Parameters<VmArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let res: anyhow::Result<_> = async {
-            let target =
-                self.authorize(&ctx, "vm_state", &args.host, Need::Cap(Capability::Virt))?;
-            let host = &target.host;
-            let s = virt::domstate(&self.ssh, &ctx, host, &args.vm).await?;
-            Ok(serde_json::json!({ "host": args.host, "vm": args.vm, "state": s }))
-        }
-        .await;
-        self.finish_tool(&ctx, "vm_state", Some(&host_name), res)
     }
 
     #[tool(description = "Start a libvirt domain (`virsh start`).")]
@@ -887,7 +888,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Stop a libvirt domain via dompmsuspend → shutdown → destroy fallback chain."
+        description = "Stop a libvirt domain: dompmsuspend, then shutdown, then destroy, until one works."
     )]
     async fn vm_stop(
         &self,
@@ -910,7 +911,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Wake host (if down) + start VM (if not running) + wait for SSH-ready. One call before issuing VM work."
+        description = "Wake the hypervisor if it is down, then start the VM if it isn't running."
     )]
     async fn vm_ensure_up(
         &self,
@@ -967,7 +968,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command on a host over SSH. Returns stdout/stderr/exit. stdout passes through a 26-filter chain (cargo, git, journalctl, find, pkg, k8s, …) that names the applied filter in the response. For N commands on the same host, prefer ssh_batch."
+        description = "Run a shell command as the host's ssh_user. Noisy output (cargo, git, …) comes back compacted."
     )]
     async fn ssh_exec(
         &self,
@@ -988,7 +989,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run N commands on one host in a single SSH session. PREFER OVER repeated ssh_exec for same-host sequences (snapshot destroys, service restarts, fan-out checks) — saves N-1 round trips and the conversation accumulation cost. Returns per-command exit/output/timing. fail_fast (default true) skips remaining on first failure. Keep commands tight; batch stdout is not filter-chained."
+        description = "Run several commands on one host in one SSH session; per-command exit and output."
     )]
     async fn ssh_batch(
         &self,
@@ -1060,11 +1061,11 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List a directory on a remote host (a symlink to a directory lists the directory). Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link } plus, when set, link_target, device, xattrs, acl, security_context; lines that could not be parsed come back in `unparsed`."
+        description = "List a directory as typed entries; stat_only=true returns the path's own metadata instead."
     )]
     async fn file_list(
         &self,
-        Parameters(args): Parameters<PathArgs>,
+        Parameters(args): Parameters<FileListArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ctx = self.new_ctx();
         let host_name = args.host.clone();
@@ -1073,6 +1074,9 @@ impl Prompto {
                 self.authorize(&ctx, "file_list", &args.host, Need::Cap(Capability::Exec))?;
             let host = &target.host;
             files::validate_path(&args.path)?;
+            if args.stat_only.unwrap_or(false) {
+                return self.stat(&ctx, host, &args.host, &args.path).await;
+            }
             let cmd = files::ls_command(host.platform, &args.path);
             let raw = self
                 .ssh
@@ -1108,49 +1112,7 @@ impl Prompto {
         self.finish_tool(&ctx, "file_list", Some(&host_name), res)
     }
 
-    #[tool(
-        description = "Stat a remote file. Returns typed { path, mode (octal), size, owner, group, mtime, kind }."
-    )]
-    async fn file_stat(
-        &self,
-        Parameters(args): Parameters<PathArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let res: anyhow::Result<_> = async {
-            let target =
-                self.authorize(&ctx, "file_stat", &args.host, Need::Cap(Capability::Exec))?;
-            let host = &target.host;
-            files::validate_path(&args.path)?;
-            let cmd = files::stat_command(host.platform, &args.path);
-            let raw = self
-                .ssh
-                .exec(&ctx, host, &cmd, Some(Duration::from_secs(10)), false)
-                .await?;
-            if !raw.ok() {
-                return Err(crate::error_class::ClassifiedError::exec_failure(
-                    &raw,
-                    false,
-                    format!(
-                        "stat failed (exit={:?}): {}",
-                        raw.exit_code,
-                        raw.stderr.trim()
-                    ),
-                )
-                .into());
-            }
-            let parsed = files::parse_stat(&raw.stdout);
-            Ok(serde_json::json!({
-                "host": args.host,
-                "stat": parsed,
-                "raw": raw.stdout,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "file_stat", Some(&host_name), res)
-    }
-
-    #[tool(description = "List inventory hosts with their capabilities. Read-only.")]
+    #[tool(description = "List the inventory hosts you may use, with their capabilities.")]
     async fn inventory_list(&self) -> Result<CallToolResult, McpError> {
         let ctx = self.new_ctx();
         let res: anyhow::Result<_> = async {
@@ -1194,7 +1156,7 @@ impl Prompto {
         self.finish_tool(&ctx, "inventory_list", None, res)
     }
 
-    #[tool(description = "Get one host's inventory config (ssh_key path elided).")]
+    #[tool(description = "One host's inventory entry (ssh_key path elided).")]
     async fn inventory_get_host(
         &self,
         Parameters(args): Parameters<InventoryHostNameArgs>,
@@ -1234,7 +1196,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "rsync files between two inventory hosts in one call. PREFER OVER N×file_write loops (~17K tokens vs ~150). PRECONDITION: the rsync runs ON source_host, so source_host must already be able to SSH to dest_host as its inventory ssh_user — prompto's own keys are not available there. Optional dest_key names an identity file on source_host. Trailing `/` on paths matters. Output is the --stats block. A failure names its cause as `[error_class=…]` (e.g. dest_ssh_auth = source_host can't log into dest_host) with rsync's exit code and stderr tail."
+        description = "rsync between two hosts. It runs ON source_host, which must already be able to SSH to dest_host."
     )]
     async fn rsync_sync(
         &self,
@@ -1290,9 +1252,7 @@ impl Prompto {
         self.finish_tool(&ctx, "rsync_sync", Some(&host_name), res)
     }
 
-    #[tool(
-        description = "TCP-probe a list of ports on a host (no SSH). Returns per-port reachable + latency_ms."
-    )]
+    #[tool(description = "TCP-probe ports on a host (no SSH): reachable and latency per port.")]
     async fn port_scan(
         &self,
         Parameters(args): Parameters<PortScanArgs>,
@@ -1322,47 +1282,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Composite host health: uptime, load, mem (MB), disk, last-boot, kernel, listening ports (top 30), failed units. One round-trip; replaces ~5 ssh_exec calls."
-    )]
-    async fn host_diagnose(
-        &self,
-        Parameters(args): Parameters<HostArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx = self.new_ctx();
-        let host_name = args.host.clone();
-        let res: anyhow::Result<_> = async {
-            let target = self.authorize(
-                &ctx,
-                "host_diagnose",
-                &args.host,
-                Need::Cap(Capability::Exec),
-            )?;
-            let host = &target.host;
-            let raw = script::run(
-                &self.ssh,
-                &ctx,
-                host,
-                "bash",
-                diagnose::DIAGNOSE_SCRIPT,
-                &[],
-                Some(Duration::from_secs(15)),
-                false,
-            )
-            .await?;
-            let report = diagnose::parse(&raw.stdout);
-            Ok(serde_json::json!({
-                "host": args.host,
-                "report": report,
-                "stderr": raw.stderr,
-                "exit_code": raw.exit_code,
-            }))
-        }
-        .await;
-        self.finish_tool(&ctx, "host_diagnose", Some(&host_name), res)
-    }
-
-    #[tool(
-        description = "Drive a systemd unit (start/stop/restart/reload/enable/disable/status/is-active/is-enabled). status output is auto-compacted (journal tail dropped — use service_logs for logs)."
+        description = "Run `systemctl <action>` on a unit, as root. status omits the journal: use service_logs."
     )]
     async fn service_control(
         &self,
@@ -1424,7 +1344,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Read a remote file. max_bytes default 64 KB, clamped to 1 MB. Returns content + `truncated` flag."
+        description = "Read a remote file as ssh_user (not root). Large files come back cut, `truncated: true`."
     )]
     async fn file_read(
         &self,
@@ -1457,7 +1377,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Write a remote file (content via SSH stdin, no shell quoting). Optional mode runs chmod after. sudo=true writes as root."
+        description = "Write a remote file; content goes over stdin, no quoting. sudo=true writes as root."
     )]
     async fn file_write(
         &self,
@@ -1498,7 +1418,9 @@ impl Prompto {
         self.finish_tool(&ctx, "file_write", Some(&host_name), res)
     }
 
-    #[tool(description = "Run Bash on a remote host. Script body via SSH stdin.")]
+    #[tool(
+        description = "Run a Bash script on a host; the body goes over stdin, no quoting. Needs bash there."
+    )]
     async fn bash_exec(
         &self,
         Parameters(args): Parameters<ScriptExecArgs>,
@@ -1537,7 +1459,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Run a command as root over SSH. The whole command runs as root, including every part of a compound command (`a; b`, pipes, redirects). Uses passwordless sudo (`sudo -n -- <cmd>` for a command of plain words, so narrow sudoers rules match; otherwise `sudo -n -- sh -s` with the command on stdin), or a vault-held sudo password when the host declares one (the password never reaches the caller; the command runs under a root sh). Same filter chain as ssh_exec."
+        description = "Run a shell command as root. All of it runs as root: every part of `a; b`, pipes, redirects."
     )]
     async fn ssh_sudo_exec(
         &self,
@@ -1562,7 +1484,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Read logs for ANY systemd unit on a host — this is how you find out why something failed to start or crashed. Tails the journal (`journalctl -u <unit>`). lines default 50, clamped 1..1000. Pairs with service_control, which drives the unit. Requires sudo_exec."
+        description = "Tail a systemd unit's journal (`journalctl -u`), as root: why a unit failed or crashed."
     )]
     async fn service_logs(
         &self,
@@ -1593,7 +1515,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "Token-savings analytics vs an SSH+bash baseline. Optional since_secs lookback. Returns total + per-tool breakdown, and the advisor's hints and bytes since start."
+        description = "Token savings of this prompto vs plain SSH, in all and per tool; advisor hint counts."
     )]
     async fn prompto_gain(
         &self,
@@ -1617,6 +1539,43 @@ impl Prompto {
                 v
             });
         self.finish_tool(&ctx, "prompto_gain", None, res)
+    }
+}
+
+impl Prompto {
+    /// `file_list` with `stat_only`: the path's own metadata, `{ host,
+    /// stat: { path, mode (octal), size, owner, group, mtime, kind }, raw }`
+    /// (what `file_stat` returned before v0.12.3), plus `path`.
+    async fn stat(
+        &self,
+        ctx: &CallCtx,
+        host: &HostConfig,
+        host_name: &str,
+        path: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let cmd = files::stat_command(host.platform, path);
+        let raw = self
+            .ssh
+            .exec(ctx, host, &cmd, Some(Duration::from_secs(10)), false)
+            .await?;
+        if !raw.ok() {
+            return Err(crate::error_class::ClassifiedError::exec_failure(
+                &raw,
+                false,
+                format!(
+                    "stat failed (exit={:?}): {}",
+                    raw.exit_code,
+                    raw.stderr.trim()
+                ),
+            )
+            .into());
+        }
+        Ok(serde_json::json!({
+            "host": host_name,
+            "path": path,
+            "stat": files::parse_stat(&raw.stdout),
+            "raw": raw.stdout,
+        }))
     }
 }
 
@@ -1746,15 +1705,11 @@ impl ServerHandler for Prompto {
         if let Some(kill) = self.killed(&call) {
             return self.refuse_killed(&call, kill);
         }
-        // A tool v0.12.2 removed: say what replaces it, rather than rmcp's
+        // A tool prompto removed: say what replaces it, rather than rmcp's
         // bare "tool not found" (a client may hold a stale tool list).
-        if let Some(instead) = authz::removed_tool(&request.name) {
+        if let Some(r) = authz::removed_tool(&request.name) {
             let res = Err(McpError::invalid_params(
-                format!(
-                    "{} was removed in {}: {instead}",
-                    request.name,
-                    authz::REMOVED_IN
-                ),
+                format!("{} was removed in {}: {}", r.name, r.release, r.instead),
                 None,
             ));
             self.audit_unrouted(&call, Some(&res));
@@ -1799,23 +1754,43 @@ impl ServerHandler for Prompto {
     }
 }
 
-/// The advertised tool surface and usage notes handed to clients.
-///
-/// Split out of [`ServerHandler::get_info`] so `baselines.rs` can parse
-/// the `Tools: …` list and assert every advertised tool has a gain
-/// baseline — a tool with no entry silently records as pure cost.
+/// The usage notes handed to clients at `initialize`. Short: clients load
+/// them into every conversation, and `tools/list` already names the
+/// tools. Guidance goes to the plugin skill
+/// (`claude-plugin/skills/prompto-tools/SKILL.md`) and the README.
 pub const fn instructions() -> &'static str {
-    "prompto — homelab power, libvirt and SSH exec over MCP. \
-                 Tools: host_wake, host_sleep, host_status, host_diagnose, vm_list, vm_state, vm_start, vm_stop, vm_ensure_up, ssh_exec, ssh_batch, ssh_sudo_exec, bash_exec, file_read, file_write, file_list, file_stat, rsync_sync, port_scan, service_control, service_logs, inventory_list, inventory_get_host, prompto_gain. \
-                 Prefer a typed tool (file_*, service_*, host_*, vm_*) over ssh_exec when one fits. \
-                 Hosts are looked up by name in the server's inventory; every call is gated on the host's capabilities (`wake`, `exec`, `sudo_exec`, `virt`). Inventory is operator-managed — edit /etc/prompto.toml and SIGHUP to reload. \
-                 vm_stop runs the dompmsuspend → shutdown → destroy fallback chain. \
-                 prompto_gain returns the token-savings summary for this instance."
+    "prompto runs commands, file, service, VM and power operations on the hosts of its \
+     inventory, over SSH. Name hosts as `inventory_list` shows them; each call is checked \
+     against the host's capabilities and the policy, and audited. Prefer a typed tool \
+     (file_*, service_*, vm_*, host_*) over ssh_exec when one fits."
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The description diet (v0.12.3): what every client loads with
+    /// `tools/list` and `initialize` stays short — one line per tool,
+    /// parameters only where needed. Guidance belongs in the plugin skill.
+    #[test]
+    fn descriptions_stay_short() {
+        let mut params = 0;
+        for t in Prompto::tool_router().list_all() {
+            let d = t.description.as_deref().unwrap_or_default();
+            assert!(!d.is_empty() && d.chars().count() <= 100, "{}: {d}", t.name);
+            assert!(!d.contains('\n'), "{}: {d}", t.name);
+            let props = t.input_schema.get("properties").and_then(|p| p.as_object());
+            for (name, p) in props.into_iter().flatten() {
+                if let Some(d) = p.get("description").and_then(|d| d.as_str()) {
+                    params += 1;
+                    assert!(d.chars().count() <= 60, "{}.{name}: {d}", t.name);
+                    assert!(!d.contains('\n'), "{}.{name}: {d}", t.name);
+                }
+            }
+        }
+        assert!(params > 0, "no parameter descriptions seen");
+        assert!(instructions().len() <= 400, "{}", instructions().len());
+    }
 
     #[test]
     fn object_payload_gains_a_trailing_request_id_field() {

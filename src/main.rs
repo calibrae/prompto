@@ -1680,6 +1680,11 @@ async fn run(inherited: Inherited) -> Result<()> {
                         () = signals.stop() => {
                             tracing::warn!("stop signal during a handover: abandoning the successor");
                             successor.abandon();
+                            // Stops received meanwhile (a SIGINT with the
+                            // SIGTERM, a repeat) asked for this one: the
+                            // drain runs in full, and only a stop sent
+                            // during it cuts it short.
+                            signals.discard_pending_stops().await;
                             break false;
                         }
                     };
@@ -1832,6 +1837,15 @@ impl Signals {
             _ = self.term.recv() => {}
             _ = self.int.recv() => {}
         }
+    }
+
+    /// Consume the stop signals already received, without waiting.
+    async fn discard_pending_stops(&mut self) {
+        // `timeout` polls the future before its (elapsed) deadline.
+        while tokio::time::timeout(Duration::ZERO, self.stop())
+            .await
+            .is_ok()
+        {}
     }
 }
 

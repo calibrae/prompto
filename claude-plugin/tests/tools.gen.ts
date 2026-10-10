@@ -11,16 +11,13 @@ export const TOOLS: Record<string, Record<string, string>> = {
   },
   "file_list": {
     "host": "string",
-    "path": "string"
+    "path": "string",
+    "stat_only": "boolean"
   },
   "file_read": {
     "host": "string",
     "path": "string",
     "max_bytes": "integer"
-  },
-  "file_stat": {
-    "host": "string",
-    "path": "string"
   },
   "file_write": {
     "host": "string",
@@ -28,9 +25,6 @@ export const TOOLS: Record<string, Record<string, string>> = {
     "content": "string",
     "mode": "string",
     "sudo": "boolean"
-  },
-  "host_diagnose": {
-    "host": "string"
   },
   "host_sleep": {
     "host": "string"
@@ -97,13 +91,10 @@ export const TOOLS: Record<string, Record<string, string>> = {
     "total_timeout_secs": "integer"
   },
   "vm_list": {
-    "host": "string"
-  },
-  "vm_start": {
     "host": "string",
     "vm": "string"
   },
-  "vm_state": {
+  "vm_start": {
     "host": "string",
     "vm": "string"
   },
