@@ -52,25 +52,59 @@ use crate::policy::Enforcer;
 /// Tools that target no host. Policy matches them on agent and tool only.
 pub const HOSTLESS_TOOLS: &[&str] = &["inventory_list", "prompto_gain"];
 
-/// Tools prompto no longer has (S0.3: unused in production). Old
-/// `policy.toml` files may still name them: `policy::lint` warns rather
-/// than errs, and such a rule simply matches no call.
-pub const REMOVED_TOOLS: &[&str] = &[
-    "claude_exec",
-    "python_exec",
-    "node_exec",
-    "ruby_exec",
-    "perl_exec",
-    "deno_exec",
-    "mcp_add",
-    "mcp_remove",
-    "mcp_restart_claudecli",
-    "mcp_list",
-    "mcp_get",
-    "mcp_status",
-    "mcp_logs",
-    "mcp_reconnect_hint",
+/// Tools prompto no longer has (S0.3: unused in production), with what
+/// to use instead. Old `policy.toml` files may still name them:
+/// `policy::lint` warns rather than errs, and such a rule simply matches
+/// no call. A call to one is refused with the replacement
+/// ([`removed_tool`]).
+pub const REMOVED_TOOLS: &[(&str, &str)] = &[
+    ("claude_exec", "use host_diagnose, service_logs or ssh_exec"),
+    (
+        "python_exec",
+        "use ssh_exec with a heredoc: python3 - <<'EOF' … EOF",
+    ),
+    (
+        "node_exec",
+        "use ssh_exec with a heredoc: node - <<'EOF' … EOF",
+    ),
+    (
+        "ruby_exec",
+        "use ssh_exec with a heredoc: ruby - <<'EOF' … EOF",
+    ),
+    (
+        "perl_exec",
+        "use ssh_exec with a heredoc: perl - <<'EOF' … EOF",
+    ),
+    (
+        "deno_exec",
+        "use ssh_exec with a heredoc: deno run - <<'EOF' … EOF",
+    ),
+    ("mcp_add", "use ssh_exec \"claude mcp add …\" on the client"),
+    (
+        "mcp_remove",
+        "use ssh_exec \"claude mcp remove …\" on the client",
+    ),
+    ("mcp_list", "use ssh_exec \"claude mcp list\" on the client"),
+    ("mcp_get", "use ssh_exec \"claude mcp get …\" on the client"),
+    (
+        "mcp_status",
+        "use ssh_exec \"claude mcp list\" on the client",
+    ),
+    (
+        "mcp_restart_claudecli",
+        "use service_control or ssh_exec on the client",
+    ),
+    ("mcp_logs", "use service_logs (same arguments)"),
+    ("mcp_reconnect_hint", "run /mcp in the client"),
 ];
+
+/// What replaces `tool`, if prompto removed it ([`REMOVED_TOOLS`]).
+pub fn removed_tool(tool: &str) -> Option<&'static str> {
+    REMOVED_TOOLS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map(|(_, instead)| *instead)
+}
 
 /// The release that removed [`REMOVED_TOOLS`].
 pub const REMOVED_IN: &str = "v0.12.2";
@@ -759,7 +793,7 @@ capabilities = ["exec"]
     #[test]
     fn removed_tools_are_gone_everywhere() {
         let live = crate::mcp::Prompto::tool_names();
-        for t in REMOVED_TOOLS {
+        for (t, _) in REMOVED_TOOLS {
             assert!(!live.iter().any(|l| l == t), "{t} is still served");
             assert!(
                 !ROOT_TOOLS.contains(t)

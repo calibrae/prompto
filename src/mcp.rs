@@ -1718,6 +1718,20 @@ impl ServerHandler for Prompto {
         if let Some(kill) = self.killed(&call) {
             return self.refuse_killed(&call, kill);
         }
+        // A tool v0.12.2 removed: say what replaces it, rather than rmcp's
+        // bare "tool not found" (a client may hold a stale tool list).
+        if let Some(instead) = authz::removed_tool(&request.name) {
+            let res = Err(McpError::invalid_params(
+                format!(
+                    "{} was removed in {}: {instead}",
+                    request.name,
+                    authz::REMOVED_IN
+                ),
+                None,
+            ));
+            self.audit_unrouted(&call, Some(&res));
+            return res;
+        }
         // Dropped before the end (cancelled, panicked, shut down): the
         // guard writes an `aborted` record.
         let _guard = AbortGuard {

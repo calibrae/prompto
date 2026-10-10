@@ -17,7 +17,7 @@ Production usage since 2026-04-26 (10,005 calls) shows them unused or obsolete. 
 | `mcp_list`, `mcp_get`, `mcp_add`, `mcp_remove`, `mcp_status`, `mcp_restart_claudecli`, `mcp_reconnect_hint` | 10 in all (with `mcp_logs`) | `ssh_exec "claude mcp list"` (or `get`/`add`/`remove`) on the client; `service_control` / `ssh_exec "systemctl --user restart claudecli"` for the bridge |
 | `mcp_logs` (deprecated alias) | | `service_logs` (same arguments) |
 
-`bash_exec` (47 calls) stays, and with a quoted heredoc (`<<'EOF'`) `ssh_exec` passes any script through untouched. A call to a removed tool is refused as an unknown tool (`invalid_args`).
+`bash_exec` (47 calls) stays, and with a quoted heredoc (`<<'EOF'`) `ssh_exec` passes any script through untouched. A call to a removed tool (from a client holding a stale tool list) is refused, `invalid_args`, with what replaces it: `python_exec was removed in v0.12.2: use ssh_exec with a heredoc: python3 - <<'EOF' … EOF`.
 
 **Old configuration keeps working:**
 

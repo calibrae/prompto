@@ -1003,7 +1003,7 @@ pub fn lint(
                 // A tool removed from prompto: the rule still loads and
                 // grants nothing for it. An old policy file must not
                 // count as broken (`prompto policy lint` fails on errors).
-                (false, true) if authz::REMOVED_TOOLS.contains(&t.as_str()) => push(
+                (false, true) if authz::removed_tool(t.as_str()).is_some() => push(
                     Level::Warning,
                     rule,
                     format!(

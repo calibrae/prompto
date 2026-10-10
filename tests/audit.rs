@@ -1292,3 +1292,30 @@ async fn advisor_hints_once_and_is_recorded_and_counted() {
     assert_eq!(adv["bytes"], hint.len(), "{gain}");
     assert_eq!(adv["by_pattern"]["cat"]["hints"], 1, "{gain}");
 }
+
+/// S0.3: a call to a removed tool (a client with a stale tool list) is
+/// refused with what replaces it, and recorded like any invalid call.
+#[tokio::test]
+async fn a_removed_tool_says_what_replaces_it() {
+    let s = spawn(AuthMode::Required).await;
+    let resp = call(
+        &s,
+        "python_exec",
+        json!({ "host": "run", "script": "print(1)" }),
+    )
+    .await;
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("python_exec was removed in v0.12.2")
+            && msg.contains("ssh_exec with a heredoc"),
+        "{resp}"
+    );
+    let r = s
+        .records()
+        .into_iter()
+        .find(|r| r["tool"] == "python_exec")
+        .unwrap();
+    assert_eq!(r["error_class"], "invalid_args", "{r}");
+    assert_eq!(r["decision"], Value::Null, "{r}");
+    assert!(s.argv_log().is_empty(), "{}", s.argv_log());
+}

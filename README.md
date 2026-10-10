@@ -28,7 +28,7 @@ Every call is **capability-gated** by the per-host allowlist in the inventory. A
 | `exec` | `ssh_exec`, `ssh_batch` (N commands, one session), `bash_exec` (script body over stdin), `file_read`, `file_write`, `file_list`, `file_stat`, `rsync_sync`, `host_diagnose` |
 | `sudo_exec` | `ssh_sudo_exec`, `host_sleep`, `service_control`, `service_logs`, `file_write` with `sudo=true` |
 
-24 tools. v0.12.2 removed 14 that production didn't use: `claude_exec`, the interpreter runners other than `bash_exec`, and the `mcp_*` family (see the [CHANGELOG](CHANGELOG.md) for what replaces each). An inventory may still list the `claude_admin` / `claude_exec` capabilities and `apytti_url`: they load, are ignored, and are logged once.
+24 tools. v0.12.2 removed 14 that production didn't use: `claude_exec`, the interpreter runners other than `bash_exec`, and the `mcp_*` family (see the [CHANGELOG](CHANGELOG.md) for what replaces each; a call to one is refused with its replacement). An inventory may still list the `claude_admin` / `claude_exec` capabilities and `apytti_url`: they load, are ignored, and are logged once.
 
 `ssh_exec` stdout passes through a filter chain (cargo, git, journalctl, systemctl, pkg, k8s, zfs, …) that compacts known-noisy output and names the filter it applied. Compound commands (`;`, `&&`, `||`, `&`, newlines) are never filtered.
 

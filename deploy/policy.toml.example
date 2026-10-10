@@ -12,8 +12,9 @@
 #            "anonymous" (no token, optional mode) and "local" (stdio) only
 #            match by name.
 #   hosts    inventory names or aliases, * ? globs, group:<g> (inventory
-#            `groups`). Ignored for inventory_list and prompto_gain, which
-#            target no host (they still need a tools match).
+#            `groups`). Ignored for inventory_list and prompto_gain,
+#            which target no host (they still need a
+#            tools match).
 #   tools    tool names, * ? globs.
 #   sudo     false (default): grants ordinary calls only.
 #            true: grants root-capable calls only — ssh_sudo_exec,
