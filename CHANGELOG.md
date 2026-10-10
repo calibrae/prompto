@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.12.1 (unreleased)
+## v0.12.1 — 2026-10-10
 
 Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"` now grants a call that carries a valid ticket, instead of always refusing it.
 
