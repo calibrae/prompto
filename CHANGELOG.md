@@ -22,6 +22,14 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **`GET /v1/audit?host=&session=&limit=`**: the caller's own audit records; with `host`, only where policy grants the agent something; never for `anonymous` or with `PROMPTO_AUTH=off`.
 - **`POST /v1/kill`**: `scope: "session"` stops the caller's own calls in its own session; `scope: "global"` stops every call and needs an approver's TOTP code. Written to `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`); lifted only with `prompto kill off` / `prompto unkill session <id>`. Audited as `type: kill` with `by.agent`.
 - **`/v1/precheck`** answers also say `root` (whether the call is root-capable) on `allow` and `ask`.
+- **Hardening after review (task 021):**
+  - The approval pane shows **every argument** a ticket covers (the command first, then all the others, never omitted), and for `file_write` the diff or else the whole new content; values over 32 KiB as their head, size and SHA-256 with a "you are approving all N bytes" warning. Control and bidi characters in anything it draws are shown escaped.
+  - Claude Code's own permission verdict is asked **before** the pane (a deny costs no code) and before the pane reads the current file for its diff.
+  - The plugin warns at session start when a server of the person's shadows the plugin's and `servers` doesn't name it; a pane item whose call was lost on a reload says so instead of hanging; `123 456`-style codes in the name or reason field are refused too; `prompto-headers` refuses a token file whose ACL grants others read.
+  - `POST /v1/kill`: `reason` cut to 256 chars and cleaned; at most 100 live session kills per agent and 1000 HTTP switches in all (429 beyond); `PROMPTO_KILL_API_DIR` created `0700`, switches `0600`.
+  - `/v1/whoami|audit|kill` take bodies up to 64 KiB, `/v1/precheck|approve` up to 2 MiB (413 beyond).
+  - `GET /v1/audit`: scans off the async runtime, at most 30 reads per agent per minute (429), and each read is a new `"type": "audit_read"` audit record.
+  - A refused approver name is never written raw (audit records, journal): only its length and a short hash.
 
 ### macOS and FreeBSD targets
 
@@ -45,7 +53,7 @@ With neither ticket variable set, nothing is minted or accepted: `approval` rule
 2. Two new routes, `POST /v1/precheck` and `POST /v1/approve`, behind the same authentication as `/mcp` (unauthenticated with `PROMPTO_AUTH=off`, where they report every call as needing no approval).
 3. Audit records may carry `ticket_sha256` / `scope_minutes`, and `args.ticket` is never recorded.
 4. `serde_json`'s `float_roundtrip` is on: JSON numbers in arguments now always parse to the nearest double (needed for stable argument digests).
-5. Three more routes, `GET /v1/whoami`, `GET /v1/audit` and `POST /v1/kill`. Each call also `stat`s `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`; absent = nothing set), which the startup probe checks like `kill.d`. `prompto kill off` and `unkill session` also lift what was set there. Kill records may carry `scope: "agent_session"` and an `agent`.
+5. Three more routes, `GET /v1/whoami`, `GET /v1/audit` (each read audited as `audit_read`) and `POST /v1/kill`. Each call also `stat`s `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`; absent = nothing set), which the startup probe checks like `kill.d`. `prompto kill off` and `unkill session` also lift what was set there. Kill records may carry `scope: "agent_session"` and an `agent`. The API directory is `0700` (switches `0600`), so `prompto kill status` reads it as root. A refused approval's `approved_by` is now a length and a hash, not the typed name. The lockout message no longer names the approver.
 6. `file_list` on a path that is a symlink to a directory lists the directory (it used to list the link alone); results may carry the new optional fields above, and exec-style results always carry `error_class`.
 6. **`ssh_sudo_exec` on `sudo -n` hosts**: a compound command now needs sudo to allow `sh` (`sudo -n -- sh -s`). A host whose sudoers allows only specific commands refuses it (`sudo: a password is required`, `remote_nonzero`) where the first part used to run as root and the rest as `ssh_user`. Plain-word commands are unchanged.
 7. **Approval secrets on `PROMPTO_VAULT_MOUNT`**: with `PROMPTO_PRIVATE_MOUNT` set to the same mount as `PROMPTO_VAULT_MOUNT`, approvals are now off whatever the path (it used to be only under `prompto/`, `infra/`, `nxp/`). The private mount is the only valid home. A `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` that names prefixes on `PROMPTO_VAULT_MOUNT` still works (they are covered already); it can no longer narrow the shared mount.
