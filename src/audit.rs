@@ -565,7 +565,7 @@ pub fn judge(tool: &str, outcome: &Outcome, notes: &Notes, sudo: bool) -> Verdic
     let allowed = || notes.authorized.then_some("allow");
     match outcome {
         Outcome::Success(p) => {
-            let (exit_code, error_class) = success_status(p, sudo);
+            let (exit_code, error_class) = success_status(tool, p, sudo);
             Verdict {
                 ok: error_class.is_none(),
                 exit_code,
@@ -614,7 +614,7 @@ pub fn judge(tool: &str, outcome: &Outcome, notes: &Notes, sudo: bool) -> Verdic
 /// run a command return its `exit_code` (and `timed_out`, `stderr`) in
 /// the payload rather than failing; `ssh_batch` returns `all_ok` and
 /// per-command `items`.
-fn success_status(p: &Value, sudo: bool) -> (Option<i32>, Option<ErrorClass>) {
+fn success_status(tool: &str, p: &Value, sudo: bool) -> (Option<i32>, Option<ErrorClass>) {
     let exit = |v: &Value| v.get("exit_code").and_then(Value::as_i64).map(|c| c as i32);
     if p.get("all_ok") == Some(&Value::Bool(false)) {
         let first_bad = p
@@ -628,21 +628,26 @@ fn success_status(p: &Value, sudo: bool) -> (Option<i32>, Option<ErrorClass>) {
     if timed_out {
         return (exit_code, Some(ErrorClass::Timeout));
     }
+    let stderr = p.get("stderr").and_then(Value::as_str).unwrap_or_default();
     let class = match exit_code {
         None | Some(0) => None,
         Some(_) => error_class::classify_exec(
             &ExecOutput {
                 stdout: String::new(),
-                stderr: p
-                    .get("stderr")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                stderr: stderr.to_string(),
                 exit_code,
                 timed_out: false,
             },
             sudo,
         ),
+    };
+    let class = match (class, crate::script::interpreter_for_tool(tool)) {
+        (Some(ErrorClass::RemoteNonzero), Some(i))
+            if crate::script::interpreter_missing(i, exit_code, stderr) =>
+        {
+            Some(ErrorClass::InterpreterMissing)
+        }
+        (class, _) => class,
     };
     (exit_code, class)
 }

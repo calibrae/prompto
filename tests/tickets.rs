@@ -1690,6 +1690,49 @@ async fn approval_secrets_agents_can_read_disable_approvals() {
     assert!(a2.unavailable().is_some());
 }
 
+/// Agents read the whole shared mount (`PROMPTO_VAULT_MOUNT`), whatever
+/// `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` says: the variable only adds
+/// locations. A prefix list went stale in production (`ai/`,
+/// `personal/`, … were readable too).
+#[test]
+fn the_whole_shared_mount_is_agent_readable() {
+    use prompto::approval::PrivateVault;
+    for extra in [
+        None,
+        Some(""),
+        Some("prompto/,infra/"),
+        Some("ai:,other:x/"),
+    ] {
+        let pv = PrivateVault::from_parts("secret", Some("secret"), extra);
+        for path in ["ticket-key", "ai/k", "personal/approvers/a", "zzz/k"] {
+            assert!(pv.check_path("k", path).is_err(), "{extra:?} {path}");
+        }
+        // The private mount is the valid home.
+        let pv = PrivateVault::from_parts("secret", None, extra);
+        assert_eq!(pv.mount, "prompto-private");
+        assert!(pv.check_path("k", "ticket-key").is_ok(), "{extra:?}");
+    }
+    // Extra entries on other mounts are added.
+    let pv = PrivateVault::from_parts(
+        "kv",
+        Some("prompto-private"),
+        Some("prompto-private:legacy/"),
+    );
+    assert!(pv.check_path("k", "legacy/ticket-key").is_err());
+    assert!(pv.check_path("k", "ticket-key").is_ok());
+    let pv = PrivateVault::from_parts("kv", Some("kv"), None);
+    assert!(pv.check_path("k", "anything").is_err());
+    // The default is the same as from_parts with nothing set.
+    assert!(
+        PrivateVault {
+            mount: "secret".into(),
+            ..Default::default()
+        }
+        .check_path("k", "ai/x")
+        .is_err()
+    );
+}
+
 /// Root, or prompto's service user, on the host running prompto reads
 /// the approval factors: while the live policy grants either (the
 /// `prompto_host` lint errors), approvals are off — the same refusal as
@@ -1773,10 +1816,11 @@ capabilities = ["exec", "sudo_exec"]
 const BIN: &str = env!("CARGO_BIN_EXE_prompto");
 
 /// `prompto approver add --vault-path`: refused where agents can read,
-/// and — unless `--i-know` — in the same vault directory as a sudo
-/// password. Both refusals come before anything touches vault.
+/// before anything touches vault. (The sudo-directory refusal can no
+/// longer be reached: sudo passwords live on the shared mount, which is
+/// agent-readable as a whole.)
 #[test]
-fn approver_cli_refuses_agent_readable_and_sudo_prefixed_paths() {
+fn approver_cli_refuses_agent_readable_paths() {
     let dir = tempfile::tempdir().unwrap();
     let inv = dir.path().join("prompto.toml");
     std::fs::write(
@@ -1785,29 +1829,46 @@ fn approver_cli_refuses_agent_readable_and_sudo_prefixed_paths() {
          capabilities = [\"exec\", \"sudo_exec\"]\nsudo_password_vault_path = \"ops/sudo-edge\"\n",
     )
     .unwrap();
-    let run = |mount: &str, path: &str, extra: &[&str]| {
-        let out = std::process::Command::new(BIN)
-            .args(["approver", "add", "alice", "--vault-path", path])
+    let run_with = |mount: &str, path: &str, extra: &[&str], readable: Option<&str>| {
+        let mut cmd = std::process::Command::new(BIN);
+        cmd.args(["approver", "add", "alice", "--vault-path", path])
             .args(extra)
             .env_clear()
             .env("PROMPTO_INVENTORY", &inv)
             .env("PROMPTO_APPROVERS", dir.path().join("approvers.toml"))
             .env("PROMPTO_PRIVATE_MOUNT", mount)
-            .env("PROMPTO_VAULT_MOUNT", "secret")
-            .output()
-            .unwrap();
+            .env("PROMPTO_VAULT_MOUNT", "secret");
+        if let Some(r) = readable {
+            cmd.env("PROMPTO_AGENT_READABLE_VAULT_PREFIXES", r);
+        }
+        let out = cmd.output().unwrap();
         assert!(!out.status.success());
         String::from_utf8_lossy(&out.stderr).to_string()
     };
-    // The old default, prompto/approvers/<name> on the shared mount.
-    let e = run("secret", "prompto/approvers/alice", &["--i-know"]);
+    let run = |mount: &str, path: &str, extra: &[&str]| run_with(mount, path, extra, None);
+    // The old default, prompto/approvers/<name> on the shared mount, and
+    // any other path there: the whole shared mount is agent-readable
+    // (task 018), --i-know or not.
+    for path in [
+        "prompto/approvers/alice",
+        "ai/alice",
+        "personal/alice",
+        "alice",
+    ] {
+        let e = run("secret", path, &["--i-know"]);
+        assert!(e.contains("agents can read"), "{path}: {e}");
+    }
+    // Setting the variable only adds locations: the shared mount stays
+    // covered.
+    let e = run_with("secret", "ai/alice", &["--i-know"], Some("other:"));
     assert!(e.contains("agents can read"), "{e}");
-    // Next to a sudo password: refused, --i-know lets it through (to the
-    // missing token, here).
-    let e = run("secret", "ops/approvers-alice", &[]);
-    assert!(e.contains("sudo password") && e.contains("--i-know"), "{e}");
-    let e = run("secret", "ops/approvers-alice", &["--i-know"]);
-    assert!(e.contains("PROMPTO_VAULT_TOKEN"), "{e}");
+    let e = run_with(
+        "prompto-private",
+        "approvers/alice",
+        &[],
+        Some("prompto-private:approvers/"),
+    );
+    assert!(e.contains("agents can read"), "{e}");
     // The private mount: straight to vault.
     let e = run("prompto-private", "approvers/alice", &[]);
     assert!(e.contains("PROMPTO_VAULT_TOKEN"), "{e}");

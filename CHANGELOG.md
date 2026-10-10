@@ -10,7 +10,7 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **`POST /v1/approve`**: a human approver's TOTP code (RFC 6238; single-use codes; lockout after 5 wrong codes in 15 min) turns an `ask` into an `approval = "human"` ticket naming the approver. Optional `scope_minutes` (≤ 60): one ticket for every call by the same agent, session, tool and host(s), decided by the same policy rule(s) and with the same root-capability, whatever the other arguments. A scope for a root-capable call needs `allow_root_scope: true`.
 - **Every tool accepts a `ticket` argument**, checked where policy demands one: missing → `approval_required` (the message says how to get one), invalid, forged, expired, replayed or for another call → `refused_ticket`.
 - **Keys** from vault KV (`PROMPTO_TICKET_KEY_VAULT_PATH`, fields `current` / `previous`) or an owner-only file (`PROMPTO_TICKET_KEY_FILE`); current and previous both accepted; re-read every minute and on SIGHUP. Used nonces and TOTP steps persist (synced) in `PROMPTO_APPROVAL_STATE` across restarts.
-- **Approval secrets are never agent-readable.** The ticket key and vault-held TOTP secrets are read from their own KV mount, `PROMPTO_PRIVATE_MOUNT` (default `prompto-private`), which only prompto's token may read. If either is configured under `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` (default `prompto/,infra/,nxp/` on `PROMPTO_VAULT_MOUNT`), approvals are turned off with an error saying what to move. `prompto approver add --vault-path` refuses such paths, and paths next to a sudo password unless `--i-know`.
+- **Approval secrets are never agent-readable.** The ticket key and vault-held TOTP secrets are read from their own KV mount, `PROMPTO_PRIVATE_MOUNT` (default `prompto-private`), which only prompto's token may read. If either is agent-readable, approvals are turned off with an error saying what to move. The whole of `PROMPTO_VAULT_MOUNT` (the sudo passwords' mount) counts as agent-readable; `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` adds other places agents read, as `<mount>:<prefix>`. `prompto approver add --vault-path` refuses such paths, and paths next to a sudo password unless `--i-know`.
 - **Inventory `prompto_host = true`** marks the machine running prompto; `policy lint` reports an error for any rule granting root there (sudo, or exec where the shell can sudo), or a shell/file tool there as prompto's own service user (`PROMPTO_SERVICE_USER`, default `prompto`), unless the rule says `crown_jewel_ack = true`. While the live policy has such an error, approvals are off (startup, SIGHUP and every re-read of `policy.toml`), as for a misplaced secret.
 - **CLI:** `prompto approver add|list|revoke` (prints the `otpauth://` URI and a terminal QR code once; `--i-know`), `prompto ticket keygen`.
 - **Audit:** the ticket is removed from `args` and recorded as `ticket_sha256`; `approved_by` is filled in; new record types `precheck` and `approve`.
@@ -23,6 +23,12 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **`ssh_batch` on FreeBSD** runs instead of refusing: a POSIX `/bin/sh` script drives the same protocol there and each command runs under `sh -c` (bash is absent; OPNsense's login shell is csh). Linux and macOS keep the bash script unchanged; `windows` still refuses.
 - **Exec-style results carry `error_class`** (as `rsync_sync`'s did): the audit record's class for a non-zero exit, `null` on success. Additive.
 
+### Exec fixes
+
+- **`ssh_sudo_exec` runs a compound command entirely as root on `sudo -n` hosts**, as it already did on vault hosts. A command with shell syntax (`a; b`, `&&`, `|`, redirects, `$`, backquotes, globs, `~`, braces, a leading `VAR=value`) is sent as `sudo -n -- sh -s` with the command on stdin; before, only its first simple command was elevated, and the rest (redirects included) ran as `ssh_user`. A command of plain words is still sent as `sudo -n -- <cmd>`, so narrow sudoers rules keep matching. The root shell also gets `PROMPTO_REQUEST_ID`.
+- **`rsync_sync`**: the source host's inner `ssh` gets `-o ConnectTimeout=15`, so an unreachable dest fails as `dest_ssh_connect` in 15 s instead of the OS TCP timeout (75 s to 4 min).
+- **New error class `interpreter_missing`** for `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec` and `bash_exec` when the interpreter isn't installed (the shell's "command not found", exit 127; csh's "Command not found.", exit 1). It was `remote_nonzero`.
+
 ### Upgrade note — no new config
 
 With neither ticket variable set, nothing is minted or accepted: `approval` rules refuse their calls as in v0.12.0. Visible changes:
@@ -32,6 +38,9 @@ With neither ticket variable set, nothing is minted or accepted: `approval` rule
 3. Audit records may carry `ticket_sha256` / `scope_minutes`, and `args.ticket` is never recorded.
 4. `serde_json`'s `float_roundtrip` is on: JSON numbers in arguments now always parse to the nearest double (needed for stable argument digests).
 5. `file_list` on a path that is a symlink to a directory lists the directory (it used to list the link alone); results may carry the new optional fields above, and exec-style results always carry `error_class`.
+6. **`ssh_sudo_exec` on `sudo -n` hosts**: a compound command now needs sudo to allow `sh` (`sudo -n -- sh -s`). A host whose sudoers allows only specific commands refuses it (`sudo: a password is required`, `remote_nonzero`) where the first part used to run as root and the rest as `ssh_user`. Plain-word commands are unchanged.
+7. **Approval secrets on `PROMPTO_VAULT_MOUNT`**: with `PROMPTO_PRIVATE_MOUNT` set to the same mount as `PROMPTO_VAULT_MOUNT`, approvals are now off whatever the path (it used to be only under `prompto/`, `infra/`, `nxp/`). The private mount is the only valid home. A `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` that names prefixes on `PROMPTO_VAULT_MOUNT` still works (they are covered already); it can no longer narrow the shared mount.
+8. `interpreter_missing` replaces `remote_nonzero` for a missing interpreter, in results and the audit log.
 
 ## v0.12.0
 

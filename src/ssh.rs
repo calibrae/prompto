@@ -82,6 +82,32 @@ pub fn sudo_guarded(cmd: &str) -> String {
     format!("{prefix}{cmd}")
 }
 
+/// Remote command for a caller's compound command on a `sudo -n` host:
+/// the command itself travels on stdin, so the whole of it (every
+/// `;`/`&&`/`|` part, redirects, expansions) runs as root, as it does on
+/// vault hosts. See [`needs_root_shell`].
+pub const SUDO_N_SHELL: &str = "sudo -n -- sh -s";
+
+/// Whether `cmd` must go through [`SUDO_N_SHELL`] on a `sudo -n` host.
+///
+/// `sudo -n -- <cmd>` elevates only the first simple command: the login
+/// shell parses the rest (`a; b`, `a > /etc/x`, `$(…)`, globs, `~`) as
+/// `ssh_user`. A command made only of words — letters, digits,
+/// `_-./:,=@+%`, blanks and quotes — has nothing for the login shell to
+/// do but split and unquote, so it keeps `sudo -n -- <cmd>` and narrow
+/// sudoers rules (`ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart
+/// nginx`) still match it. Anything else, and a leading `VAR=value`
+/// (which sudo would treat as an environment setting), is sent as
+/// [`SUDO_N_SHELL`], which needs sudo to allow `sh`.
+pub fn needs_root_shell(cmd: &str) -> bool {
+    let word_char = |c: char| c.is_ascii_alphanumeric() || " \t_-./:,=@+%'\"".contains(c);
+    let leading_assignment = cmd
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.contains('='));
+    leading_assignment || !cmd.chars().all(word_char)
+}
+
 /// Environment variable carrying the call's request ID to the remote
 /// command, so host-side logs can be joined with prompto's.
 pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
@@ -177,6 +203,12 @@ impl SshClient {
                 let remote = sudo_guarded(&with_request_id(ctx, host, "sh -s"));
                 return self
                     .run(ctx, host, &remote, Some(&input), cmd_timeout)
+                    .await;
+            }
+            if needs_root_shell(cmd) {
+                let input = sudo_n_shell_payload(ctx, host, cmd);
+                return self
+                    .run(ctx, host, SUDO_N_SHELL, Some(&input), cmd_timeout)
                     .await;
             }
             return self
@@ -379,6 +411,18 @@ pub fn sudo_stdin_payload(password: &str, cmd: &[u8]) -> Vec<u8> {
     v
 }
 
+/// stdin for [`SUDO_N_SHELL`]: the request ID export (sudo has reset the
+/// environment; skipped on `off` hosts), then the command.
+fn sudo_n_shell_payload(ctx: &CallCtx, host: &HostConfig, cmd: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(cmd.len() + 64);
+    if host.request_id_env() != RequestIdEnv::Off {
+        v.extend_from_slice(format!("export {REQUEST_ID_ENV}={}\n", ctx.request_id()).as_bytes());
+    }
+    v.extend_from_slice(cmd.as_bytes());
+    v.push(b'\n');
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +452,46 @@ mod tests {
             "csh history-expands ! inside single quotes"
         );
         assert!(!body.contains('\n'), "csh rejects newlines in quoted words");
+    }
+
+    #[test]
+    fn plain_words_keep_sudo_n_everything_else_gets_a_root_shell() {
+        for simple in [
+            "id -u",
+            "systemctl restart nginx",
+            "sysctl -w net.ipv4.ip_forward=1",
+            "grep 'a b' /etc/hosts",
+            "date +%s",
+            "chmod -- 640 /etc/x",
+        ] {
+            assert!(!needs_root_shell(simple), "{simple}");
+        }
+        for compound in [
+            "id -u; whoami",
+            "a && b",
+            "a || b",
+            "a | b",
+            "echo x > /etc/x",
+            "cat < /etc/x",
+            "a & b",
+            "echo $HOME",
+            "echo `id`",
+            "echo $(id)",
+            "ls /root/*",
+            "ls /root/?",
+            "ls [ab]",
+            "cat ~/.profile",
+            "echo {a,b}",
+            "a\nb",
+            "echo a \\; b",
+            "( a )",
+            "! a",
+            "a # b",
+            "FOO=1 cmd",
+            "echo é",
+        ] {
+            assert!(needs_root_shell(compound), "{compound:?}");
+        }
     }
 
     #[test]

@@ -302,12 +302,6 @@ async fn open_approvals(
         agent_readable = %cfg.private.agent_readable.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
         "tickets and approvals enabled"
     );
-    if cfg.private.agent_readable.is_empty() {
-        tracing::warn!(
-            "PROMPTO_AGENT_READABLE_VAULT_PREFIXES is empty: prompto cannot check that agents \
-             can't read the approval secrets"
-        );
-    }
     warn_sudo_prefix_overlap(&cfg, inv);
     // Approval secrets are read from their own mount, with the same token.
     let vault = vault.map(|v| Arc::new(v.with_mount(&cfg.private.mount)));
@@ -504,11 +498,10 @@ reads it approves its own calls):
       prompto's own token may read; see the README, \"Where the approval
       secrets live\", for the vault policy. Uses PROMPTO_VAULT_ADDR/_CACERT
       and a PROMPTO_VAULT_TOKEN that may write there (an operator token,
-      not prompto's). Refused if the path is under
-      $PROMPTO_AGENT_READABLE_VAULT_PREFIXES (default prompto/,infra/,nxp/ on
-      $PROMPTO_VAULT_MOUNT). Refused too if it shares a vault directory
-      with a host's sudo_password_vault_path (policies written for those
-      would likely cover it) unless --i-know.
+      not prompto's). Refused if the private mount is $PROMPTO_VAULT_MOUNT
+      (default secret; agents are assumed to read all of it) or the path
+      is under $PROMPTO_AGENT_READABLE_VAULT_PREFIXES. --i-know skips the
+      check against the sudo passwords' vault directories.
   --file <path>   (default: approvers.d/<name>.totp next to the approvers
       file) an owner-only file in a directory owned by the service user.
       Anyone who is root on this machine can read it — and so can any
@@ -736,7 +729,8 @@ Whoever holds the key can mint any ticket: it must be readable by prompto's
 own token or user ONLY. Store it as the `current` field of
 PROMPTO_TICKET_KEY_VAULT_PATH (KV v2) on the private mount
 $PROMPTO_PRIVATE_MOUNT (default prompto-private, which no other token may
-read; prompto refuses a path under $PROMPTO_AGENT_READABLE_VAULT_PREFIXES),
+read; prompto refuses one agents can read: all of $PROMPTO_VAULT_MOUNT and
+$PROMPTO_AGENT_READABLE_VAULT_PREFIXES),
 or as the first line of PROMPTO_TICKET_KEY_FILE (mode 0600, owned by the
 service user; any agent with root on this host defeats it — see
 prompto_host in the README). To rotate: move the old key to `previous`
