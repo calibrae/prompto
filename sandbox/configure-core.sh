@@ -198,11 +198,18 @@ Description=prompto (sandbox dev)
 After=network-online.target
 Wants=network-online.target
 [Service]
+# Continuity (task 022): see deploy/prompto.service.
+Type=notify
+NotifyAccess=main
 User=prompto
 Group=prompto
 EnvironmentFile=/etc/prompto/env
+Environment=PROMPTO_ENV_FILE=/etc/prompto/env
 Environment=HOME=/var/lib/prompto
 ExecStart=/usr/local/bin/prompto-dev
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=660
 Restart=on-failure
 WorkingDirectory=/var/lib/prompto
 StateDirectory=prompto

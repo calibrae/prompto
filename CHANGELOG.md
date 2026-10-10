@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Continuity of service (roadmap E11)
+
+- **Graceful drain.** SIGTERM (and SIGINT) no longer kills calls in flight: prompto stops accepting connections, answers requests still arriving on open connections with a retryable `503` (`Retry-After`, `Connection: close`), lets the calls in flight finish for up to `PROMPTO_DRAIN_SECS` (default 600), then exits. At the deadline the calls still running get an `aborted` error and an `aborted` audit record; their local `ssh` process group is killed and their remote processes are reaped (a second connection kills the process groups carrying the call's `PROMPTO_REQUEST_ID`, as root when the call ran as root). A second SIGTERM cuts the drain short.
+- **Binary handover, no gap.** `systemctl kill -s SIGUSR2 --kill-whom=main prompto` after installing a new binary: the new process inherits the listening socket and becomes the unit's main process; the old one drains. A successor that can't start leaves the old process serving. `PROMPTO_ENV_FILE` is re-read for the successor.
+- **Socket activation** (optional `deploy/prompto.socket`): an inherited `LISTEN_FDS` socket is used instead of `PROMPTO_BIND`.
+- **Two processes at once are safe:** the approval state file is locked and re-read on every ticket and TOTP check; the kill API directory's count-then-write is locked across processes.
+- `ssh` now runs in a process group of its own, killed whole when a call is dropped before it ends (timeout, drain deadline, client gone), so a `ProxyCommand` goes with it.
+- `deploy/prompto.service`: `Type=notify`, `NotifyAccess=main`, `KillMode=mixed`, `TimeoutStopSec=660`, `ExecReload` = SIGHUP, `PROMPTO_ENV_FILE`. **Install the new unit with the new binary** (a `Type=notify` unit with an older binary never becomes ready); the first upgrade to this version is a plain restart.
+- `examples/loadgen.rs`: N fake agents with their own tokens, mixed long/short/file/sudo/ticket/refused calls, every outcome checked against its expectation.
+
 ## v0.12.2 — 2026-10-10
 
 ### Breaking: 14 unused tools removed (roadmap S0.3)

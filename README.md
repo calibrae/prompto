@@ -520,10 +520,12 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_PRIVATE_MOUNT` | `prompto-private` | KV v2 mount the ticket key and approvers' TOTP secrets are read from. Only prompto's token may read it: see [Where the approval secrets live](#where-the-approval-secrets-live). |
 | `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` | *(empty)* | What else agents can read in vault, besides the whole of `PROMPTO_VAULT_MOUNT` (always counted): `<mount>:<prefix>` entries, comma-separated. An approval secret under one turns approvals off. |
 | `PROMPTO_SERVICE_USER` | `prompto` | The account prompto runs as. A policy grant of a shell or file tool on a `prompto_host` whose `ssh_user` is this user is a lint error and turns approvals off. |
+| `PROMPTO_DRAIN_SECS` | `600` | On SIGTERM (and in the old process after a handover), how long calls in flight may still run; the rest are then aborted and their remote processes killed. See [Restarts and deploys](#restarts-and-deploys). |
+| `PROMPTO_ENV_FILE` | unset | The unit's `EnvironmentFile`. Re-read for a handover's successor, so edits to it apply as on a restart. Set in `deploy/prompto.service`. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
-Env is read once at startup: changes need a restart. The inventory, `agents.toml` and `policy.toml` (the last two unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently; `agents.toml` and `policy.toml` are also re-read on the first request after they change. Kill switches are read on every call.
+Env is read once at startup: changes need a restart, or a [handover](#restarts-and-deploys) with `PROMPTO_ENV_FILE` set. The inventory, `agents.toml` and `policy.toml` (the last two unless `PROMPTO_AUTH=off`) reload on `SIGHUP`, each independently; `agents.toml` and `policy.toml` are also re-read on the first request after they change. Kill switches are read on every call.
 
 CLI:
 
@@ -596,12 +598,27 @@ Then set its options (`/plugin configure prompto@prompto`, or `pluginConfigs` in
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
 scp target/x86_64-unknown-linux-musl/release/prompto YOUR-HOST:/tmp/
-scp -r deploy/{install.sh,prompto.service,env.example,prompto.toml.example,logrotate.d} YOUR-HOST:/tmp/
+scp -r deploy/{install.sh,prompto.service,prompto.socket,env.example,prompto.toml.example,logrotate.d} YOUR-HOST:/tmp/
 ssh YOUR-HOST 'sudo /tmp/install.sh /tmp/prompto'
 ssh YOUR-HOST 'sudo systemctl enable --now prompto'
 ```
 
 Keep the env file (`/etc/prompto/env`) `0640 root:prompto` once it holds a vault token.
+
+### Restarts and deploys
+
+Agents run long calls (builds, `rsync_sync`) through prompto all day; no reload, restart or deploy should make one fail.
+
+- **Config:** `systemctl reload prompto` (SIGHUP) re-reads the inventory, `agents.toml`, `policy.toml` and the ticket keys; `agents.toml`, `policy.toml` and kill switches apply on the next call even without it. Nothing is interrupted. Write config files atomically (to a temporary file, then `mv`): a policy re-read that catches a half-written file fails closed.
+- **New binary, no gap:** install it over the old one, then
+  ```bash
+  sudo systemctl kill -s SIGUSR2 --kill-whom=main prompto
+  ```
+  The running process starts the new binary and hands it the listening socket — the same socket, so no connection is ever refused or queued behind a restart. Once the new process serves, it becomes the unit's main process and the old one drains: it accepts nothing new, answers what still arrives on its open connections with `Connection: close` (the client reconnects, to the new process), lets its calls in flight finish, then exits. If the new binary can't start (a bad config, a broken build), it exits, the old process logs `handover failed` and keeps serving. `systemctl status` shows `SIGUSR2 = binary handover` when the running build supports it; the first upgrade to it is a plain restart. The successor gets the old process's environment with `PROMPTO_ENV_FILE` re-read on top. Requires the shipped unit (`Type=notify`); with `Type=simple` systemd would kill the successor, so prompto refuses.
+- **Stop or restart:** SIGTERM drains. New connections are no longer accepted; a request that still reaches the process on an open connection gets `503` with `Retry-After` (nothing ran); calls in flight finish, for up to `PROMPTO_DRAIN_SECS` (600). At that deadline the calls still running are cancelled: the client gets `aborted` ("whether it took effect is unknown"), the audit log records `aborted`, prompto kills the local `ssh` process group, then reaps the remote side — sshd does not stop a command when its connection drops, so prompto connects again and kills every process group carrying the call's `PROMPTO_REQUEST_ID` (as root if the call ran as root; not possible on `request_id_env = "off"` hosts). A second SIGTERM cuts the drain short. The unit's `KillMode=mixed` sends SIGTERM to prompto only (the ssh children of calls in flight must not get it), and `TimeoutStopSec` must exceed `PROMPTO_DRAIN_SECS` by a minute.
+- **Socket activation (optional):** with `deploy/prompto.socket` systemd holds the listening socket, so a plain restart or a crash queues new connections in the kernel instead of refusing them. prompto then takes the socket from systemd and ignores `PROMPTO_BIND`.
+
+While a handover drains, two processes run. Audit and usage records are single appends; the approval state (used ticket nonces, TOTP steps) is locked and re-read on every check, so neither process accepts a ticket the other spent; the kill API's count-then-write is locked across both. Approver lockout counters and the `/v1/audit` read limit are per process and start fresh, as after any restart.
 
 Validate an inventory before installing it:
 

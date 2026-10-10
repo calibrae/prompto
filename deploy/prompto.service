@@ -5,15 +5,36 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Continuity (E11) — see "Restarts and deploys" in the README.
+#  - notify: prompto says when it serves, and after a binary handover
+#    (SIGUSR2) which process is the service's main one. NotifyAccess=main:
+#    only that process may — never an ssh child.
+#  - reload = SIGHUP: inventory, agents, policy, ticket keys re-read.
+#  - upgrade with no gap, after replacing the binary:
+#      systemctl kill -s SIGUSR2 --kill-whom=main prompto
+#    the new binary takes over the listening socket while the old process
+#    drains its calls in flight.
+#  - stop/restart = SIGTERM to prompto alone (KillMode=mixed): it stops
+#    accepting, lets the calls in flight finish for up to
+#    PROMPTO_DRAIN_SECS (default 600), aborts and reaps the rest, exits.
+#    Its ssh children must NOT get the SIGTERM (KillMode=control-group
+#    would kill every running call at once); whatever is left when
+#    TimeoutStopSec expires gets SIGKILL.
+#  - TimeoutStopSec >= PROMPTO_DRAIN_SECS + 60 (abort, remote reap, exit).
+Type=notify
+NotifyAccess=main
 User=prompto
 Group=prompto
 ExecStart=/opt/prompto/bin/prompto
 ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=660
 Restart=on-failure
 RestartSec=5
 
 EnvironmentFile=-/etc/prompto/env
+# Re-read by a handover's successor, so edits apply as on a restart.
+Environment=PROMPTO_ENV_FILE=/etc/prompto/env
 Environment=RUST_LOG=prompto=info
 
 # Hardening — prompto needs:
