@@ -104,7 +104,7 @@ capabilities = []
 
 | Field | Meaning |
 |---|---|
-| `platform` | Target OS. Tools **adapt** where a BSD equivalent exists (`stat -f`, `ls -T`), and **refuse** legibly where the model differs: no systemd tools off Linux, no `ssh_batch` without bash (FreeBSD/OPNsense ship csh). `windows` is declared so the host can be addressed, not shelled into. |
+| `platform` | Target OS. Tools **adapt** where a BSD equivalent exists (`stat -f`, `ls -T`), and **refuse** legibly where the model differs: no systemd tools off Linux; `ssh_batch` runs its commands under `sh -c` on FreeBSD/OPNsense, which have no bash. `windows` is declared so the host can be addressed, not shelled into. |
 | `chassis` / `hypervisor` | `vm` makes `host_wake` refuse and point at `vm_start <hypervisor> <name>` instead of broadcasting at a NIC that does not exist yet. |
 | `aliases` | One machine, one entry, reachable by either name. Collisions with host names or other aliases are load errors. |
 | `apytti_url` | Gateway URL; required with `claude_exec`. |

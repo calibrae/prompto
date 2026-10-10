@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
 done
 [ "$1" = "--" ] && shift
 case "$target" in
-  127.0.0.20|127.0.0.21) PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
+  127.0.0.20|127.0.0.21|127.0.0.23) PATH="$dir:$PATH" exec /bin/sh -c "$*" ;;
 esac
 exit 0
 "#;
@@ -90,6 +90,21 @@ ip = "127.0.0.22"
 ssh_user = "admin"
 ssh_key = "/dev/null"
 request_id_env = "off"
+capabilities = ["exec"]
+
+# FreeBSD: no bash, so ssh_batch is driven by /bin/sh (task 017).
+[host.bsd]
+ip = "127.0.0.23"
+ssh_user = "admin"
+ssh_key = "/dev/null"
+platform = "freebsd"
+capabilities = ["exec"]
+
+[host.win]
+ip = "127.0.0.24"
+ssh_user = "admin"
+ssh_key = "/dev/null"
+platform = "windows"
 capabilities = ["exec"]
 
 [host.vaulted]
@@ -457,4 +472,45 @@ async fn log_endpoint_refuses_self_target_and_returns_request_id() {
     assert_ulid(&rid);
     let body = resp.text().await.unwrap();
     assert!(body.contains(SELF_TARGET_MSG), "{body}");
+}
+
+/// FreeBSD has no bash: ssh_batch sends its POSIX script to `/bin/sh`
+/// (run here by the local /bin/sh) and every command comes back. Before
+/// task 017 this was refused with "ssh_batch needs bash".
+#[tokio::test]
+async fn ssh_batch_on_freebsd_runs_under_sh() {
+    let s = spawn_server().await;
+    let resp = call(
+        &s,
+        "ssh_batch",
+        json!({ "host": "bsd", "commands": ["echo one", "echo two; exit 4", "echo never"] }),
+    )
+    .await;
+    let out = ok_payload(&resp);
+    let items = out["items"].as_array().unwrap_or_else(|| panic!("{resp}"));
+    assert_eq!(items[0]["output"], "one", "{out}");
+    assert_eq!(items[1]["output"], "two", "{out}");
+    assert_eq!(items[1]["exit_code"], 4, "{out}");
+    assert_eq!(items[2]["skipped"], true, "{out}");
+    assert_eq!(out["all_ok"], false, "{out}");
+    let argv = s.argv_log();
+    assert!(argv.lines().any(|l| l == "/bin/sh"), "{argv}");
+    assert!(!argv.lines().any(|l| l.contains("bash")), "{argv}");
+}
+
+/// No POSIX shell at all: still a clear refusal, nothing sent.
+#[tokio::test]
+async fn ssh_batch_on_windows_is_refused() {
+    let s = spawn_server().await;
+    let resp = call(
+        &s,
+        "ssh_batch",
+        json!({ "host": "win", "commands": ["dir"] }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["data"]["error_class"], "refused_capability",
+        "{resp}"
+    );
+    assert!(s.argv_log().is_empty(), "{}", s.argv_log());
 }
