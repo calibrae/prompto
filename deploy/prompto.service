@@ -12,15 +12,19 @@ Wants=network-online.target
 #  - reload = SIGHUP: inventory, agents, policy, ticket keys re-read.
 #  - upgrade with no gap, after replacing the binary:
 #      systemctl kill -s SIGUSR2 --kill-whom=main prompto
-#    the new binary takes over the listening socket while the old process
-#    drains its calls in flight.
+#    the new binary takes over the listening socket (after a 5 s
+#    probation, both accepting) while the old process drains its calls in
+#    flight. A deploy tool, not a revocation one: agents.toml, policy.toml
+#    and kill switches apply in every running process on the next request.
 #  - stop/restart = SIGTERM to prompto alone (KillMode=mixed): it stops
 #    accepting, lets the calls in flight finish for up to
 #    PROMPTO_DRAIN_SECS (default 600), aborts and reaps the rest, exits.
 #    Its ssh children must NOT get the SIGTERM (KillMode=control-group
 #    would kill every running call at once); whatever is left when
 #    TimeoutStopSec expires gets SIGKILL.
-#  - TimeoutStopSec >= PROMPTO_DRAIN_SECS + 60 (abort, remote reap, exit).
+#  - a stop takes at most PROMPTO_DRAIN_SECS + ~40 s (remote reaps <= 25 s,
+#    aborted answers <= 10 s, close 2 s), so TimeoutStopSec must be at
+#    least PROMPTO_DRAIN_SECS + 60: raise both together.
 Type=notify
 NotifyAccess=main
 User=prompto
