@@ -487,7 +487,7 @@ impl Inventory {
     fn warn_removed_once(&self) {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let w = self.warnings();
-        if !w.is_empty() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if first_time(&WARNED, !w.is_empty()) {
             tracing::warn!(
                 hosts = %w.join("; "),
                 "inventory: the claude_admin / claude_exec capabilities and apytti_url belong \
@@ -585,6 +585,11 @@ impl InventoryStore {
     }
 }
 
+/// `true` the first time it is asked with `now` set, then never again.
+fn first_time(flag: &std::sync::atomic::AtomicBool, now: bool) -> bool {
+    now && !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +636,16 @@ capabilities = ["exec"]
             !json.contains("apytti") && !json.contains("claude_"),
             "{json}"
         );
+    }
+
+    /// The removed-capability warning is logged once per process, not on
+    /// every reload.
+    #[test]
+    fn removed_capabilities_warn_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!first_time(&flag, false));
+        assert!(first_time(&flag, true));
+        assert!(!first_time(&flag, true));
     }
 
     /// `claude_exec` without `apytti_url` used to be a load error; now

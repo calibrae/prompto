@@ -723,6 +723,11 @@ mod tests {
             ("ssh_exec", "python3 - <<'EOF'\nprint(1)\nEOF"),
             ("ssh_exec", "tee /etc/a /etc/b <<EOF\nx\nEOF"),
             ("bash_exec", "cat /etc/hosts"),
+            ("bash_exec", "systemctl restart nginx"),
+            ("ssh_batch", "journalctl -u nginx"),
+            // `#` starts a comment: this is a bare `cat`.
+            ("ssh_exec", "cat #notes"),
+            ("ssh_exec", "ls -la #x"),
             ("file_read", "cat /etc/hosts"),
             ("ssh_exec", "uptime"),
             ("ssh_exec", ""),

@@ -1263,7 +1263,7 @@ fn cli_filters_records() {
 #[tokio::test]
 async fn advisor_hints_once_and_is_recorded_and_counted() {
     let s = spawn(AuthMode::Required).await;
-    let args = json!({ "host": "run", "cmd": "cat /etc/hostname" });
+    let args = json!({ "host": "run", "cmd": "cat /etc/hosts" });
     let first = call(&s, "ssh_exec", args.clone()).await;
     assert_ok(&first);
     let blocks = first["result"]["content"].as_array().unwrap();

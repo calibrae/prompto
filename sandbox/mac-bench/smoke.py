@@ -100,8 +100,8 @@ r = call("file_write", host=H1, path="/tmp/root-owned", content="x\n", mode="600
 w = call("ssh_exec", host=H1, cmd="stat -f '%Su %Lp' /tmp/root-owned")
 check("file_write sudo mode 600 owner root", out_of(w).strip() == "root 600", {"_raw": r["_raw"] + " | " + w["_raw"]}, out_of(w).strip())
 
-r = call("python_exec", host=H1, script="import sys; print('py', sys.version_info[0])")
-check("python_exec", "py 3" in r["_raw"], r)
+r = call("ssh_exec", host=H1, cmd="python3 - <<'EOF'\nimport sys; print('py', sys.version_info[0])\nEOF")
+check("python3 heredoc (python_exec removed)", "py 3" in r["_raw"], r)
 
 for tool, args in (("service_logs", dict(host=H1, unit="com.apple.sshd")), ("service_control", dict(host=H1, unit="ssh", action="status"))):
     r = call(tool, **args)
