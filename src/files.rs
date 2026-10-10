@@ -120,43 +120,108 @@ pub async fn write(
     Ok(res)
 }
 
-#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct FileEntry {
+    /// The name as `ls` prints it; for a symlink that is
+    /// `name -> target` (the target is also in `link_target`).
     pub name: String,
-    /// 10-char mode string from `ls -l` (e.g. `drwxr-xr-x`).
+    /// 10-char mode string from `ls -l` (e.g. `drwxr-xr-x`), without the
+    /// indicator `ls` may append (see `xattrs`, `acl`, `security_context`).
     pub mode: String,
+    /// Bytes; 0 for a device file (see `device`).
     pub size: u64,
     pub owner: String,
     pub group: String,
-    /// Modification time, raw string from `ls -la --time-style=long-iso`.
+    /// Modification time, `YYYY-MM-DD HH:MM` on every platform.
     pub mtime: String,
     pub is_dir: bool,
     pub is_link: bool,
+    /// The symlink's target, for a symlink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+    /// `major,minor` for a character or block device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// BSD/macOS `@`: the file has extended attributes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub xattrs: bool,
+    /// `+` (BSD and GNU): the file has an ACL.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub acl: bool,
+    /// GNU `.`: the file has an SELinux security context and no ACL.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub security_context: bool,
 }
+
+/// A parsed `ls -l`: the entries, and every line that wasn't one —
+/// kept rather than dropped, so a format prompto doesn't know shows up
+/// instead of silently shrinking the listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub entries: Vec<FileEntry>,
+    /// The first [`MAX_UNPARSED`] such lines, each cut to
+    /// [`MAX_UNPARSED_LINE`] bytes.
+    pub unparsed: Vec<String>,
+    /// How many lines were unparseable in all.
+    pub unparsed_count: usize,
+}
+
+/// Unparseable lines kept in [`Listing::unparsed`].
+pub const MAX_UNPARSED: usize = 20;
+/// Byte cap of one kept unparseable line.
+pub const MAX_UNPARSED_LINE: usize = 256;
 
 /// `ls` invocation for a platform.
 ///
 /// GNU's `--time-style=long-iso` gives `YYYY-MM-DD HH:MM` in two tokens.
 /// BSD has no such flag; `-T` is the closest, yielding a four-token
-/// `Mon DD HH:MM:SS YYYY`. Different token counts, hence two parsers —
-/// see [`parse_ls_long`] and [`parse_ls_long_bsd`].
+/// `Mon DD HH:MM:SS YYYY`. Both are parsed by [`parse_ls`].
+///
+/// A path that is a symlink to a directory lists that directory (macOS
+/// `/tmp` → `private/tmp`): `ls -l` alone lists the link itself. GNU
+/// has a flag for exactly that; BSD's `-H` follows every symlink named
+/// on the command line, so there a symlink to a file is listed as the
+/// file it points to.
 pub fn ls_command(platform: Platform, path: &str) -> String {
     if platform.is_gnu() {
-        format!("ls -la --time-style=long-iso -- {path}")
+        format!("ls -la --time-style=long-iso --dereference-command-line-symlink-to-dir -- {path}")
     } else {
-        format!("ls -laT -- {path}")
+        format!("ls -laTH -- {path}")
     }
 }
 
 /// Parse `ls` output for `platform`, normalising both dialects to the
 /// same [`FileEntry`] shape — including an ISO `YYYY-MM-DD HH:MM` mtime,
 /// so a caller never has to know which kind of host it asked.
-pub fn parse_ls(platform: Platform, stdout: &str) -> Vec<FileEntry> {
-    if platform.is_gnu() {
-        parse_ls_long(stdout)
-    } else {
-        parse_ls_long_bsd(stdout)
+pub fn parse_ls(platform: Platform, stdout: &str) -> Listing {
+    let mut out = Listing::default();
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_total(trimmed) {
+            continue;
+        }
+        match parse_line(platform.is_gnu(), line) {
+            Some(e) => out.entries.push(e),
+            None => {
+                out.unparsed_count += 1;
+                if out.unparsed.len() < MAX_UNPARSED {
+                    let mut end = line.len().min(MAX_UNPARSED_LINE);
+                    while !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    out.unparsed.push(line[..end].to_string());
+                }
+            }
+        }
     }
+    out
+}
+
+/// `total 12` (GNU may print `total 1.5K` with `-h`; not used here).
+fn is_total(line: &str) -> bool {
+    line.strip_prefix("total ")
+        .is_some_and(|n| !n.is_empty() && !n.contains(' '))
 }
 
 fn month_to_num(m: &str) -> Option<&'static str> {
@@ -177,99 +242,119 @@ fn month_to_num(m: &str) -> Option<&'static str> {
     })
 }
 
-/// Parse BSD `ls -laT`:
-/// `mode links owner group size Mon DD HH:MM:SS YYYY name…`
-///
-/// Rebuilds the date into `YYYY-MM-DD HH:MM` so the `mtime` field matches
-/// what the GNU path produces. Seconds are dropped for exactly that
-/// reason — GNU's `long-iso` has none.
-pub fn parse_ls_long_bsd(stdout: &str) -> Vec<FileEntry> {
+/// Whitespace-separated tokens of `line` with their byte offsets, so the
+/// name (which may hold runs of spaces) is taken verbatim from the line.
+fn tokens(line: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("total ") {
-            continue;
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                out.push((s, &line[s..i]));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
         }
-        let toks: Vec<&str> = trimmed.split_whitespace().collect();
-        if toks.len() < 10 {
-            continue;
-        }
-        let mode = toks[0];
-        if mode.len() != 10 {
-            continue;
-        }
-        let size: u64 = match toks[4].parse() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let (Some(month), Ok(day), Some(hhmm), year) = (
-            month_to_num(toks[5]),
-            toks[6].parse::<u32>(),
-            toks[7].get(..5),
-            toks[8],
-        ) else {
-            continue;
-        };
-        if year.len() != 4 || !year.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        out.push(FileEntry {
-            name: toks[9..].join(" "),
-            mode: mode.to_string(),
-            size,
-            owner: toks[2].to_string(),
-            group: toks[3].to_string(),
-            mtime: format!("{year}-{month}-{day:02} {hhmm}"),
-            is_dir: mode.starts_with('d'),
-            is_link: mode.starts_with('l'),
-        });
+    }
+    if let Some(s) = start {
+        out.push((s, &line[s..]));
     }
     out
 }
 
-/// Parse `ls -la --time-style=long-iso` output. Tolerates a `total N`
-/// header and skips it; ignores lines that don't fit the expected
-/// column count.
-pub fn parse_ls_long(stdout: &str) -> Vec<FileEntry> {
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("total ") {
-            continue;
-        }
-        // Expect: mode links owner group size YYYY-MM-DD HH:MM name…
-        // split_whitespace collapses runs of spaces; the name (which can
-        // include spaces) is reconstructed from tokens[7..].
-        let toks: Vec<&str> = trimmed.split_whitespace().collect();
-        if toks.len() < 8 {
-            continue;
-        }
-        let mode = toks[0];
-        if mode.len() != 10 {
-            continue;
-        }
-        let owner = toks[2].to_string();
-        let group = toks[3].to_string();
-        let size: u64 = match toks[4].parse() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let mtime = format!("{} {}", toks[5], toks[6]);
-        let name = toks[7..].join(" ");
-        let is_dir = mode.starts_with('d');
-        let is_link = mode.starts_with('l');
-        out.push(FileEntry {
-            name,
-            mode: mode.to_string(),
-            size,
-            owner,
-            group,
-            mtime,
-            is_dir,
-            is_link,
-        });
+/// The 10-char mode and the flags of the indicator `ls` may append:
+/// `@` extended attributes (BSD), `+` ACL (both), `.` SELinux context
+/// (GNU).
+fn parse_mode(tok: &str) -> Option<(&str, bool, bool, bool)> {
+    if !tok.is_ascii() || !(10..=11).contains(&tok.len()) {
+        return None;
     }
-    out
+    let (mode, ind) = tok.split_at(10);
+    if !"-dlcbpsDwn?".contains(&mode[..1]) {
+        return None;
+    }
+    let perms_ok = mode[1..].chars().all(|c| "-rwxsStTlL".contains(c));
+    if !perms_ok {
+        return None;
+    }
+    match ind {
+        "" => Some((mode, false, false, false)),
+        "@" => Some((mode, true, false, false)),
+        "+" => Some((mode, false, true, false)),
+        "." => Some((mode, false, false, true)),
+        _ => None,
+    }
+}
+
+/// One `ls -l` line:
+/// - GNU `ls -la --time-style=long-iso`:
+///   `mode links owner group size YYYY-MM-DD HH:MM name…`
+/// - BSD `ls -laT`:
+///   `mode links owner group size Mon DD HH:MM:SS YYYY name…`
+///
+/// A device prints `major, minor` (two tokens) where the size goes. BSD
+/// dates are rebuilt as `YYYY-MM-DD HH:MM`, seconds dropped because
+/// GNU's `long-iso` has none.
+fn parse_line(gnu: bool, line: &str) -> Option<FileEntry> {
+    let toks = tokens(line);
+    let (mode, xattrs, acl, security_context) = parse_mode(toks.first()?.1)?;
+    toks.get(1)?.1.parse::<u64>().ok()?;
+    let owner = toks.get(2)?.1;
+    let group = toks.get(3)?.1;
+    let (size, device, next) = match toks.get(4)?.1.strip_suffix(',') {
+        Some(major) => {
+            let minor = toks.get(5)?.1;
+            (0, Some(format!("{major},{minor}")), 6)
+        }
+        None => (toks[4].1.parse::<u64>().ok()?, None, 5),
+    };
+    let (mtime, name_at) = if gnu {
+        let (date, time) = (toks.get(next)?.1, toks.get(next + 1)?.1);
+        let date_ok = date.len() == 10
+            && date.char_indices().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            });
+        if !date_ok || time.len() != 5 || time.as_bytes()[2] != b':' {
+            return None;
+        }
+        (format!("{date} {time}"), next + 2)
+    } else {
+        let month = month_to_num(toks.get(next)?.1)?;
+        let day: u32 = toks.get(next + 1)?.1.parse().ok()?;
+        let hhmm = toks.get(next + 2)?.1.get(..5)?;
+        let year = toks.get(next + 3)?.1;
+        if year.len() != 4 || !year.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        (format!("{year}-{month}-{day:02} {hhmm}"), next + 4)
+    };
+    let name = &line[toks.get(name_at)?.0..];
+    let is_link = mode.starts_with('l');
+    let link_target = if is_link {
+        name.split_once(" -> ").map(|(_, t)| t.to_string())
+    } else {
+        None
+    };
+    Some(FileEntry {
+        name: name.to_string(),
+        mode: mode.to_string(),
+        size,
+        owner: owner.to_string(),
+        group: group.to_string(),
+        mtime,
+        is_dir: mode.starts_with('d'),
+        is_link,
+        link_target,
+        device,
+        xattrs,
+        acl,
+        security_context,
+    })
 }
 
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
@@ -430,8 +515,8 @@ mod tests {
                    drwxr-xr-x 3 user staff 96 Aug 13 14:23:07 2026 somedir\n\
                    -rw-r--r-- 1 user staff 42 Aug 13 09:05:59 2026 a file.txt\n";
 
-        let g = parse_ls(Platform::Linux, gnu);
-        let b = parse_ls(Platform::Macos, bsd);
+        let g = parse_ls(Platform::Linux, gnu).entries;
+        let b = parse_ls(Platform::Macos, bsd).entries;
         assert_eq!(g.len(), 2, "gnu parse: {g:?}");
         assert_eq!(b.len(), 2, "bsd parse: {b:?}");
 
@@ -531,19 +616,162 @@ mod tests {
     }
 
     #[test]
-    fn parse_ls_long_extracts_entries() {
+    fn parse_ls_gnu_extracts_entries() {
         let s = "total 12\n\
                  drwxr-xr-x 2 user staff   64 2026-04-27 12:00 .\n\
                  drwxr-xr-x 5 user staff  160 2026-04-27 11:00 ..\n\
                  -rw-r--r-- 1 user staff   42 2026-04-27 11:30 file.txt\n\
                  lrwxrwxrwx 1 user staff    7 2026-04-27 11:31 link -> target\n";
-        let entries = parse_ls_long(s);
+        let l = parse_ls(Platform::Linux, s);
+        let entries = l.entries;
         assert_eq!(entries.len(), 4);
+        assert!(l.unparsed.is_empty());
         assert!(entries[0].is_dir);
         assert_eq!(entries[2].name, "file.txt");
         assert_eq!(entries[2].size, 42);
         assert!(!entries[2].is_dir);
         assert!(entries[3].is_link);
+        // `name` keeps what ls printed; the target is split out too.
+        assert_eq!(entries[3].name, "link -> target");
+        assert_eq!(entries[3].link_target.as_deref(), Some("target"));
+    }
+
+    /// Verbatim from the macOS 26 bench (`ls -laT`): `@` (extended
+    /// attributes) after the mode made the line 11 chars and it was
+    /// silently dropped, so `file_list /` came back without `/tmp`.
+    #[test]
+    fn bsd_mode_indicators_are_parsed_not_dropped() {
+        let s = "total 0\n\
+                 drwxrwxrwt@ 7 root wheel 224 Oct 10 13:02:11 2026 .\n\
+                 lrwxr-xr-x@ 1 root wheel 11 Oct 10 12:58:40 2026 /tmp -> private/tmp\n\
+                 drwxr-xr-x+ 4 ops  staff 128 Oct  9 08:01:02 2026 Desktop\n\
+                 -rw-r--r--  1 ops  staff  42 Oct  9 08:01:02 2026 plain\n";
+        let l = parse_ls(Platform::Macos, s);
+        assert_eq!(l.unparsed, Vec::<String>::new());
+        let e = &l.entries;
+        assert_eq!(e.len(), 4, "{e:?}");
+        assert_eq!(e[0].mode, "drwxrwxrwt", "the indicator is not part of mode");
+        assert!(e[0].xattrs && !e[0].acl && e[0].is_dir);
+        assert_eq!(e[0].mtime, "2026-10-10 13:02");
+        assert!(e[1].is_link && e[1].xattrs);
+        assert_eq!(e[1].name, "/tmp -> private/tmp");
+        assert_eq!(e[1].link_target.as_deref(), Some("private/tmp"));
+        assert!(e[2].acl && !e[2].xattrs);
+        assert_eq!(e[2].mtime, "2026-10-09 08:01");
+        assert!(!e[3].acl && !e[3].xattrs && !e[3].security_context);
+    }
+
+    /// GNU appends `+` (ACL) and, on SELinux hosts, `.` to nearly every
+    /// mode: those lines were dropped too.
+    #[test]
+    fn gnu_mode_indicators_are_parsed() {
+        let s = "-rw-r--r--. 1 root root 1024 2026-10-01 10:00 /etc/hosts\n\
+                 drwxrwxr-x+ 2 ops  ops    40 2026-10-01 10:00 shared\n";
+        let e = parse_ls(Platform::Linux, s).entries;
+        assert_eq!(e.len(), 2);
+        assert!(e[0].security_context && !e[0].acl);
+        assert_eq!(e[0].mode, "-rw-r--r--");
+        assert!(e[1].acl && e[1].is_dir);
+    }
+
+    /// The indicators and the extra fields are omitted when unset, so a
+    /// plain Linux entry serialises exactly as before.
+    #[test]
+    fn plain_entries_serialise_as_before() {
+        let e = &parse_ls(
+            Platform::Linux,
+            "-rw-r--r-- 1 u g 42 2026-04-27 11:30 file.txt\n",
+        )
+        .entries[0];
+        let v = serde_json::to_value(e).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "group", "is_dir", "is_link", "mode", "mtime", "name", "owner", "size"
+            ]
+        );
+    }
+
+    /// Devices print `major, minor` where the size goes: two tokens, and
+    /// `3,` is no size, so these lines were dropped.
+    #[test]
+    fn device_files_on_both_dialects() {
+        // GNU, verbatim from Debian 13.
+        let gnu = "crw-rw-rw- 1 root root 1, 3 2026-10-08 19:11 /dev/null\n\
+                   brw-rw---- 1 root disk 254,   0 2026-10-08 19:11 vda\n";
+        let g = parse_ls(Platform::Linux, gnu);
+        assert!(g.unparsed.is_empty(), "{:?}", g.unparsed);
+        assert_eq!(g.entries[0].device.as_deref(), Some("1,3"));
+        assert_eq!(g.entries[0].size, 0);
+        assert_eq!(g.entries[0].name, "/dev/null");
+        assert_eq!(g.entries[1].device.as_deref(), Some("254,0"));
+        // macOS: `%3d, %3d`, or a hex minor above 255.
+        let bsd = "crw-rw-rw-  1 root  wheel    3,   2 Oct 10 13:02:11 2026 null\n\
+                   crw-------  1 root  wheel   20, 0x00000004 Oct 10 13:02:11 2026 ttyp4\n";
+        let b = parse_ls(Platform::Macos, bsd);
+        assert!(b.unparsed.is_empty(), "{:?}", b.unparsed);
+        assert_eq!(b.entries[0].device.as_deref(), Some("3,2"));
+        assert_eq!(b.entries[0].name, "null");
+        assert_eq!(b.entries[0].mtime, "2026-10-10 13:02");
+        assert_eq!(b.entries[1].device.as_deref(), Some("20,0x00000004"));
+    }
+
+    /// Names are taken verbatim from the line: runs of spaces survive,
+    /// and an arrow in a regular file's name is no link target.
+    #[test]
+    fn names_with_spaces_and_arrows() {
+        // GNU, verbatim from Debian 13.
+        let gnu = "-rw-rw-r--  1 ops  ops     0 2026-10-10 11:38 a  b.txt\n\
+                   lrwxrwxrwx  1 ops  ops     8 2026-10-10 11:38 lnk sp -> a  b.txt\n\
+                   -rw-rw-r--  1 ops  ops     0 2026-10-10 11:38 x -> y\n";
+        let g = parse_ls(Platform::Linux, gnu).entries;
+        assert_eq!(g[0].name, "a  b.txt");
+        assert_eq!(g[1].link_target.as_deref(), Some("a  b.txt"));
+        assert_eq!(g[2].name, "x -> y");
+        assert_eq!(g[2].link_target, None);
+        let bsd = "-rw-r--r--@ 1 ops  staff  6 Oct 10 13:05:00 2026 My  Notes.txt\n\
+                   lrwxr-xr-x  1 ops  staff  9 Oct 10 13:05:00 2026 to notes -> My  Notes.txt\n";
+        let b = parse_ls(Platform::Macos, bsd).entries;
+        assert_eq!(b[0].name, "My  Notes.txt");
+        assert_eq!(b[1].link_target.as_deref(), Some("My  Notes.txt"));
+    }
+
+    /// Nothing is dropped silently: a line that is no entry comes back in
+    /// `unparsed`, bounded in count and length.
+    #[test]
+    fn unparseable_lines_are_returned_bounded() {
+        let mut s = String::from("total 4\n-rw-r--r-- 1 u g 1 2026-04-27 11:30 ok\n");
+        s.push_str("-????????? ? ? ? ? ? broken\n");
+        let l = parse_ls(Platform::Linux, &s);
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.unparsed, ["-????????? ? ? ? ? ? broken"]);
+        assert_eq!(l.unparsed_count, 1);
+        // A GNU line handed to the BSD parser is unparsed, not lost.
+        let l = parse_ls(Platform::Macos, "-rw-r--r-- 1 u g 1 2026-04-27 11:30 ok\n");
+        assert_eq!((l.entries.len(), l.unparsed_count), (0, 1));
+
+        let long = format!("weird {}\n", "é".repeat(400));
+        let many = long.repeat(MAX_UNPARSED + 5);
+        let l = parse_ls(Platform::Macos, &many);
+        assert_eq!(l.unparsed_count, MAX_UNPARSED + 5);
+        assert_eq!(l.unparsed.len(), MAX_UNPARSED);
+        assert!(l.unparsed.iter().all(|u| u.len() <= MAX_UNPARSED_LINE));
+    }
+
+    /// A path that is a symlink to a directory lists the directory
+    /// (macOS `/tmp` → `private/tmp` returned `entries: []` before).
+    #[test]
+    fn ls_follows_a_symlink_to_a_directory() {
+        assert!(
+            ls_command(Platform::Linux, "/tmp")
+                .contains(" --dereference-command-line-symlink-to-dir ")
+        );
+        for p in [Platform::Macos, Platform::Freebsd] {
+            let c = ls_command(p, "/tmp");
+            assert!(c.starts_with("ls -laTH -- "), "{p:?}: {c}");
+        }
     }
 
     #[test]

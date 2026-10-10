@@ -10,10 +10,16 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **`POST /v1/approve`**: a human approver's TOTP code (RFC 6238; single-use codes; lockout after 5 wrong codes in 15 min) turns an `ask` into an `approval = "human"` ticket naming the approver. Optional `scope_minutes` (≤ 60): one ticket for every call by the same agent, session, tool and host(s), decided by the same policy rule(s) and with the same root-capability, whatever the other arguments. A scope for a root-capable call needs `allow_root_scope: true`.
 - **Every tool accepts a `ticket` argument**, checked where policy demands one: missing → `approval_required` (the message says how to get one), invalid, forged, expired, replayed or for another call → `refused_ticket`.
 - **Keys** from vault KV (`PROMPTO_TICKET_KEY_VAULT_PATH`, fields `current` / `previous`) or an owner-only file (`PROMPTO_TICKET_KEY_FILE`); current and previous both accepted; re-read every minute and on SIGHUP. Used nonces and TOTP steps persist (synced) in `PROMPTO_APPROVAL_STATE` across restarts.
-- **Approval secrets are never agent-readable.** The ticket key and vault-held TOTP secrets are read from their own KV mount, `PROMPTO_PRIVATE_MOUNT` (default `prompto-private`), which only prompto's token may read. If either is configured under `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` (default `prompto/,infra/` on `PROMPTO_VAULT_MOUNT`), approvals are turned off with an error saying what to move. `prompto approver add --vault-path` refuses such paths, and paths next to a sudo password unless `--i-know`.
-- **Inventory `prompto_host = true`** marks the machine running prompto; `policy lint` reports an error for any rule granting root there (sudo, or exec where the shell can sudo) unless the rule says `crown_jewel_ack = true`.
+- **Approval secrets are never agent-readable.** The ticket key and vault-held TOTP secrets are read from their own KV mount, `PROMPTO_PRIVATE_MOUNT` (default `prompto-private`), which only prompto's token may read. If either is configured under `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` (default `prompto/,infra/,nxp/` on `PROMPTO_VAULT_MOUNT`), approvals are turned off with an error saying what to move. `prompto approver add --vault-path` refuses such paths, and paths next to a sudo password unless `--i-know`.
+- **Inventory `prompto_host = true`** marks the machine running prompto; `policy lint` reports an error for any rule granting root there (sudo, or exec where the shell can sudo), or a shell/file tool there as prompto's own service user (`PROMPTO_SERVICE_USER`, default `prompto`), unless the rule says `crown_jewel_ack = true`. While the live policy has such an error, approvals are off (startup, SIGHUP and every re-read of `policy.toml`), as for a misplaced secret.
 - **CLI:** `prompto approver add|list|revoke` (prints the `otpauth://` URI and a terminal QR code once; `--i-know`), `prompto ticket keygen`.
 - **Audit:** the ticket is removed from `args` and recorded as `ticket_sha256`; `approved_by` is filled in; new record types `precheck` and `approve`.
+
+### macOS targets
+
+- **`file_list`** no longer drops entries whose mode carries an indicator (BSD `@` extended attributes, `+` ACL; GNU `+`, `.` SELinux): they come back with `xattrs` / `acl` / `security_context: true`. Device files are listed (`device: "major,minor"`, size 0), symlinks get `link_target`, names keep runs of spaces. A line that still can't be parsed is returned in `unparsed` (at most 20, with `unparsed_count`) instead of vanishing. A path that is a symlink to a directory lists the directory (macOS `/tmp`); on BSD/macOS a symlink to a file is listed as that file. New fields are left out when unset.
+- **`rsync_sync`** recognises openrsync (macOS since 15.4): its `rsync(<pid>): error: …` lines mark a source→dest failure (`dest_ssh_auth` / `dest_ssh_connect`, not `ssh_auth`), its exit 1 is `remote_nonzero`, and zsh/csh "command not found" wording is `rsync_missing`.
+- **Exec-style results carry `error_class`** (as `rsync_sync`'s did): the audit record's class for a non-zero exit, `null` on success. Additive.
 
 ### Upgrade note — no new config
 
@@ -23,6 +29,7 @@ With neither ticket variable set, nothing is minted or accepted: `approval` rule
 2. Two new routes, `POST /v1/precheck` and `POST /v1/approve`, behind the same authentication as `/mcp` (unauthenticated with `PROMPTO_AUTH=off`, where they report every call as needing no approval).
 3. Audit records may carry `ticket_sha256` / `scope_minutes`, and `args.ticket` is never recorded.
 4. `serde_json`'s `float_roundtrip` is on: JSON numbers in arguments now always parse to the nearest double (needed for stable argument digests).
+5. `file_list` on a path that is a symlink to a directory lists the directory (it used to list the link alone); results may carry the new optional fields above, and exec-style results always carry `error_class`.
 
 ## v0.12.0
 

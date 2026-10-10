@@ -186,26 +186,61 @@ pub async fn run(
     Ok(res)
 }
 
-/// Does stderr carry rsync's own diagnostics (`rsync: …`, `rsync error:
-/// …`)? If so rsync started on the source host, and a transport failure
-/// is the source→dest hop, not prompto→source.
+/// Does stderr carry rsync's own diagnostics? If so rsync started on the
+/// source host, and a transport failure is the source→dest hop, not
+/// prompto→source. Two flavours:
+/// - samba rsync: `rsync: …`, `rsync error: …`;
+/// - openrsync (macOS since 15.4, OpenBSD): `rsync(<pid>): error: …` /
+///   `rsync(<pid>): warning: …` (Apple's `log.c`: `"%s(%d): error%s%s"`
+///   with `getprogname()`, `getpid()`), or `openrsync: error: …` when
+///   upstream openrsync runs under its own name.
 fn rsync_spoke(stderr: &str) -> bool {
     stderr.lines().any(|l| {
         let l = l.trim_start();
-        l.starts_with("rsync: ") || l.starts_with("rsync error: ")
+        l.starts_with("rsync: ") || l.starts_with("rsync error: ") || openrsync_line(l)
     })
+}
+
+/// An openrsync diagnostic: `<prog>(<pid>): error…` / `warning…`, or
+/// `<prog>: error…` / `warning…`, where `<prog>` ends in `rsync`.
+fn openrsync_line(l: &str) -> bool {
+    let Some((head, rest)) = l.split_once(": ") else {
+        return false;
+    };
+    let level = rest.starts_with("error") || rest.starts_with("warning");
+    let prog = match head.strip_suffix(')').and_then(|h| h.split_once('(')) {
+        Some((prog, pid)) if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) => prog,
+        Some(_) => return false,
+        None => head,
+    };
+    level && prog.ends_with("rsync") && !prog.contains(char::is_whitespace)
+}
+
+/// Did openrsync (rather than samba rsync) report? Its man page documents
+/// exit 1 as "an error occurs", not samba's syntax/usage error.
+fn is_openrsync(stderr: &str) -> bool {
+    stderr.lines().any(|l| openrsync_line(l.trim_start()))
 }
 
 fn command_not_found(stderr: &str) -> bool {
     stderr.lines().any(|l| {
         l.contains("rsync: not found")
             || l.contains("rsync: command not found")
+            || l.contains("rsync: Command not found")
+            || l.contains("command not found: rsync")
             || l.contains("rsync: No such file or directory")
     })
 }
 
 /// Map rsync's documented exit codes (rsync(1) "EXIT VALUES") to a class.
 /// 255 and 127 are not decided here: they depend on which hop failed.
+///
+/// openrsync documents only 0, 1 ("an error occurs") and 2 (remote
+/// protocol too old), but Apple's build exits with samba's numbers
+/// (`extern.h` `ERR_*`: 1 syntax, 2 protocol, 3 file selection, 10/11
+/// socket/file I/O, 12 wire protocol, 14 IPC, 23 partial, 25 delete
+/// limit) plus 16 (terminated), which falls to `remote_nonzero` with
+/// the signal codes. [`classify`] treats openrsync's 1 as generic.
 pub fn class_for_exit(code: i32) -> ErrorClass {
     match code {
         1 | 4 => ErrorClass::RsyncUsage,
@@ -252,6 +287,9 @@ pub fn classify(out: &ExecOutput) -> ErrorClass {
             (false, true) => ErrorClass::SshAuth,
             (false, false) => ErrorClass::SshConnect,
         };
+    }
+    if code == 1 && is_openrsync(stderr) {
+        return ErrorClass::RemoteNonzero;
     }
     class_for_exit(code)
 }
@@ -501,6 +539,104 @@ mod tests {
             "ssh: connect to host 192.0.2.12 port 22: No route to host",
         );
         assert_eq!(classify(&failed(Some(12), &c)), ErrorClass::DestSshConnect);
+    }
+
+    /// Verbatim from the macOS 26 bench (openrsync), IP replaced: the
+    /// source host was refused by the dest. openrsync's `rsync(<pid>):`
+    /// lines weren't recognised, so this was blamed on prompto's own
+    /// login (`ssh_auth`).
+    #[test]
+    fn openrsync_source_to_dest_failures_are_dest_ssh_classes() {
+        let denied = "ops@192.0.2.3: Permission denied (publickey).\n\
+                      rsync(1226): error: unexpected end of file\n";
+        assert_eq!(
+            classify(&failed(Some(255), denied)),
+            ErrorClass::DestSshAuth
+        );
+        let refused = "ssh: connect to host 192.0.2.3 port 22: Connection refused\n\
+                       rsync(1301): error: unexpected end of file\n";
+        assert_eq!(
+            classify(&failed(Some(255), refused)),
+            ErrorClass::DestSshConnect
+        );
+        // A warning line alone says rsync ran too.
+        let warned = "Host key verification failed.\n\
+                      rsync(77): warning: child exited abnormally\n";
+        assert_eq!(
+            classify(&failed(Some(255), warned)),
+            ErrorClass::DestSshAuth
+        );
+        // Upstream openrsync under its own name.
+        let upstream = "192.0.2.3: Permission denied (publickey).\n\
+                        openrsync: error: unexpected end of file\n";
+        assert_eq!(
+            classify(&failed(Some(255), upstream)),
+            ErrorClass::DestSshAuth
+        );
+        // Without rsync's lines it is still prompto's own hop.
+        let own = "ops@192.0.2.3: Permission denied (publickey).\n";
+        assert_eq!(classify(&failed(Some(255), own)), ErrorClass::SshAuth);
+    }
+
+    #[test]
+    fn openrsync_line_shapes() {
+        for yes in [
+            "rsync(1226): error: unexpected end of file",
+            "rsync(1226): warning: some files vanished",
+            "openrsync(9): error: x",
+            "rsync.openrsync(12): error: x",
+            "openrsync: error: x",
+            "rsync(1226): error",
+        ] {
+            assert!(openrsync_line(yes), "{yes}");
+        }
+        for no in [
+            "rsync(abc): error: x",
+            "rsync(): error: x",
+            "rsync(12): info: x",
+            "not rsync(12): error: x",
+            "ops@192.0.2.3: Permission denied (publickey).",
+            "foo(12): error: x",
+        ] {
+            assert!(!openrsync_line(no), "{no}");
+        }
+    }
+
+    /// openrsync's man page: exit 1 is any error, not samba's usage
+    /// error. Samba's 1 is unchanged.
+    #[test]
+    fn openrsync_exit_codes() {
+        let generic = "rsync(4242): error: /nope: lstat: No such file or directory\n";
+        assert_eq!(
+            classify(&failed(Some(1), generic)),
+            ErrorClass::RemoteNonzero
+        );
+        let samba = "rsync: link_stat \"/nope\" failed: No such file or directory (2)\n";
+        assert_eq!(classify(&failed(Some(1), samba)), ErrorClass::RsyncUsage);
+        // Apple's ERR_* codes shared with samba keep their classes.
+        assert_eq!(
+            classify(&failed(Some(23), generic)),
+            ErrorClass::RsyncPartial
+        );
+        assert_eq!(
+            classify(&failed(Some(2), generic)),
+            ErrorClass::RsyncProtocol
+        );
+        assert_eq!(classify(&failed(Some(11), generic)), ErrorClass::RsyncIo);
+        // ERR_TERMINATED.
+        assert_eq!(
+            classify(&failed(Some(16), generic)),
+            ErrorClass::RemoteNonzero
+        );
+    }
+
+    /// zsh (macOS login shells) and csh word "not found" differently.
+    #[test]
+    fn missing_rsync_under_zsh_and_csh() {
+        let zsh = "zsh:1: command not found: rsync\n";
+        assert_eq!(classify(&failed(Some(127), zsh)), ErrorClass::RsyncMissing);
+        let csh = "rsync: Command not found.\n";
+        assert_eq!(classify(&failed(Some(1), csh)), ErrorClass::RsyncMissing);
     }
 
     #[test]

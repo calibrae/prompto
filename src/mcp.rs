@@ -652,6 +652,7 @@ impl Prompto {
             Ok(v) => {
                 let payload = serde_json::to_value(&v).unwrap_or_default();
                 let verdict = self.judge(ctx, tool, &audit::Outcome::Success(&payload));
+                let payload = with_error_class(payload, verdict.error_class);
                 let mut blocks = success_blocks(payload, &request_id);
                 let bytes = blocks.iter().map(|b| b.len()).sum::<usize>();
                 self.tracker.record(tool, host, true, exec_ms, bytes as u64);
@@ -1295,7 +1296,7 @@ impl Prompto {
     }
 
     #[tool(
-        description = "List a directory on a remote host. Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link }."
+        description = "List a directory on a remote host (a symlink to a directory lists the directory). Returns parsed { name, mode, size, owner, group, mtime, is_dir, is_link } plus, when set, link_target, device, xattrs, acl, security_context; lines that could not be parsed come back in `unparsed`."
     )]
     async fn file_list(
         &self,
@@ -1325,13 +1326,19 @@ impl Prompto {
                 )
                 .into());
             }
-            let entries = files::parse_ls(host.platform, &raw.stdout);
-            Ok(serde_json::json!({
+            let listing = files::parse_ls(host.platform, &raw.stdout);
+            let mut out = serde_json::json!({
                 "host": args.host,
                 "path": args.path,
-                "entries": entries,
-                "count": entries.len(),
-            }))
+                "count": listing.entries.len(),
+                "entries": listing.entries,
+            });
+            // Lines that weren't entries are returned, never dropped.
+            if listing.unparsed_count > 0 {
+                out["unparsed"] = serde_json::json!(listing.unparsed);
+                out["unparsed_count"] = serde_json::json!(listing.unparsed_count);
+            }
+            Ok(out)
         }
         .await;
         self.finish_tool(&ctx, "file_list", Some(&host_name), res)
@@ -2091,6 +2098,26 @@ fn with_groups(v: &mut serde_json::Value, groups: &[String]) {
     if !groups.is_empty() {
         v["groups"] = groups.into();
     }
+}
+
+/// An exec-style result — one carrying `exit_code`, `timed_out` or
+/// (`ssh_batch`) `all_ok` — gets `error_class`: the audit record's class
+/// for the call (`remote_nonzero`, `ssh_connect`, `timeout`, …), `null`
+/// when the command succeeded. Same field and values as `rsync_sync`,
+/// which sets its own. Additive: nothing else in the result changes.
+fn with_error_class(
+    mut payload: serde_json::Value,
+    class: Option<ErrorClass>,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut payload
+        && ["exit_code", "timed_out", "all_ok"]
+            .iter()
+            .any(|k| map.contains_key(*k))
+        && !map.contains_key("error_class")
+    {
+        map.insert("error_class".into(), serde_json::json!(class));
+    }
+    payload
 }
 
 fn success_blocks(payload: serde_json::Value, request_id: &str) -> Vec<String> {

@@ -351,6 +351,14 @@ fn rid(resp: &Value) -> String {
     panic!("no request_id in {resp}")
 }
 
+/// The tool result's JSON payload.
+fn result(resp: &Value) -> Value {
+    let t = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{resp}"));
+    serde_json::from_str(t).unwrap_or_else(|_| panic!("{resp}"))
+}
+
 fn assert_ok(resp: &Value) {
     assert!(resp.get("result").is_some(), "expected success: {resp}");
 }
@@ -441,11 +449,38 @@ async fn failed_command_is_not_ok_and_has_a_class() {
     );
     assert_eq!(r["error_class"], "remote_nonzero");
     assert_eq!(r["decision"], "allow");
+    // The result carries the same class (it used to be audit-only).
+    assert_eq!(result(&resp)["error_class"], "remote_nonzero");
+    assert_eq!(result(&resp)["exit_code"], 1);
 
     let resp = call(&s, "ssh_exec", json!({ "host": "down", "cmd": "true" })).await;
     let r = s.record(&rid(&resp));
     assert_eq!(r["error_class"], "ssh_connect", "{r}");
     assert_eq!(r["exit_code"], 255);
+    assert_eq!(result(&resp)["error_class"], "ssh_connect");
+}
+
+/// Exit 0: `error_class` is present and null, on every exec-style tool.
+#[tokio::test]
+async fn successful_exec_results_have_a_null_error_class() {
+    let s = spawn(AuthMode::Required).await;
+    for (tool, args) in [
+        ("ssh_exec", json!({ "host": "runner", "cmd": "true" })),
+        ("bash_exec", json!({ "host": "runner", "script": "true" })),
+        (
+            "ssh_batch",
+            json!({ "host": "runner", "commands": ["true"] }),
+        ),
+    ] {
+        let resp = call(&s, tool, args).await;
+        assert_ok(&resp);
+        let v = result(&resp);
+        assert_eq!(v.get("error_class"), Some(&Value::Null), "{tool}: {v}");
+        assert_eq!(s.record(&rid(&resp))["error_class"], Value::Null);
+    }
+    // Not an exec-style result: no field added.
+    let resp = call(&s, "inventory_list", json!({})).await;
+    assert_eq!(result(&resp).get("error_class"), None, "{resp}");
 }
 
 /// ssh_batch: one record, with the whole command list.
@@ -466,6 +501,7 @@ async fn batch_is_one_record_with_every_command() {
     assert_eq!(r["ok"], false, "a command failed: {r}");
     assert_eq!(r["exit_code"], 3);
     assert_eq!(r["error_class"], "remote_nonzero");
+    assert_eq!(result(&resp)["error_class"], "remote_nonzero");
     assert_eq!(
         s.records()
             .iter()

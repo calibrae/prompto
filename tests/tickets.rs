@@ -1690,6 +1690,86 @@ async fn approval_secrets_agents_can_read_disable_approvals() {
     assert!(a2.unavailable().is_some());
 }
 
+/// Root, or prompto's service user, on the host running prompto reads
+/// the approval factors: while the live policy grants either (the
+/// `prompto_host` lint errors), approvals are off — the same refusal as
+/// a misplaced secret — and back on once the policy is fixed, by SIGHUP
+/// or by the edit alone.
+#[test]
+fn prompto_host_lint_errors_disable_approvals() {
+    let dir = tempfile::tempdir().unwrap();
+    let inv = InventoryStore::new(
+        Inventory::from_toml_str(
+            r#"
+[host.core]
+ip = "192.0.2.1"
+ssh_user = "prompto"
+ssh_key = "/k"
+prompto_host = true
+nopasswd_sudo = false
+capabilities = ["exec", "sudo_exec"]
+
+[host.t1]
+ip = "192.0.2.2"
+ssh_user = "ops"
+ssh_key = "/k"
+capabilities = ["exec", "sudo_exec"]
+"#,
+        )
+        .unwrap(),
+        None,
+    );
+    let path = dir.path().join("policy.toml");
+    let rule = |hosts: &str, tools: &str, sudo: bool| {
+        format!(
+            "[[rule]]\nagents = [\"dev\"]\nhosts = [{hosts}]\ntools = [{tools}]\nsudo = {sudo}\n"
+        )
+    };
+    let fine = rule("\"t1\"", "\"*\"", true);
+    std::fs::write(&path, &fine).unwrap();
+    let policy = PolicyStore::load_from(path.clone()).unwrap();
+    let a = Approvals::with_keys(
+        ApprovalConfig {
+            approvers_path: write_approvers(dir.path(), 1),
+            state_path: dir.path().join("approval-state"),
+            ..Default::default()
+        },
+        keyset(7),
+    );
+    let tools: Vec<String> = ["ssh_exec", "ssh_sudo_exec", "file_read"]
+        .map(String::from)
+        .into();
+    a.gate_on_policy(&policy, &inv, tools, "prompto".into());
+    assert_eq!(a.unavailable(), None);
+
+    // Root on the prompto host, picked up by SIGHUP (reload).
+    std::fs::write(&path, rule("\"core\"", "\"ssh_sudo_exec\"", true)).unwrap();
+    policy.reload().unwrap();
+    let why = a.unavailable().expect("approvals off");
+    assert!(why.contains("grants root or its service user"), "{why}");
+
+    // Fixed by an edit alone: re-read on the next policy decision.
+    std::fs::write(&path, &fine).unwrap();
+    policy.refresh();
+    assert_eq!(a.unavailable(), None);
+
+    // The service user's file access there, without any sudo.
+    std::fs::write(&path, rule("\"core\"", "\"file_read\"", false)).unwrap();
+    policy.refresh();
+    assert!(a.unavailable().is_some());
+    // ...unless prompto runs as someone else.
+    let b = Approvals::with_keys(
+        ApprovalConfig {
+            approvers_path: write_approvers(dir.path(), 1),
+            state_path: dir.path().join("approval-state-b"),
+            ..Default::default()
+        },
+        keyset(7),
+    );
+    b.gate_on_policy(&policy, &inv, vec!["file_read".into()], "svc".into());
+    assert_eq!(b.unavailable(), None);
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_prompto");
 
 /// `prompto approver add --vault-path`: refused where agents can read,
