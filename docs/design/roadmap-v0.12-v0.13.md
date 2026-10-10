@@ -193,6 +193,8 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S9.1 JWT validation** (`jsonwebtoken` + JWKS fetch/refresh): issuer, audience, expiry. `preferred_username` → agent, the `groups` claim → policy groups.
 - **S9.2 Kanidm:** an OAuth2 client for prompto plus a service account per agent role (aligned with infra's plan: `agent-infragkid`, …).
 - **S9.3 Token acquisition** in `headersHelper` and the mod (client credentials). Static tokens stay as break-glass.
+- **S9.4 Approver enrollment page.** A one-time page served by prompto behind a Kanidm login for a *human* identity, never an agent role. It shows the approver's TOTP QR once, writes the secret to the private mount, then expires. It replaces root CLI enrollment as the normal path; `prompto approver add` stays as break-glass. Never in a Claude session: an enrollment secret shown where an agent runs is readable by that agent.
+- **S9.5 Separate-device approval factor.** Approve from the human's browser or phone through the same Kanidm-authenticated page, an `approvers::Factor` implementation. The terminal pane can then link to it instead of taking a typed code.
 
 ### E10 — Docs, wiki, rollout
 - **S10.1** README + design note updates per release; wiki prompto page (currently stale at v0.9.1) via bucciarati; palazzo entries.
