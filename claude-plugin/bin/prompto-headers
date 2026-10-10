@@ -1,0 +1,26 @@
+#!/bin/sh
+# prompto-headers [token-file]: print prompto's Authorization header as the
+# JSON object a Claude Code headersHelper returns.
+#
+# The token file (default $PROMPTO_TOKEN_FILE, else ~/.config/prompto/token)
+# must be a regular file owned by this user, mode 0600 (or 0400): anything
+# group- or world-readable is refused, so a mistake fails loudly instead of
+# leaking the role token. Its first line is the token.
+f=${1:-${PROMPTO_TOKEN_FILE:-$HOME/.config/prompto/token}}
+case $f in "~/"*) f=$HOME/${f#"~/"} ;; esac
+die() { echo "prompto-headers: $*" >&2; exit 1; }
+[ -f "$f" ] || die "no token file $f (put the role token there, mode 0600)"
+[ -L "$f" ] && die "$f is a symlink; use the file itself"
+# shellcheck disable=SC2012 # ls -ln is the portable way to read mode and uid
+set -- $(ls -ln "$f")
+case $1 in
+  -rw-------*|-r--------*) ;;
+  *) die "$f is mode $1: it must be readable by you only (chmod 600 $f)" ;;
+esac
+[ "$3" = "$(id -u)" ] || die "$f is owned by uid $3, not you ($(id -u))"
+tok=$(head -n 1 "$f" | tr -d '\r\n\t ')
+[ -n "$tok" ] || die "$f is empty"
+case $tok in
+  *[!A-Za-z0-9_.~+/=-]*) die "$f does not hold a token (unexpected characters)" ;;
+esac
+printf '{"Authorization": "Bearer %s"}\n' "$tok"

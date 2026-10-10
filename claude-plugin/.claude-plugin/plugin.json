@@ -1,0 +1,57 @@
+{
+  "name": "prompto",
+  "version": "0.1.0",
+  "description": "prompto in Claude Code: session context on every call, prechecks and tickets, an approval pane for human-approval rules, /prompto whoami|audit|kill",
+  "author": {
+    "name": "calibrae"
+  },
+  "homepage": "https://github.com/calibrae/prompto",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "url": {
+      "type": "string",
+      "title": "prompto URL",
+      "description": "prompto's MCP endpoint (…/mcp); /v1/precheck and friends are next to it",
+      "default": "http://localhost:6337/mcp"
+    },
+    "token_file": {
+      "type": "string",
+      "title": "Token file",
+      "description": "File holding the agent role token, mode 0600",
+      "default": "~/.config/prompto/token"
+    },
+    "servers": {
+      "type": "string",
+      "title": "MCP server names",
+      "description": "Comma-separated names of MCP servers that are this prompto (besides this plugin's own), e.g. a server added with `claude mcp add prompto …`",
+      "default": "prompto"
+    },
+    "transport": {
+      "type": "string",
+      "title": "Transport",
+      "description": "mod: the plugin sends prompto calls itself, with X-Prompto-Session. engine: Claude Code's own MCP connection (its permission prompt and settings hooks run; no session context)",
+      "options": [
+        "mod",
+        "engine"
+      ],
+      "default": "mod"
+    },
+    "scope_minutes": {
+      "type": "number",
+      "title": "Approve for N minutes",
+      "description": "Length of an 'approve similar calls' approval (1-60)",
+      "default": 10
+    }
+  },
+  "mcpServers": {
+    "prompto": {
+      "type": "http",
+      "url": "${user_config.url}",
+      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/prompto-headers\"",
+      "env": {
+        "PROMPTO_TOKEN_FILE": "${user_config.token_file}"
+      }
+    }
+  }
+}
