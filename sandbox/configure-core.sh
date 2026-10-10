@@ -332,6 +332,15 @@ for ip in 192.168.122.11 192.168.122.12 192.168.122.13; do
   echo "from=\"192.168.122.0/24\" $PUB" | $P ops@$ip 'grep -q sbx-rsync-017-throwaway ~/.ssh/authorized_keys || cat >> ~/.ssh/authorized_keys'
 done
 REMOTE
+# Task 018: sbx-bsd's sshd accepts PROMPTO_*, so the request ID reaches its csh
+# login shell through `ssh -o SetEnv` (the `setenv` default on freebsd hosts).
+# Applied in the sandbox through prompto's own vault sudo path; from koichi the
+# equivalent is the sudo -S pipe used by up-bsd.sh.
+{ cat $HOME/sandbox/secrets/sudo-password
+  echo 'f=/etc/ssh/sshd_config'
+  echo 'grep -q "^AcceptEnv PROMPTO_\*" $f || printf "\n# prompto request ID via ssh -o SetEnv (sandbox, task 018)\nAcceptEnv PROMPTO_*\n" >> $f'
+  echo 'sshd -t && service sshd reload'
+} | $S sbx-bsd 'sudo -S -p "" sh -s'
 }
 step_1; step_2; step_3; step_4; step_5; step_6; step_7
 # Smoke test: sandbox/smoke (curl JSON-RPC from sbx-dev) - see /tmp/smoke.sh on sbx-dev.
