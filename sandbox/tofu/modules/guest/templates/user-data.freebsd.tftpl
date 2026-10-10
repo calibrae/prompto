@@ -1,0 +1,14 @@
+#cloud-config
+hostname: ${name}
+users:
+  - name: ops
+    shell: /bin/csh
+    groups: [wheel]
+    passwd: "${pwhash}"
+    ssh_authorized_keys: ["${pubkey}"]
+ssh_pwauth: false
+packages: [sudo, curl, jq, rsync, ca_root_nss]
+runcmd:
+  - mkdir -p /usr/local/etc/sudoers.d
+  - echo 'ops ${sudo_line}' > /usr/local/etc/sudoers.d/ops
+  - chmod 440 /usr/local/etc/sudoers.d/ops

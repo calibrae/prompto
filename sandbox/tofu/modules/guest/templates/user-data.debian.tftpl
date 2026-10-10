@@ -1,0 +1,13 @@
+#cloud-config
+hostname: ${name}
+users:
+  - name: ops
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: "${sudo_line}"
+    lock_passwd: false
+    passwd: "${pwhash}"
+    ssh_authorized_keys: ["${pubkey}"]
+ssh_pwauth: false
+package_update: true
+packages: [curl, jq, rsync, ca-certificates]
