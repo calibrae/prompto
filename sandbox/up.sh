@@ -4,6 +4,7 @@
 #   sbx-core  control plane: prompto-dev, OpenBao, Kanidm   (passwordless sudo)
 #   sbx-t1    managed target: passwordless sudo, static key
 #   sbx-t2    managed target: password sudo                 (vault-sudo path)
+#   sbx-bsd   FreeBSD target (csh, password sudo): created by up-bsd.sh, not here
 #   sbx-dev   the dev agent's workstation: Claude Code + toolchain, root
 #             only inside itself, governed by sandbox prompto
 #
