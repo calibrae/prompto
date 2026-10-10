@@ -11,6 +11,8 @@ export type Fake = {
   precheck: Record<string, any>
   /** The code /v1/approve accepts. */
   code: string
+  /** /v1/approve's reason for a wrong code. */
+  refusal: string
   /** tools/call answers, per tool: a result object or { error }. */
   results: Record<string, any>
   /** /v1/audit records. */
@@ -26,8 +28,12 @@ export type Fake = {
 
 /** Install the fake and the engine stubs every test needs. */
 export type Opts = {
-  /** Claude Code's permission verdict. */
-  check?: 'allow' | 'ask' | 'deny'
+  /** Claude Code's permission verdict, for every tool or per MCP tool name. */
+  check?: 'allow' | 'ask' | 'deny' | ((tool: string) => 'allow' | 'ask' | 'deny')
+  /** Tool names `$.tool.check` was asked about, in order. */
+  checked?: string[]
+  /** What `$.mcp.connect('prompto')` answers: the server's name (default the plugin's own). */
+  mcpServer?: string
   /** The person's pick when asked (AskUserQuestion). */
   answer?: string
   /** The headers helper fails (no token file). */
@@ -51,6 +57,7 @@ export function install(on: On, opts: Opts = {}): Fake {
     seen: [],
     precheck: {},
     code: '123456',
+    refusal: 'invalid approver or code',
     results: {},
     audit: [],
     down: [],
@@ -87,7 +94,12 @@ export function install(on: On, opts: Opts = {}): Fake {
     })
   }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('tool.check', () => ({ decision: opts.check ?? 'allow' }))
+  on('tool.check', ($, e) => {
+    opts.checked?.push(e.tool)
+    const c = opts.check ?? 'allow'
+    return { decision: typeof c === 'function' ? c(e.tool) : c }
+  })
+  on('mcp.connect', () => ({ value: { isConnected: true, server: opts.mcpServer ?? 'plugin:prompto:prompto' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', () => ({ value: undefined }))
   on('store.get', ($, e) => ({ value: fake.store.get(e.key) }))
@@ -127,7 +139,7 @@ export function install(on: On, opts: Opts = {}): Fake {
       case '/v1/precheck':
         return reply(200, fake.precheck[body.tool] ?? { decision: 'allow', rule: 'policy.toml:1', approval: 'none', root: false })
       case '/v1/approve':
-        if (body.totp_code !== fake.code) return reply(403, { decision: 'deny', reason: 'invalid approver or code' })
+        if (body.totp_code !== fake.code) return reply(403, { decision: 'deny', reason: fake.refusal })
         return reply(200, { decision: 'allow', ticket: `pt1.human.${body.scope_minutes ?? 0}`, expires_at: 4102444800, scoped: !!body.scope_minutes })
       case '/v1/audit':
         return reply(200, { records: fake.audit, count: fake.audit.length })

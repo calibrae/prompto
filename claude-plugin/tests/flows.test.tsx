@@ -4,7 +4,9 @@
 
 import { test, expect, mock } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
+import { SHOW_MAX, sha256, utf8 } from '../hooks/util'
 import { install } from './fake'
+import { TOOLS } from './tools.gen'
 import type { Fake } from './fake'
 
 const PANE_PROPS = {
@@ -134,6 +136,7 @@ test('ask: the pane shows the call, the code approves it, the ticket goes on the
   expect(await shows(ui, /uptime/)).toBe(true)
   const code = await ui.find({ type: 'Code' })
   expect(code?.props.source).toBe('systemctl restart nginx')
+  expect(await shows(ui, /host = h2/)).toBe(true)
   expect(fake.calls()).toHaveLength(0)
   expect(await ui.find({ key: 'approve-scope' })).toBeUndefined() // root: no scope without the toggle
   await ui.input({ key: 'totp-0', text: CODE, kind: 'change' })
@@ -536,4 +539,277 @@ test('/prompto kill global: only from the pane, with the code', async ($, on) =>
   expect(kills).toHaveLength(1)
   expect(kills[0]!.body).toEqual({ scope: 'global', approver: 'alice', totp_code: CODE, reason: 'incident 7' })
   expect(await shows(ui, /No prompto approval is waiting/)).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// What the approver sees (task 021)
+// ---------------------------------------------------------------------------
+
+/** Every string in a drawn tree (texts and props alike). */
+function strings(v: unknown, out: string[] = []): string[] {
+  if (typeof v === 'string') out.push(v)
+  else if (Array.isArray(v)) for (const x of v) strings(x, out)
+  else if (v && typeof v === 'object') for (const x of Object.values(v)) strings(x, out)
+  return out
+}
+
+/** A distinctive value of a JSON type, for argument `arg` of `tool`. */
+function sample(tool: string, arg: string, type: string, n: number): unknown {
+  switch (type) {
+    case 'integer':
+    case 'number':
+      return 7000 + n
+    case 'boolean':
+      return true
+    case 'array':
+      return [`a_${tool}_${arg}`]
+    case 'object':
+      return { k: `o_${tool}_${arg}` }
+    default:
+      return `v_${tool}_${arg}`
+  }
+}
+
+test('the pane shows every argument of every prompto tool', { timeoutMs: 120_000 }, async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock })
+  await start($)
+  let n = 0
+  for (const [tool, props] of Object.entries(TOOLS)) {
+    fake.precheck[tool] = { ...ASK, root: false }
+    const args: Record<string, unknown> = {}
+    for (const [arg, type] of Object.entries(props)) args[arg] = sample(tool, arg, type, n++)
+    const call = $.tool.call({ tool: `mcp__prompto__${tool}`, tool_use_id: `all-${tool}`, ...args })
+    const ui = await paneReady($, clock)
+    const drawn = strings(await ui.drawn()).join('\n')
+    for (const [arg, value] of Object.entries(args)) {
+      // The name, and the value: whole, or each string inside it.
+      const named = (await ui.find({ type: 'Text', text: new RegExp(`(^|\\s)${arg}( =|:| \\()`) })) !== undefined
+      expect([tool, arg, named]).toEqual([tool, arg, true])
+      const parts = typeof value === 'object' ? strings(value) : [String(value)]
+      for (const part of parts) expect([tool, arg, drawn.includes(part)]).toEqual([tool, arg, true])
+      if (typeof value === 'boolean' || typeof value === 'number') {
+        expect([tool, arg, await shows(ui, new RegExp(`${arg} = ${value}$`))]).toEqual([tool, arg, true])
+      }
+    }
+    await ui.press({ key: 'deny' })
+    await done(clock, call)
+    await ui.unmount()
+  }
+  expect(n).toBeGreaterThan(20)
+  expect(fake.calls().filter(c => c.body.params.name !== 'file_read')).toHaveLength(0)
+})
+
+test('file_write with Claude Code denying file_read: no read, the whole new content instead of a diff', async ($, on) => {
+  const clock = mock.clock(on)
+  const checked: string[] = []
+  const fake = install(on, { clock, checked, check: t => (t.endsWith('__file_read') ? 'deny' : 'allow') })
+  fake.precheck.file_write = { ...ASK, root: false }
+  await start($)
+  const content = 'line one\nline two\nmode=0600\n'
+  const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw1', host: 'h2', path: '/etc/x.conf', content, mode: '0600' })
+  const ui = await paneReady($, clock)
+  expect(checked).toContain('mcp__prompto__file_read')
+  expect(await shows(ui, /diff unavailable: your Claude Code settings deny file_read/)).toBe(true)
+  const codes = await ui.findAll({ type: 'Code' })
+  expect(codes.some(c => c.props.format === 'diff')).toBe(false)
+  expect(codes.some(c => c.props.source === content)).toBe(true)
+  expect(await shows(ui, /mode = 0600/)).toBe(true)
+  expect(await shows(ui, /content \(28 bytes, sha256 [0-9a-f]{64}\):/)).toBe(true)
+  // Nothing was read, not even prechecked.
+  expect(fake.seen.filter(s => s.body?.tool === 'file_read' || s.body?.params?.name === 'file_read')).toHaveLength(0)
+  await ui.press({ key: 'deny' })
+  await done(clock, call)
+})
+
+test('file_write with a diff: the content line says the diff shows it', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock })
+  fake.precheck.file_write = { ...ASK, root: false }
+  fake.results.file_read = { content: [{ type: 'text', text: JSON.stringify({ content: 'a\n', truncated: false }) }], isError: false }
+  await start($)
+  const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw2', host: 'h2', path: '/etc/x', content: 'b\n', sudo: true })
+  const ui = await paneReady($, clock)
+  expect(await shows(ui, /content = 2 bytes, sha256 [0-9a-f]{64}: the diff below/)).toBe(true)
+  expect(await shows(ui, /sudo = true/)).toBe(true)
+  const diff = (await ui.findAll({ type: 'Code' })).find(c => c.props.format === 'diff')
+  expect(String(diff?.props.source)).toContain('-a\n+b')
+  await ui.press({ key: 'deny' })
+  await done(clock, call)
+})
+
+test('a file_write too large to draw: its head, its size, its sha256, and a warning', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock, check: t => (t.endsWith('__file_read') ? 'ask' : 'allow') })
+  fake.precheck.file_write = { ...ASK, root: false }
+  await start($)
+  const content = 'x'.repeat(100_000)
+  const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw3', host: 'h2', path: '/big', content })
+  const ui = await paneReady($, clock)
+  expect(await shows(ui, /diff unavailable: your Claude Code settings ask before file_read/)).toBe(true)
+  const code = (await ui.findAll({ type: 'Code' })).find(c => String(c.props.source).startsWith('xxx'))
+  expect(String(code?.props.source).length).toBe(SHOW_MAX)
+  const warning = await ui.find({ type: 'Text', text: /content truncated in this view/ })
+  expect(warning).toBeDefined()
+  expect(await shows(ui, new RegExp(`you are approving all 100000 bytes, sha256 ${sha256(utf8(content))}`))).toBe(true)
+  await ui.press({ key: 'deny' })
+  await done(clock, call)
+})
+
+test('terminal controls and bidi characters are drawn escaped, wherever they come from', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { store: { approver: 'alice' }, clock })
+  fake.precheck.ssh_sudo_exec = { ...ASK, rule: 'r\u202e1', reason: 'needs\x1b[2J a human\u2066' }
+  fake.audit = [{ ts: '2026-10-10T12:00:01.000Z', type: 'tool', tool: 'ssh_exec', host: 'h2', ok: true, args: { cmd: 'echo \x1b]0;pwn\x07' } }]
+  await start($)
+  const call = $.tool.call({
+    tool: 'mcp__prompto__ssh_sudo_exec',
+    tool_use_id: 'bidi',
+    host: 'h2',
+    cmd: 'ls # \u202etxt.exe\x1b[8m',
+    note: 'x\u2067y\x9b',
+    // Keys come from the model too, short and long values alike.
+    'k\u202eey': 'v',
+    'long\u2066key': 'a\nb',
+  })
+  const ui = await paneReady($, clock)
+  // The person also gets a refusal message from prompto with hazards in it.
+  fake.code = 'never'
+  fake.refusal = 'bad code\u202e\x1b[2J'
+  await ui.input({ key: 'totp-0', text: '000000', kind: 'change' })
+  await ui.press({ key: 'approve' })
+  const drawn = strings(await ui.drawn())
+  const hazard = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/
+  for (const s of drawn) expect([s, hazard.test(s)]).toEqual([s, false])
+  expect(drawn.join('\n')).toContain('\\u{202e}txt.exe\\x1b[8m')
+  expect(drawn.join('\n')).toContain('x\\u{2067}y\\x9b')
+  expect(await shows(ui, /rule r\\u\{202e\}1/)).toBe(true)
+  await ui.press({ key: 'deny' })
+  await done(clock, call)
+})
+
+// ---------------------------------------------------------------------------
+// Claude Code's own verdict comes before the pane (task 021)
+// ---------------------------------------------------------------------------
+
+test('ask: a Claude Code deny refuses before the pane, without asking for a code', async ($, on) => {
+  const clock = mock.clock(on)
+  const asked: string[] = []
+  const fake = install(on, { clock, check: 'deny', answer: 'Allow', asked })
+  fake.precheck.ssh_sudo_exec = ASK
+  await start($)
+  const out = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'cc1', host: 'h2', cmd: 'id' })
+  expect(out.deny).toContain('permission settings')
+  expect(asked).toHaveLength(0)
+  expect(fake.logs.join('')).not.toContain('waits for an approval')
+  expect(fake.approvals()).toHaveLength(0)
+  expect(fake.calls()).toHaveLength(0)
+})
+
+test('ask: a Claude Code ask goes to the person first; their no ends it before the pane', async ($, on) => {
+  const clock = mock.clock(on)
+  const asked: string[] = []
+  const fake = install(on, { clock, check: 'ask', answer: 'Deny', asked })
+  fake.precheck.ssh_sudo_exec = ASK
+  await start($)
+  const out = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'cc2', host: 'h2', cmd: 'id' })
+  expect(asked).toHaveLength(1)
+  expect(out.deny).toContain('denied')
+  expect(fake.logs.join('')).not.toContain('waits for an approval')
+  expect(fake.approvals()).toHaveLength(0)
+})
+
+test('ask, transport engine: a Claude Code deny refuses before the pane too', { options: { transport: 'engine' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock, check: 'deny' })
+  fake.precheck.ssh_sudo_exec = ASK
+  await start($)
+  const out = await $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'cc3', host: 'h2', cmd: 'id' })
+  expect(out.deny).toContain('permission settings')
+  expect(fake.logs.join('')).not.toContain('waits for an approval')
+})
+
+// ---------------------------------------------------------------------------
+// A reload mid-approval (task 021)
+// ---------------------------------------------------------------------------
+
+test('an item whose call was lost on a reload is marked stale, never wedges, and Deny dismisses it', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { store: { approver: 'alice' }, clock })
+  fake.precheck.ssh_sudo_exec = ASK
+  // What a reload leaves behind: an item in state whose hook is gone.
+  let injected = false
+  on('state.set', ($, e, next) => {
+    const v = e.value as { shape: string; value: { id: string }[] } | undefined
+    if (!injected && e.key === 'pending' && v?.value?.length) {
+      injected = true
+      return next({ ...e, value: { ...v, value: [{ ...v.value[0]!, id: 'ghost' }, ...v.value] } } as typeof e)
+    }
+    return next(e)
+  })
+  await start($)
+  const call = $.tool.call({ tool: 'mcp__prompto__ssh_sudo_exec', tool_use_id: 'real', host: 'h2', cmd: 'id' })
+  const ui = await $.ui.mount({ plugin: 'prompto', surface: 'terminal', component: 'Pane', requestId: 'prompto-approval', props: PANE_PROPS })
+  for (let i = 0; i < 200 && !(await shows(ui, /^stale:/)); i++) await clock.settle()
+  expect(await shows(ui, /^stale: the call was lost when the plugin reloaded/)).toBe(true)
+  expect(await ui.find({ key: 'approve' })).toBeUndefined()
+  // A code typed and submitted anyway: nothing is sent, nothing stays busy.
+  await ui.input({ key: 'totp-0', text: CODE })
+  expect(fake.approvals()).toHaveLength(0)
+  expect(await shows(ui, /asking prompto/)).toBe(false)
+  expect(await shows(ui, /Ask the agent to retry it/)).toBe(true)
+  // Deny dismisses it; the live call is next, and works.
+  await ui.press({ key: 'deny' })
+  for (let i = 0; i < 200 && (await shows(ui, /^stale:/)); i++) await clock.settle()
+  expect(await shows(ui, /^stale:/)).toBe(false)
+  const totp = (await ui.findAll({ type: 'Input' })).find(x => String(x.key).startsWith('totp-'))!
+  await ui.input({ key: String(totp.key), text: CODE, kind: 'change' })
+  await ui.press({ key: 'approve' })
+  expect((await done(clock, call)).deny).toBeUndefined()
+  expect(fake.approvals()).toHaveLength(1)
+})
+
+// ---------------------------------------------------------------------------
+// A user-configured server shadowing the plugin's (task 021)
+// ---------------------------------------------------------------------------
+
+test('session.start warns when a server of the person\'s serves prompto and `servers` misses it', async ($, on) => {
+  mock.clock(on)
+  const fake = install(on, { mcpServer: 'prompto-sbx' })
+  await start($)
+  const said = fake.logs.join('\n')
+  expect(said).toContain('toast:')
+  expect(said).toContain('log:')
+  expect(said).toContain('your MCP server \\"prompto-sbx\\"')
+})
+
+test('no warning when `servers` names it, or the plugin\'s own server is the one', { options: { servers: 'prompto, prompto-sbx' } }, async ($, on) => {
+  mock.clock(on)
+  const fake = install(on, { mcpServer: 'prompto-sbx' })
+  await start($)
+  expect(fake.logs.join('\n')).not.toContain('serves prompto through')
+})
+
+test('no warning with the plugin\'s own server', async ($, on) => {
+  mock.clock(on)
+  const fake = install(on)
+  await start($)
+  expect(fake.logs.join('\n')).not.toContain('serves prompto through')
+})
+
+test('file_write whose diff is too long to draw: the new content instead, whole', async ($, on) => {
+  const clock = mock.clock(on)
+  const fake = install(on, { clock })
+  fake.precheck.file_write = { ...ASK, root: false }
+  const before = 'old line\n'.repeat(5000)
+  fake.results.file_read = { content: [{ type: 'text', text: JSON.stringify({ content: before, truncated: false }) }], isError: false }
+  await start($)
+  const call = $.tool.call({ tool: 'mcp__prompto__file_write', tool_use_id: 'fw4', host: 'h2', path: '/etc/x', content: 'new\n' })
+  const ui = await paneReady($, clock)
+  expect(await shows(ui, /the diff is too long to show/)).toBe(true)
+  const codes = await ui.findAll({ type: 'Code' })
+  expect(codes.some(c => c.props.format === 'diff')).toBe(false)
+  expect(codes.some(c => c.props.source === 'new\n')).toBe(true)
+  await ui.press({ key: 'deny' })
+  await done(clock, call)
 })

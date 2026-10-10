@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import { unifiedDiff } from '../hooks/diff'
-import { argsOf, auditLine, commandOf, looksLikeCode, rpcMessage, scopeKey, toolPattern } from '../hooks/util'
+import { SHOW_MAX, argView, argsOf, auditLine, clean, commandOf, cutNote, looksLikeCode, rpcMessage, scopeKey, sha256, toolPattern, utf8 } from '../hooks/util'
 
 test('diff: one changed line, with context and line numbers', () => {
   const d = unifiedDiff('a\nb\nc\nd\ne\nf\ng\nh\n', 'a\nb\nc\nd\nE\nf\ng\nh\n', 'x')
@@ -33,14 +33,58 @@ test('argsOf drops only the engine\'s keys and copies the rest as JSON', () => {
   expect(argsOf(e)).toEqual({ host: 'h', n: 1, nested: { b: [1, 2] } })
 })
 
-test('commandOf: the command, the script, the batch, or the arguments without content or ticket', () => {
+test('commandOf: the command, the script, the batch, or the other arguments (file_write\'s content aside)', () => {
   expect(commandOf('ssh_exec', { host: 'h', cmd: 'id' })).toBe('id')
   expect(commandOf('bash_exec', { host: 'h', script: 'echo 1' })).toBe('echo 1')
   expect(commandOf('ssh_batch', { host: 'h', commands: ['a', 'b'] })).toBe('a\nb')
-  const fw = commandOf('file_write', { host: 'h', path: '/p', content: 'secret-ish body', ticket: 'pt1.x' })
-  expect(fw).toContain('"path": "/p"')
-  expect(fw).toContain('<15 chars: see the diff>')
-  expect(fw).not.toContain('pt1.x')
+  const fw = commandOf('file_write', { host: 'h', path: '/p', content: 'body', ticket: 'pt1.x' })
+  expect(fw).toBe('host=h path=/p')
+})
+
+test('argView: the main field first, then every other argument but the ticket, in order', () => {
+  const v = argView({ host: 'h', timeout_secs: 30, cmd: 'id', env: { A: '1' }, flag: false, ticket: 'pt1.x', list: [1, 'a'] })
+  expect(v.main).toEqual({ key: 'cmd', text: 'id', cut: null })
+  expect(v.fields.map(f => f.key)).toEqual(['host', 'timeout_secs', 'env', 'flag', 'list'])
+  expect(v.fields.map(f => f.text)).toEqual(['h', '30', '{\n  "A": "1"\n}', 'false', '[\n  1,\n  "a"\n]'])
+  expect(JSON.stringify(v)).not.toContain('pt1.x')
+  // No main field: everything is a field.
+  expect(argView({ host: 'h', unit: 'nginx' })).toEqual({
+    main: null,
+    fields: [
+      { key: 'host', text: 'h', cut: null },
+      { key: 'unit', text: 'nginx', cut: null },
+    ],
+  })
+})
+
+test('argView: a value too long to draw is its head, its size and its sha256', () => {
+  const big = 'é'.repeat(SHOW_MAX + 10)
+  const [f] = argView({ content: big }).fields
+  expect(f!.text.length).toBe(SHOW_MAX)
+  expect(f!.cut).toEqual({ bytes: (SHOW_MAX + 10) * 2, sha256: sha256(utf8(big)) })
+  expect(cutNote(f!)).toContain(`you are approving all ${(SHOW_MAX + 10) * 2} bytes, sha256 ${sha256(utf8(big))}`)
+  expect(cutNote(argView({ content: 'short' }).fields[0]!)).toBeNull()
+})
+
+test('sha256 and utf8: known vectors', () => {
+  expect(sha256(utf8(''))).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+  expect(sha256(utf8('abc'))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+  expect(sha256(utf8('abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq'))).toBe(
+    '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1',
+  )
+  expect(sha256(utf8('a'.repeat(1_000_000)))).toBe('cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0')
+  expect([...utf8('é€😀')]).toEqual([0xc3, 0xa9, 0xe2, 0x82, 0xac, 0xf0, 0x9f, 0x98, 0x80])
+})
+
+test('clean: controls and bidi/format characters are drawn as escapes; newline and tab stay', () => {
+  expect(clean('a\x1b[2Jb\rc\x07d\x9b')).toBe('a\\x1b[2Jb\\x0dc\\x07d\\x9b')
+  for (const c of ['\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069', '\u200b', '\u200e', '\u200f', '\ufeff', '\u061c']) {
+    const out = clean(`x${c}y`)
+    expect(out).not.toContain(c)
+    expect(out).toBe(`x\\u{${c.charCodeAt(0).toString(16)}}y`)
+  }
+  expect(clean('l1\n\tl2 é')).toBe('l1\n\tl2 é')
+  expect(argView({ cmd: 'rm -rf /\u202e#' }).main!.text).toBe('rm -rf /\\u{202e}#')
 })
 
 test('toolPattern: this plugin\'s server and the configured ones, nothing else', () => {
@@ -64,9 +108,19 @@ test('rpcMessage: plain JSON or an SSE data line', () => {
   expect(rpcMessage('not json')).toBeUndefined()
 })
 
-test('looksLikeCode: a run of exactly six digits', () => {
-  for (const t of ['123456', 'alice123456', 'code: 123456.', '123456 is it']) expect(looksLikeCode(t)).toBe(true)
-  for (const t of ['alice', 'sbx-approver', '12345', '1234567', 'policy.toml:36', 'ticket 2026-10-10']) expect(looksLikeCode(t)).toBe(false)
+test('looksLikeCode: six digits, alone or in small groups split by a space or a hyphen', () => {
+  for (const t of ['123456', 'alice123456', 'code: 123456.', '123456 is it', '123 456', '123-456', 'ok 12-34-56', '1 2 3 4 5 6', 'x 12 345 6', '0000 00']) {
+    expect([t, looksLikeCode(t)]).toEqual([t, true])
+  }
+  for (const t of ['alice', 'sbx-approver', '12345', '1234567', 'policy.toml:36', 'ticket 2026-10-10', 'host 10.0.0.1', '12 345', 'ap-1 2']) {
+    expect([t, looksLikeCode(t)]).toEqual([t, false])
+  }
+})
+
+test('auditLine: hazards in a record are escaped', () => {
+  const line = auditLine({ ts: '2026-10-10T13:30:54.000Z', type: 'tool', tool: 'ssh_exec', host: 'h\u202e1', ok: true, args: { cmd: 'echo \x1b]0;x\x07' } })
+  expect(line).not.toMatch(/[\x00-\x1f\u202e]/)
+  expect(line).toContain('h\\u{202e}1')
 })
 
 test('auditLine: a call shows its outcome, a precheck its decision', () => {

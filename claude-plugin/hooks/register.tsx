@@ -8,6 +8,13 @@
 // that X-Prompto-Session rides on it: Claude Code's own MCP connection
 // takes its headers once, from a helper run before any session exists.
 //
+// The pane shows the approver everything the ticket will cover: every
+// argument (the command first), file_write's content as a diff or whole,
+// and a value too long to draw as its head, its size and its SHA-256.
+// Everything drawn goes through `clean` first: arguments, reasons and
+// audit lines come from the model or the network, and must not drive the
+// terminal (escape sequences, bidi overrides).
+//
 // The TOTP code is held in one variable (`codes`) from the keystroke to
 // the /v1/approve request, then deleted: never in $.state, $.store, a log
 // line, a toast, a tool argument or the transcript. No request body is
@@ -21,18 +28,24 @@ import { unifiedDiff } from './diff'
 import {
   CODE_IN_FIELD,
   HELP,
+  SHOW_MAX,
+  argView,
   argsOf,
   auditLine,
+  clean,
   commandOf,
   configFrom,
+  cutNote,
   errorText,
   hostOf,
   looksLikeCode,
   refusal,
   rpcMessage,
   scopeKey,
+  sha256,
   textOf,
   toolPattern,
+  utf8,
 } from './util'
 import type { Config, McpBlock, Precheck } from './util'
 
@@ -44,7 +57,7 @@ const WAIT_MS = 10 * 60 * 1000
 const VERSION = '0.1.0'
 const USER_AGENT = `prompto-claude-plugin/${VERSION}`
 
-const pending = atom({ plugin: 'prompto', key: 'pending' } as const, [] as PromptoPending[])
+const pending = atom({ plugin: 'prompto', key: 'pending' } as const, [] as PromptoPending[], { shape: 'pending-2' })
 
 type Settings = {
   options: Readonly<Record<string, unknown>>
@@ -239,14 +252,25 @@ async function sendMod(
   return out.ok ? ({ result: out.content } as ToolCallResult) : { deny: out.message }
 }
 
-/** Claude Code's own permission verdict, for a call the plugin sends itself. */
-async function permitted($: $, mcpTool: string, tool: string, args: Record<string, unknown>): Promise<true | { deny: string }> {
+/**
+ * Claude Code's own permission verdict. A deny refuses. An ask is put to
+ * the person when the plugin sends the call itself (`askPerson`); else
+ * Claude Code asks on its own when the call reaches it.
+ */
+async function permitted(
+  $: $,
+  mcpTool: string,
+  tool: string,
+  args: Record<string, unknown>,
+  askPerson = true,
+): Promise<true | { deny: string }> {
   const v = await $.tool.check({ tool: mcpTool, input: args })
   if (v.decision === 'allow') return true
   if (v.decision === 'deny') return { deny: v.reason ?? "denied by Claude Code's permission settings" }
+  if (!askPerson) return true
   if (!interactive) return { deny: `Claude Code's permission settings ask before ${mcpTool} runs, and nobody is here to answer` }
   try {
-    const pick = await $.ui.ask(`Allow prompto ${tool} on ${hostOf(tool, args) ?? '-'}?\n${commandOf(tool, args).slice(0, 300)}`, {
+    const pick = await $.ui.ask(`Allow prompto ${tool} on ${clean(hostOf(tool, args) ?? '-')}?\n${commandOf(tool, args).slice(0, 300)}`, {
       options: ['Allow', 'Deny'],
       header: 'prompto',
     })
@@ -275,7 +299,9 @@ function blank(id: string, kind: PromptoPending['kind'], approver: string): Prom
     kind,
     tool: '',
     host: null,
-    command: '',
+    main: null,
+    fields: [],
+    contentSum: null,
     path: null,
     rule: null,
     reason: '',
@@ -289,6 +315,7 @@ function blank(id: string, kind: PromptoPending['kind'], approver: string): Prom
     message: null,
     isBusy: false,
     generation: 0,
+    stale: false,
   }
 }
 
@@ -297,6 +324,7 @@ async function waitForHuman(
   $: $,
   id: string,
   signal: AbortSignal,
+  mcpTool: string,
   tool: string,
   args: Record<string, unknown>,
   session: string | undefined,
@@ -304,11 +332,15 @@ async function waitForHuman(
 ): Promise<Decision> {
   const w: Waiter = { tool, args, session, root: a.root === true }
   waiters.set(id, w)
+  const { main, fields } = argView(args)
+  const content = tool === 'file_write' && typeof args.content === 'string' ? utf8(args.content) : null
   const item: PromptoPending = {
     ...blank(id, 'call', String((await $.store.get('approver')) ?? '')),
     tool,
     host: hostOf(tool, args),
-    command: commandOf(tool, args),
+    main,
+    fields,
+    contentSum: content ? `${content.length} bytes, sha256 ${sha256(content)}` : null,
     path: typeof args.path === 'string' ? args.path : null,
     rule: a.rule ?? null,
     reason: a.reason ?? '',
@@ -320,7 +352,7 @@ async function waitForHuman(
     await update($, pending, list => [...list.filter(p => p.id !== id), item])
     const opened = await $.ui.open({ id: PANE, title: `prompto: approve ${tool}`, focus: true, closeOnEscape: true })
     $.ui.status(`prompto: ${tool} on ${item.host ?? '-'} waits for an approval${opened.isPlaced ? '' : ' (run /prompto approve)'}`)
-    await enrich($, id, tool, args, session)
+    await enrich($, id, mcpTool, tool, args, session)
     const deadline = (await $.clock.now()) + WAIT_MS
     while (!w.decision) {
       if (signal.aborted) w.decision = { kind: 'denied', reason: 'the turn was interrupted' }
@@ -341,8 +373,12 @@ async function waitForHuman(
   }
 }
 
-/** The diff (file_write) and the recent audit lines, both through prompto and its policy. */
-async function enrich($: $, id: string, tool: string, args: Record<string, unknown>, session: string | undefined) {
+/**
+ * The diff (file_write) and the recent audit lines, both through prompto
+ * and its policy. The current file is read only where Claude Code's own
+ * settings allow file_read outright: the pane asks nobody for it.
+ */
+async function enrich($: $, id: string, mcpTool: string, tool: string, args: Record<string, unknown>, session: string | undefined) {
   const cfg = cfgOf($)
   const host = typeof args.host === 'string' ? args.host : undefined
   if (tool === 'file_write' && host && typeof args.path === 'string') {
@@ -351,8 +387,13 @@ async function enrich($: $, id: string, tool: string, args: Record<string, unkno
     const readArgs = { host, path, max_bytes: 1048576 }
     let diff: string | null = null
     let note: string | null = null
-    const pc = await precheck($, cfg, session, 'file_read', readArgs)
-    if (!pc.answer) note = `cannot check read access: ${pc.why}`
+    const readTool = mcpTool.replace(/__file_write$/, '__file_read')
+    const verdict = await $.tool.check({ tool: readTool, input: readArgs })
+    const pc =
+      verdict.decision === 'allow' ? await precheck($, cfg, session, 'file_read', readArgs) : { answer: undefined, why: undefined }
+    if (verdict.decision !== 'allow') {
+      note = `diff unavailable: your Claude Code settings ${verdict.decision === 'deny' ? 'deny' : 'ask before'} file_read; the full new content is shown instead`
+    } else if (!pc.answer) note = `cannot check read access: ${pc.why}`
     else if (pc.answer.decision === 'deny') note = `no read grant: ${pc.answer.reason ?? pc.answer.error_class}`
     else if (pc.answer.decision === 'ask') note = 'no diff: reading the file needs a human approval of its own'
     else {
@@ -370,6 +411,11 @@ async function enrich($: $, id: string, tool: string, args: Record<string, unkno
       } catch (err) {
         note = `file_read failed: ${(err as Error).message}`
       }
+    }
+    if (diff && diff.length > SHOW_MAX) {
+      // Too long to draw whole; a diff cut mid-hunk doesn't parse.
+      note = `the diff is too long to show (${diff.length} chars); the new content is shown instead`
+      diff = null
     }
     await patch($, id, () => ({ diff: diff || null, diffNote: note }))
   }
@@ -410,7 +456,7 @@ async function approvePressed($: $, id: string, minutes: number | undefined): Pr
   await patch($, id, () => ({ isBusy: true, message: null, approver }))
   if (p.kind === 'kill-global') return killGlobal($, id, approver, code)
   const w = waiters.get(id)
-  if (!w) return
+  if (!w) return markStale($, id)
   let r: Reply
   try {
     r = await request($, cfgOf($), w.session, 'POST', `${cfgOf($).base}/v1/approve`, {
@@ -442,6 +488,16 @@ async function approvePressed($: $, id: string, minutes: number | undefined): Pr
   const what = r.status === 429 ? 'locked out' : r.status === 403 ? 'refused' : `HTTP ${r.status}`
   const why = String(j.reason ?? j.error ?? r.text.slice(0, 300))
   return patch($, id, q => ({ isBusy: false, message: `${what}: ${why}`, generation: q.generation + 1 }))
+}
+
+/** The call behind a pane item is gone (a reload): say so, never wait on it. */
+async function markStale($: $, id: string): Promise<void> {
+  await patch($, id, q => ({
+    isBusy: false,
+    stale: true,
+    message: 'stale: the call was lost when the plugin reloaded. Ask the agent to retry it; Deny dismisses this.',
+    generation: q.generation + 1,
+  }))
 }
 
 async function denyPressed($: $, id: string): Promise<void> {
@@ -550,13 +606,47 @@ async function command($: $, args: string): Promise<{ text: string }> {
   }
 }
 
+/**
+ * Claude Code drops this plugin's MCP server when a server the person
+ * configured has the same URL, and the tools then go by that server's
+ * name. Unless `servers` names it, the plugin wouldn't see those calls:
+ * say so, once, at the start of the session.
+ */
+async function warnIfShadowed($: $, servers: readonly string[]): Promise<void> {
+  let r
+  try {
+    r = await $.mcp.connect('prompto')
+  } catch (err) {
+    $.ui.log(`prompto: cannot tell which MCP server serves prompto: ${(err as Error).message}`)
+    return
+  }
+  if (!r.isConnected) {
+    $.ui.log(`prompto: the plugin's MCP server is not connected (${r.reason}): ${clean(r.message)}`)
+    return
+  }
+  if (r.server.startsWith('plugin:')) return
+  const asTool = r.server.replace(/[^A-Za-z0-9_-]/g, '_')
+  if (servers.includes(r.server) || servers.includes(asTool)) return
+  const name = clean(r.server)
+  const msg =
+    `prompto: Claude Code serves prompto through your MCP server "${name}" (same URL as the plugin's), ` +
+    `and the plugin option \`servers\` doesn't name it: its calls get no precheck, ticket, approval pane or session. ` +
+    `Add "${name}" to \`servers\`, or remove that server.`
+  $.ui.log(msg)
+  $.ui.toast(msg, { timeoutMs: 15_000 })
+}
+
 export const register: Register = (on, options) => {
   S = {
     options,
     transport: options.transport === 'engine' ? 'engine' : 'mod',
     scopeMinutes: Math.min(60, Math.max(1, Math.round(Number(options.scope_minutes) || 10))),
   }
-  const PROMPTO_TOOL = toolPattern(String(options.servers ?? 'prompto'))
+  const servers = String(options.servers ?? 'prompto')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean)
+  const PROMPTO_TOOL = toolPattern(servers.join(','))
 
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive
@@ -570,6 +660,7 @@ export const register: Register = (on, options) => {
       // The calls are what matter; the command is a convenience.
       $.ui.log(`prompto: /prompto is unavailable: ${(err as Error).message}`)
     }
+    await warnIfShadowed($, servers)
     return next(e)
   })
 
@@ -624,7 +715,10 @@ export const register: Register = (on, options) => {
           deny: `${refusal({ ...a, error_class: 'approval_required' })}\nA human must approve it, and this session has nobody to show the approval pane to. Run it from an interactive Claude Code session with the prompto plugin.`,
         }
       }
-      const decision = await waitForHuman($, e.tool_use_id, next.signal, tool, args, session, a)
+      // Claude Code's verdict first: a call its settings deny never costs a code.
+      const ok = await permitted($, e.tool, tool, args, isMod)
+      if (ok !== true) return ok
+      const decision = await waitForHuman($, e.tool_use_id, next.signal, e.tool, tool, args, session, a)
       if (decision.kind === 'denied') return { deny: `prompto: the human approver refused this call: ${decision.reason}` }
       ticket = decision.ticket
     }
@@ -663,34 +757,71 @@ export const register: Register = (on, options) => {
     if (e.surface === 'mobile') {
       return (
         <Text>
-          prompto: {p.tool} on {p.host ?? '-'} waits for an approval. Approve it from a terminal or the desktop app.
+          prompto: {clean(p.tool)} on {clean(p.host ?? '-')} waits for an approval. Approve it from a terminal or the desktop app.
         </Text>
       )
     }
     const { Button, Input, Code } = $.ui.resolve(e)
     const isKill = p.kind === 'kill-global'
     const minutes = S.scopeMinutes
-    const canScope = !isKill && (!p.root || p.rootScope)
+    // A call whose hook is gone (the plugin reloaded) can't be approved.
+    const stale = p.stale || (p.kind === 'call' && !waiters.has(p.id))
+    const canScope = !isKill && !stale && (!p.root || p.rootScope)
+    const host = clean(p.host ?? '-')
+    const cuts = [p.main, ...p.fields].map(f => (f ? cutNote(f) : null)).filter(Boolean) as string[]
+    // file_write's content: the diff when there is one, else drawn whole.
+    const asDiff = (key: string) => p.tool === 'file_write' && key === 'content' && p.diff !== null
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           <Text bold>
-            {isKill ? 'Stop every prompto call (global kill)' : `${p.tool} on ${p.host ?? '-'}`}
+            {isKill ? 'Stop every prompto call (global kill)' : `${clean(p.tool)} on ${host}`}
             {p.root ? <Text color="red"> · root-capable</Text> : ''}
           </Text>
-          {p.rule ? <Text dimColor>rule {p.rule}</Text> : ''}
-          {p.reason ? <Text dimColor>{p.reason}</Text> : ''}
+          {p.rule ? <Text dimColor>rule {clean(p.rule)}</Text> : ''}
+          {p.reason ? <Text dimColor>{clean(p.reason)}</Text> : ''}
         </Box>
-        {isKill ? '' : <Code source={p.command} language="sh" />}
-        {p.diff ? <Code source={p.diff} format="diff" path={p.path ?? undefined} /> : ''}
-        {p.diffNote ? <Text dimColor>diff: {p.diffNote}</Text> : ''}
+        {stale ? <Text color="red">stale: the call was lost when the plugin reloaded. Ask the agent to retry it; Deny dismisses this.</Text> : ''}
+        {p.main ? (
+          <Box flexDirection="column">
+            <Text bold>{p.main.key}:</Text>
+            <Code source={p.main.text} language="sh" />
+          </Box>
+        ) : (
+          ''
+        )}
+        {isKill ? (
+          ''
+        ) : (
+          <Box key="args" flexDirection="column">
+            <Text dimColor>{p.main ? 'and every other argument the approval covers:' : 'every argument the approval covers:'}</Text>
+            {p.fields.length === 0 ? <Text dimColor>  (none)</Text> : ''}
+            {p.fields.map((f, i) =>
+              asDiff(f.key) ? (
+                <Text key={`arg-${i}`}>  {clean(f.key)} = {p.contentSum}: the diff below</Text>
+              ) : f.text.includes('\n') || f.text.length > 100 ? (
+                <Box key={`arg-${i}`} flexDirection="column">
+                  <Text>  {clean(f.key)}{f.key === 'content' && p.contentSum ? ` (${p.contentSum})` : ''}:</Text>
+                  <Code source={f.text} />
+                </Box>
+              ) : (
+                <Text key={`arg-${i}`}>  {clean(f.key)} = {f.text}</Text>
+              ),
+            )}
+          </Box>
+        )}
+        {cuts.map(c => (
+          <Text color="yellow">{c}</Text>
+        ))}
+        {p.diff ? <Code source={clean(p.diff)} format="diff" path={p.path ?? undefined} /> : ''}
+        {p.diffNote ? <Text dimColor>diff: {clean(p.diffNote)}</Text> : ''}
         {p.audit.length > 0 || p.auditNote ? (
           <Box flexDirection="column">
-            <Text dimColor>recent calls by this agent on {p.host ?? '-'}:</Text>
+            <Text dimColor>recent calls by this agent on {host}:</Text>
             {p.audit.map(line => (
-              <Text dimColor>  {line}</Text>
+              <Text dimColor>  {clean(line)}</Text>
             ))}
-            {p.auditNote ? <Text dimColor>  {p.auditNote}</Text> : ''}
+            {p.auditNote ? <Text dimColor>  {clean(p.auditNote)}</Text> : ''}
           </Box>
         ) : (
           ''
@@ -729,9 +860,13 @@ export const register: Register = (on, options) => {
           />
         </Box>
         <Box flexDirection="row" gap={2}>
-          <Button key="approve" variant="primary" hotkey="a" onPress={() => void approvePressed($, p.id, undefined)}>
-            {isKill ? 'Kill everything' : 'Approve once'}
-          </Button>
+          {stale ? (
+            ''
+          ) : (
+            <Button key="approve" variant="primary" hotkey="a" onPress={() => void approvePressed($, p.id, undefined)}>
+              {isKill ? 'Kill everything' : 'Approve once'}
+            </Button>
+          )}
           {canScope ? (
             <Button key="approve-scope" hotkey="m" onPress={() => void approvePressed($, p.id, minutes)}>
               {`Approve ${minutes} min`}
@@ -739,7 +874,7 @@ export const register: Register = (on, options) => {
           ) : (
             ''
           )}
-          {!isKill && p.root ? (
+          {!isKill && !stale && p.root ? (
             <Button key="root-scope" hotkey="r" dimColor onPress={() => void patch($, p.id, q => ({ rootScope: !q.rootScope }))}>
               {`${p.rootScope ? '[x]' : '[ ]'} allow a ${minutes} min root scope`}
             </Button>
@@ -752,7 +887,7 @@ export const register: Register = (on, options) => {
         </Box>
         <Text dimColor>Tab moves between fields and buttons · Esc closes the pane{isKill ? '' : ' (and refuses the call)'}</Text>
         {p.isBusy ? <Text dimColor>asking prompto…</Text> : ''}
-        {p.message ? <Text color="yellow">{p.message}</Text> : ''}
+        {p.message ? <Text color="yellow">{clean(p.message)}</Text> : ''}
         {list.length > 1 ? <Text dimColor>{list.length - 1} more waiting</Text> : ''}
       </Box>
     )

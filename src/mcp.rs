@@ -500,6 +500,19 @@ impl Prompto {
             .collect()
     }
 
+    /// Every tool's name and input schema (`tools/list`'s `inputSchema`),
+    /// in the router's order.
+    pub fn tool_schemas() -> Vec<(String, serde_json::Value)> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let schema = serde_json::Value::Object((*t.input_schema).clone());
+                (t.name.to_string(), schema)
+            })
+            .collect()
+    }
+
     /// Shared body for the trivial interpreter wrappers (ruby/perl/deno
     /// at present). No language-specific compactor — pass-through with
     /// the standard ScriptExecResult shape.
