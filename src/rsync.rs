@@ -112,13 +112,15 @@ pub fn build_command(
     // source host resolves the identity itself (~/.ssh/config, default
     // keys, agent) exactly as a human running this rsync would.
     // BatchMode + accept-new keep a missing key or host key an explicit
-    // failure rather than a hung prompt.
+    // failure rather than a hung prompt. ConnectTimeout keeps an
+    // unreachable dest a 15 s `dest_ssh_connect` instead of the OS TCP
+    // timeout (75 s to 4 min seen from macOS).
     let identity = match dest_key_path {
         Some(k) => format!(" -i {k}"),
         None => String::new(),
     };
     cmd.push_str(&format!(
-        r#" -e 'ssh{identity} -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new'"#
+        r#" -e 'ssh{identity} -p {dest_port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout={RSYNC_CONNECT_TIMEOUT_SECS}'"#
     ));
     cmd.push(' ');
     cmd.push_str(source_path);
@@ -126,6 +128,9 @@ pub fn build_command(
     cmd.push_str(&format!("{dest_user}@{dest_ip}:{dest_path}"));
     cmd
 }
+
+/// Seconds the source host's ssh waits for the dest's TCP connect.
+const RSYNC_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// Run an rsync from `source` host to `dest` host. Both HostConfigs come
 /// from the inventory after capability validation.
@@ -396,6 +401,32 @@ mod tests {
         );
         // The transport is still pinned to fail fast rather than prompt.
         assert!(cmd.contains("-e 'ssh -p 22 -o BatchMode=yes"));
+    }
+
+    /// The whole inner transport, so a dropped `ConnectTimeout` (or any
+    /// other option) fails here.
+    #[test]
+    fn inner_ssh_has_a_connect_timeout() {
+        let cmd = build_command(
+            "/src/",
+            "admin",
+            "192.0.2.13",
+            2222,
+            None,
+            "/dst/",
+            &RsyncOptions {
+                archive: true,
+                delete: false,
+                dry_run: false,
+                excludes: &[],
+            },
+        );
+        assert_eq!(
+            cmd,
+            "rsync -a --stats -e 'ssh -p 2222 -o BatchMode=yes \
+             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15' \
+             /src/ admin@192.0.2.13:/dst/"
+        );
     }
 
     #[test]
