@@ -1205,7 +1205,8 @@ async fn audit_records_ticket_hashes_not_tickets() {
     assert_eq!(rec["type"], "approve");
     assert_eq!(rec["decision"], "deny");
     assert_eq!(rec["error_class"], "refused_ticket");
-    assert_eq!(rec["approved_by"], "ap0");
+    // Refused: what was typed, as a length and a hash only.
+    assert_eq!(rec["approved_by"], prompto::approval::redacted("ap0"));
 
     let (_, v) = approve(&s, "ap0", &code(0), "ssh_sudo_exec", exec("t1")).await;
     let t = v["ticket"].as_str().unwrap().to_string();
@@ -1925,4 +1926,43 @@ async fn a_second_authorization_rechecks_the_scope() {
             .unwrap_err();
         assert!(e.message.contains(want), "{}", e.message);
     }
+}
+
+/// What the journal says about a refused approver: an unknown or
+/// malformed name (maybe a TOTP code typed into the wrong field) only as
+/// a length and a hash; a known one by name.
+#[tokio::test]
+async fn a_rejected_approver_string_never_reaches_the_journal() {
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let s = spawn().await;
+    settle().await;
+    let buf = Buf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(move || w.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    // This test's runtime is single-threaded: the default holds for it.
+    let _guard = tracing::subscriber::set_default(sub);
+    for typed in ["271828", "271 828", "271-828"] {
+        assert!(s.approvals.verify_approver(typed, "000000").await.is_err());
+    }
+    assert!(s.approvals.verify_approver("ap0", "000000").await.is_err());
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(out.contains("approval refused"), "{out}");
+    for typed in ["271828", "271 828", "271-828"] {
+        assert!(!out.contains(typed), "{typed} in {out}");
+    }
+    assert!(out.contains("sha256 "), "{out}");
+    assert!(out.contains("ap0"), "{out}");
 }

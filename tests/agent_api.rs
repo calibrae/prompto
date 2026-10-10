@@ -339,6 +339,41 @@ async fn audit_for_a_host_needs_a_grant_there() {
 }
 
 #[tokio::test]
+async fn audit_reads_are_recorded_and_rate_limited() {
+    let s = spawn(AuthMode::Required).await;
+    let (st, v) = v1(&s, "audit?limit=3", ALPHA, Some("sa"), None).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _) = v1(&s, "audit?host=t2", ALPHA, Some("sa"), None).await;
+    assert_eq!(st, 403);
+    let reads: Vec<Value> = s
+        .audit()
+        .into_iter()
+        .filter(|r| r["type"] == "audit_read")
+        .collect();
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert_eq!(reads[0]["agent"], "alpha");
+    assert_eq!(reads[0]["session_id"], "sa");
+    assert_eq!(reads[0]["decision"], "allow");
+    assert_eq!(reads[0]["query"]["limit"], 3);
+    assert_eq!(reads[0]["count"], 0);
+    assert_eq!(reads[1]["decision"], "deny");
+    assert_eq!(reads[1]["query"]["host"], "t2");
+    // They are not handed back as the agent's records.
+    let (_, v) = v1(&s, "audit", ALPHA, None, None).await;
+    assert_eq!(v["count"], 0, "{v}");
+
+    // 3 reads so far; the limit is per agent.
+    for _ in 3..prompto::agent_api::READS_PER_MINUTE {
+        let (st, v) = v1(&s, "audit", ALPHA, None, None).await;
+        assert_eq!(st, 200, "{v}");
+    }
+    let (st, v) = v1(&s, "audit", ALPHA, None, None).await;
+    assert_eq!(st, 429, "{v}");
+    let (st, v) = v1(&s, "audit", BETA, None, None).await;
+    assert_eq!(st, 200, "{v}");
+}
+
+#[tokio::test]
 async fn audit_needs_an_identity() {
     let s = spawn(AuthMode::Off).await;
     let r = call(&s, ALPHA, None, "ssh_exec", exec("t1")).await;
@@ -508,7 +543,9 @@ async fn a_global_kill_needs_an_approvers_code() {
         .find(|r| r["type"] == "kill")
         .expect("refused kill recorded");
     assert_eq!(refused["action"], "refused");
-    assert_eq!(refused["approved_by"], "ap0");
+    // A refused approver is a length and a hash, never the text.
+    let shown = refused["approved_by"].as_str().unwrap();
+    assert!(shown.starts_with("<3 chars, sha256 "), "{shown}");
 
     // The right one: every call, every agent.
     let (st, v) = v1(
@@ -548,6 +585,161 @@ async fn a_global_kill_needs_an_approvers_code() {
     assert!(s.kill().clear_api_global().unwrap());
     let r = call(&s, BETA, Some("sb"), "ssh_exec", exec("t2")).await;
     assert_eq!(class(&r), None, "{r}");
+}
+
+#[tokio::test]
+async fn a_rejected_approver_string_is_never_recorded() {
+    let s = spawn(AuthMode::Required).await;
+    // A code typed into the name field, at both endpoints that take one.
+    let typed = "271828";
+    let (st, v) = v1(
+        &s,
+        "kill",
+        ALPHA,
+        Some("sa"),
+        Some(json!({ "scope": "global", "approver": typed, "totp_code": "000000" })),
+    )
+    .await;
+    assert_eq!(st, 403, "{v}");
+    let (st, v) = v1(
+        &s,
+        "approve",
+        ALPHA,
+        Some("sa"),
+        Some(json!({ "tool": "ssh_sudo_exec", "arguments": exec("t1"),
+                     "approver": typed, "totp_code": "000000" })),
+    )
+    .await;
+    assert_eq!(st, 403, "{v}");
+    let recs = s.audit();
+    assert!(recs.iter().any(|r| r["type"] == "approve"), "{recs:?}");
+    assert!(recs.iter().any(|r| r["type"] == "kill"), "{recs:?}");
+    let all = std::fs::read_to_string(s.dir.path().join("audit.jsonl")).unwrap();
+    assert!(!all.contains(typed), "{all}");
+    assert!(all.contains("<6 chars, sha256 "), "{all}");
+}
+
+#[tokio::test]
+async fn kill_reasons_are_cut_and_cleaned() {
+    let s = spawn(AuthMode::Required).await;
+    let long = format!("evil\u{202e}txt \x1b[31m{}", "x".repeat(1000));
+    let (st, v) = v1(
+        &s,
+        "kill",
+        ALPHA,
+        Some("sa"),
+        Some(json!({ "scope": "session", "reason": long })),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let rec = s.audit().into_iter().find(|r| r["type"] == "kill").unwrap();
+    let reason = rec["reason"].as_str().unwrap();
+    assert!(
+        !reason.contains('\u{202e}') && !reason.contains('\x1b'),
+        "{reason}"
+    );
+    // "stopped by agent alpha itself: " + at most 256 chars + "…".
+    let file = std::fs::read_to_string(
+        s.kill()
+            .api_path(
+                prompto::kill::Scope::AgentSession,
+                Some("alpha"),
+                Some("sa"),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(file.chars().count() < 300, "{} chars", file.chars().count());
+    assert!(
+        !file.contains('\u{202e}') && !file.contains('\x1b'),
+        "{file}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_holds_a_bounded_number_of_session_kills() {
+    let s = spawn(AuthMode::Required).await;
+    for i in 0..prompto::kill::MAX_SESSION_KILLS_PER_AGENT {
+        let (st, v) = v1(
+            &s,
+            "kill",
+            ALPHA,
+            Some(&format!("s{i}")),
+            Some(json!({ "scope": "session" })),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+    }
+    let (st, v) = v1(
+        &s,
+        "kill",
+        ALPHA,
+        Some("one-more"),
+        Some(json!({ "scope": "session" })),
+    )
+    .await;
+    assert_eq!(st, 429, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("prompto unkill session"),
+        "{v}"
+    );
+    let last = s
+        .audit()
+        .into_iter()
+        .rev()
+        .find(|r| r["type"] == "kill")
+        .unwrap();
+    assert_eq!(last["action"], "refused");
+    // Another agent is not held back by alpha's.
+    let (st, v) = v1(
+        &s,
+        "kill",
+        BETA,
+        Some("sb"),
+        Some(json!({ "scope": "session" })),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+}
+
+#[tokio::test]
+async fn v1_bodies_are_small() {
+    let s = spawn(AuthMode::Required).await;
+    let big = json!({ "scope": "session", "reason": "x".repeat(prompto::server::API_BODY_LIMIT) });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/kill", s.addr))
+        .header("authorization", format!("Bearer {ALPHA}"))
+        .header("x-prompto-session", "sa")
+        .json(&big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 413);
+    assert!(s.kill().list().unwrap().0.is_empty());
+    // A precheck carries a whole call: more room, still bounded.
+    let content = "y".repeat(prompto::server::API_BODY_LIMIT * 2);
+    let (st, v) = v1(
+        &s,
+        "precheck",
+        ALPHA,
+        Some("sa"),
+        Some(json!({ "tool": "file_write", "arguments": { "host": "t1", "path": "/tmp/x", "content": content } })),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let huge = json!({ "tool": "file_write", "arguments": { "host": "t1", "path": "/tmp/x",
+                       "content": "z".repeat(prompto::server::CALL_BODY_LIMIT) } });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/precheck", s.addr))
+        .header("authorization", format!("Bearer {ALPHA}"))
+        .json(&huge)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 413);
 }
 
 // ---------------------------------------------------------------------------

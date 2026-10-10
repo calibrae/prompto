@@ -17,7 +17,7 @@ use crate::inventory::InventoryStore;
 use crate::mcp::Prompto;
 use crate::sessions::{self, BoundSessionManager, SessionOwners};
 use crate::ssh::SshClient;
-use axum::extract::ConnectInfo;
+use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use mcp_gain::Tracker;
@@ -203,6 +203,14 @@ async fn authenticate(
 
 /// rmcp's legacy session header.
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
+
+/// Largest body of `/v1/whoami`, `/v1/audit` and `/v1/kill`: they take
+/// a few short fields.
+pub const API_BODY_LIMIT: usize = 64 * 1024;
+/// Largest body of `/v1/precheck` and `/v1/approve`: they carry a whole
+/// call's arguments, file_write's content included (axum's own default,
+/// made explicit).
+pub const CALL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// The 401: a JSON-RPC error object on `/mcp` (so an MCP client can show
 /// the reason), plain text on `/log`.
@@ -440,6 +448,7 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         approvals: auth.approvals.clone(),
         audit: audit.clone(),
         kill: kill.clone(),
+        reads: Default::default(),
     };
 
     let service = StreamableHttpService::new(
@@ -485,26 +494,37 @@ pub fn build_router(p: HttpParams) -> axum::Router {
         )
         // Precheck and approval (E6): JSON in, JSON out, same
         // authentication as /mcp.
+        // They carry a call's arguments (file_write's content too).
         .route(
             "/v1/precheck",
-            axum::routing::post(crate::precheck::precheck).with_state(api_state.clone()),
+            axum::routing::post(crate::precheck::precheck)
+                .with_state(api_state.clone())
+                .layer(DefaultBodyLimit::max(CALL_BODY_LIMIT)),
         )
         .route(
             "/v1/approve",
-            axum::routing::post(crate::precheck::approve).with_state(api_state.clone()),
+            axum::routing::post(crate::precheck::approve)
+                .with_state(api_state.clone())
+                .layer(DefaultBodyLimit::max(CALL_BODY_LIMIT)),
         )
         // What an agent may ask about itself (E7, the Claude Code plugin).
         .route(
             "/v1/whoami",
-            axum::routing::get(crate::agent_api::whoami).with_state(api_state.clone()),
+            axum::routing::get(crate::agent_api::whoami)
+                .with_state(api_state.clone())
+                .layer(DefaultBodyLimit::max(API_BODY_LIMIT)),
         )
         .route(
             "/v1/audit",
-            axum::routing::get(crate::agent_api::audit).with_state(api_state.clone()),
+            axum::routing::get(crate::agent_api::audit)
+                .with_state(api_state.clone())
+                .layer(DefaultBodyLimit::max(API_BODY_LIMIT)),
         )
         .route(
             "/v1/kill",
-            axum::routing::post(crate::agent_api::kill).with_state(api_state),
+            axum::routing::post(crate::agent_api::kill)
+                .with_state(api_state)
+                .layer(DefaultBodyLimit::max(API_BODY_LIMIT)),
         )
         // Layers wrap outward: the caller-IP layer (added last) runs
         // first, so authentication sees the resolved client address.

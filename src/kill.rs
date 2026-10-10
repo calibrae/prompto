@@ -49,6 +49,16 @@
 //! server never removes them: an operator does, with `prompto kill off`
 //! and `prompto unkill session <id>`. They are checked, listed and probed
 //! like the others.
+//!
+//! That directory is the service's own: created mode 0700, its files
+//! 0600, owned by the user prompto runs as. Anything running as that
+//! user can therefore remove an HTTP kill — it is the service itself,
+//! which could stop enforcing anyway. The operator's switches (`kill`
+//! and `kill.d` under `/etc`) stay root-owned and out of its reach.
+//! Agents can't fill the disk through it: at most
+//! [`MAX_SESSION_KILLS_PER_AGENT`] live session kills per agent and
+//! [`MAX_API_KILLS`] files in all; beyond that `set_agent_session`
+//! refuses ([`Full`]) until an operator lifts some.
 
 use crate::error_class::{ClassifiedError, ErrorClass};
 use anyhow::{Context, Result, bail};
@@ -68,6 +78,26 @@ const API_GLOBAL: &str = "global";
 pub const MAX_REASON: usize = 200;
 /// Bytes read from a kill file to find its first line.
 const READ_LIMIT: u64 = 4096;
+/// Live session kills set over HTTP, per agent.
+pub const MAX_SESSION_KILLS_PER_AGENT: usize = 100;
+/// Files in the API directory, in all.
+pub const MAX_API_KILLS: usize = 1000;
+
+/// The API directory holds as many session kills as it may: the error
+/// `set_agent_session` returns (downcast it to tell it apart).
+#[derive(Debug)]
+pub struct Full(pub String);
+
+impl std::fmt::Display for Full {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Full {}
+
+/// Serialises the API directory's count-then-write.
+static API_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What a kill switch applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -436,17 +466,41 @@ impl KillSwitch {
             .api
             .as_ref()
             .context("no directory for kill switches set over HTTP")?;
-        create_dir(api)?;
+        create_private_dir(api)?;
         let path = api.join(API_GLOBAL);
-        write_switch(&path, reason)?;
+        write_switch(&path, reason, 0o600)?;
         Ok(path)
     }
 
-    /// Agent `agent` stops its own session `session`.
+    /// Agent `agent` stops its own session `session`. Refuses with
+    /// [`Full`] when the agent already has [`MAX_SESSION_KILLS_PER_AGENT`]
+    /// live ones, or the directory [`MAX_API_KILLS`] files (setting one
+    /// that is already set is always fine: it only rewrites the reason).
     pub fn set_agent_session(&self, agent: &str, session: &str, reason: &str) -> Result<PathBuf> {
         let path = self.agent_session_path(agent, session)?;
-        create_dir(path.parent().context("kill file has no directory")?)?;
-        write_switch(&path, reason)?;
+        create_private_dir(path.parent().context("kill file has no directory")?)?;
+        let _one = API_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        if std::fs::symlink_metadata(&path).is_err() {
+            let (global, pairs, other) = self.api_entries()?;
+            let mine = pairs.iter().filter(|(a, _)| a == agent).count();
+            if mine >= MAX_SESSION_KILLS_PER_AGENT {
+                return Err(Full(format!(
+                    "agent {agent} already has {mine} session kills in place (at most \
+                     {MAX_SESSION_KILLS_PER_AGENT}); an operator lifts them with `prompto unkill \
+                     session <id>`"
+                ))
+                .into());
+            }
+            let all = usize::from(global) + pairs.len() + other.len();
+            if all >= MAX_API_KILLS {
+                return Err(Full(format!(
+                    "the HTTP kill directory holds {all} switches (at most {MAX_API_KILLS}); an \
+                     operator lifts some with `prompto unkill session <id>`"
+                ))
+                .into());
+            }
+        }
+        write_switch(&path, reason, 0o600)?;
         Ok(path)
     }
 
@@ -561,7 +615,7 @@ impl KillSwitch {
         if scope != Scope::Global {
             create_dir(parent)?;
         }
-        write_switch(&path, reason)?;
+        write_switch(&path, reason, 0o644)?;
         Ok(path)
     }
 
@@ -592,10 +646,11 @@ impl KillSwitch {
     }
 }
 
-/// Write a switch whole, then rename it into place, mode 0644: the
-/// reason is not a secret and the server must read it. Newlines in the
-/// reason become spaces.
-fn write_switch(path: &Path, reason: &str) -> Result<()> {
+/// Write a switch whole, then rename it into place, mode `mode`: 0644
+/// for the operator's (the reason is not a secret and the server must
+/// read it), 0600 for the server's own. Newlines in the reason become
+/// spaces.
+fn write_switch(path: &Path, reason: &str, mode: u32) -> Result<()> {
     let parent = path.parent().context("kill file has no directory")?;
     let reason: String = reason
         .chars()
@@ -618,12 +673,12 @@ fn write_switch(path: &Path, reason: &str) -> Result<()> {
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o644)
+            .mode(mode)
             .open(&tmp)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
         // Whatever the umask said.
-        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         std::fs::rename(&tmp, path)
     };
     if let Err(e) = write() {
@@ -652,6 +707,26 @@ fn create_dir(dir: &Path) -> Result<()> {
                 .with_context(|| format!("chmod {}", dir.display()))
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+}
+
+/// The API directory: the service's own, mode 0700. One made by an
+/// older prompto (0755) is tightened when this process owns it.
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {}", dir.display())),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            if meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 != 0 {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("chmod {}", dir.display()))?;
+            }
+            Ok(())
+        }
         Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
     }
 }
@@ -703,10 +778,9 @@ fn read(path: &Path, scope: Scope, target: Option<&str>) -> Option<Kill> {
     })
 }
 
-/// A kill file's first line, fit to show an agent and a terminal:
-/// control and formatting characters dropped, at most [`MAX_REASON`]
-/// chars. `None` when nothing is left.
-pub fn sanitize_reason(raw: &str) -> Option<String> {
+/// `raw`'s first line with tabs as spaces and control and formatting
+/// characters dropped, trimmed; `None` when nothing is left.
+pub fn sanitize_line(raw: &str) -> Option<String> {
     let line = raw.lines().next().unwrap_or("");
     let clean: String = line
         .chars()
@@ -714,11 +788,16 @@ pub fn sanitize_reason(raw: &str) -> Option<String> {
         .filter(|&c| !crate::audit::is_terminal_hazard(c))
         .collect();
     let clean = clean.trim();
-    if clean.is_empty() {
-        return None;
-    }
+    (!clean.is_empty()).then(|| clean.to_string())
+}
+
+/// A kill file's first line, fit to show an agent and a terminal:
+/// control and formatting characters dropped, at most [`MAX_REASON`]
+/// chars. `None` when nothing is left.
+pub fn sanitize_reason(raw: &str) -> Option<String> {
+    let clean = sanitize_line(raw)?;
     if clean.chars().count() <= MAX_REASON {
-        return Some(clean.to_string());
+        return Some(clean);
     }
     let mut t: String = clean.chars().take(MAX_REASON - 1).collect();
     t.push('…');
@@ -1069,6 +1148,48 @@ mod tests {
         assert!(k.probe().unwrap_err().contains("api-kill.d"));
         let hit = k.check(&Subject::default()).expect("fails closed");
         assert!(hit.unreadable);
+    }
+
+    #[test]
+    fn the_api_directory_is_private_to_the_service() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, k) = ks();
+        let api = d.path().join("api-kill.d");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let p = k.set_agent_session("alpha", "s1", "r").unwrap();
+        assert_eq!(mode(&api), 0o700, "as created");
+        let g = k.set_api_global("r").unwrap();
+        assert_eq!((mode(&p), mode(&g), mode(&api)), (0o600, 0o600, 0o700));
+        // One an older prompto made world-readable is tightened.
+        std::fs::set_permissions(&api, std::fs::Permissions::from_mode(0o755)).unwrap();
+        k.set_agent_session("alpha", "s2", "r").unwrap();
+        assert_eq!(mode(&api), 0o700);
+        // The server still reads its own switches.
+        assert!(k.check(&subject("alpha", "s1")).is_some());
+    }
+
+    #[test]
+    fn session_kills_over_http_are_capped() {
+        let (d, k) = ks();
+        for i in 0..MAX_SESSION_KILLS_PER_AGENT {
+            k.set_agent_session("alpha", &format!("s{i}"), "r").unwrap();
+        }
+        let e = k.set_agent_session("alpha", "one-more", "r").unwrap_err();
+        assert!(e.downcast_ref::<Full>().is_some(), "{e:#}");
+        assert!(format!("{e}").contains("alpha already has 100"), "{e}");
+        assert!(k.agent_session("alpha", "one-more").is_none());
+        // Setting one already set only rewrites it.
+        k.set_agent_session("alpha", "s0", "again").unwrap();
+        // Another agent has its own allowance...
+        k.set_agent_session("beta", "s0", "r").unwrap();
+        // ...within the directory's.
+        let api = d.path().join("api-kill.d");
+        for i in 0..MAX_API_KILLS {
+            std::fs::write(api.join(format!("junk{i}")), "").unwrap();
+        }
+        let e = k.set_agent_session("gamma", "s0", "r").unwrap_err();
+        assert!(e.downcast_ref::<Full>().is_some(), "{e:#}");
+        assert!(format!("{e}").contains("holds"), "{e}");
     }
 
     #[test]
