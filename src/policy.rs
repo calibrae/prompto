@@ -1939,7 +1939,7 @@ capabilities = ["virt"]
         let p = Policy::from_toml_str(include_str!("../deploy/policy.toml.example"), "policy.toml")
             .unwrap();
         assert_eq!(p.rules.len(), 6);
-        assert_eq!(p.rules[0].name(), "policy.toml:33 (infra-router-sudo)");
+        assert_eq!(p.rules[0].name(), "policy.toml:35 (infra-router-sudo)");
     }
 
     #[test]

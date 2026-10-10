@@ -1852,15 +1852,19 @@ pub fn table_row(r: &Value) -> [String; 8] {
         if !s("auth_note").is_empty() {
             d = format!("[{}] {d}", s("auth_note"));
         }
+        if !s("approved_by").is_empty() {
+            d = format!("by={} {d}", s("approved_by"));
+        }
         d
     };
     [
         cell(&time, CELL_MAX),
         cell(s("agent"), CELL_MAX),
-        if s("type") == "auth" {
-            "(auth)".into()
-        } else {
-            cell(s("tool"), CELL_MAX)
+        match s("type") {
+            "auth" => "(auth)".into(),
+            // Not a call that ran: say what it was.
+            t @ ("precheck" | "approve") => cell(&format!("{t}:{}", s("tool")), CELL_MAX),
+            _ => cell(s("tool"), CELL_MAX),
         },
         cell(&host, CELL_MAX),
         cell(
@@ -2603,6 +2607,26 @@ mod tests {
         assert_eq!(table_row(&r)[7], "kill=host web1 id");
         let g = json!({ "type": "tool", "args": {}, "kill": { "scope": "global" } });
         assert_eq!(table_row(&g)[7], "kill=global ");
+    }
+
+    /// A precheck or approval didn't run anything: the tool column says
+    /// so, and the approver shows.
+    #[test]
+    fn table_marks_prechecks_and_approvals() {
+        let p = json!({
+            "type": "precheck", "tool": "ssh_exec", "decision": "ask", "ok": true,
+            "args": { "cmd": "id" },
+        });
+        assert_eq!(table_row(&p)[2], "precheck:ssh_exec");
+        assert_eq!(table_row(&p)[4], "ask");
+        let a = json!({
+            "type": "approve", "tool": "ssh_sudo_exec", "decision": "allow", "ok": true,
+            "approved_by": "alice", "args": { "cmd": "id" },
+        });
+        assert_eq!(table_row(&a)[2], "approve:ssh_sudo_exec");
+        assert_eq!(table_row(&a)[7], "by=alice id");
+        let t = json!({ "type": "tool", "tool": "ssh_exec", "args": { "cmd": "id" } });
+        assert_eq!(table_row(&t)[2], "ssh_exec");
     }
 
     #[test]

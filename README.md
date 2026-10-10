@@ -59,7 +59,7 @@ For HTTP transport (default):
 
 ```bash
 PROMPTO_INVENTORY=./prompto.toml ./target/release/prompto
-# listens on 0.0.0.0:6337 — POST /mcp, GET /log
+# listens on 0.0.0.0:6337 — POST /mcp, GET /log, POST /v1/precheck, POST /v1/approve
 ```
 
 ## Inventory
@@ -234,13 +234,13 @@ approval = "human"                 # none (default) | ticket | human
 
 **`sudo = false` is not "no root".** `sudo = true` gates prompto's *own* root paths, nothing more. The exec tools (`ssh_exec`, `ssh_batch`, `bash_exec`, `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`, `claude_exec`, `mcp_add`, whose stdio command runs on the client, and `file_write` without `sudo` and `rsync_sync`, because writing `~/.bashrc`, a crontab or a user unit is code execution) run whatever the agent sends, as the host's `ssh_user`. So an exec grant on a host is a shell as that user, and that is root wherever the user is `root` or can `sudo` without a password: `ssh_exec "sudo -n …"` needs no `sudo = true` rule there. prompto does not try to police command strings (`sh -c`, quoting and aliases make that unreliable). Grant exec tools only where that shell is acceptable, and mark each host's `nopasswd_sudo` in the inventory so `policy lint` can tell you where it isn't. The list of exec tools lives in one place in the code (`authz::ARBITRARY_EXEC_TOOLS`); every tool is classified as root-capable, exec or ordinary, and a test fails on one that isn't.
 
-**Approval.** A rule with `approval = "ticket"` or `"human"` refuses what it matches with `approval_required`: tickets and human approval are not implemented yet, so such a rule fails closed rather than allowing anything.
+**Approval.** A rule with `approval = "ticket"` grants what it matches only to a call that carries a valid ticket from `POST /v1/precheck`; `approval = "human"` only with one from `POST /v1/approve`, which takes a human approver's TOTP code. Without a ticket the call is refused (`approval_required`, saying how to get one), with a bad one `refused_ticket`. See [Tickets and approvals](#tickets-and-approvals). Without a ticket key configured, such a rule refuses everything it matches, as before.
 
 **What policy cannot do.** It only narrows: effective permission = policy ∩ host capability, minus the caller's own machine. The capability check and the self-targeting guard run first and no rule can undo them. A consequence: an agent with no grant at all can still tell `unknown_host` from `refused_capability` from `refused_self_target`, so it can probe which host names exist and what they carry. That is a known, accepted property; the self-targeting guard must stay unconditional, so it can't wait for policy.
 
 **Inventory visibility.** With policy on, `inventory_list` shows an agent only the hosts some rule grants it a host-targeting tool on (any tool, with or without `sudo`, approval rules included; the hostless `inventory_list` grant itself doesn't count). `sudo_password_vault_path` is shown only on hosts where the agent has a `sudo = true` grant; elsewhere the key is left out (not set to `null`, which would claim there is none). `inventory_get_host` hides it the same way. With `off`, both are unchanged.
 
-**Refusals** are classified `refused_policy` (or `approval_required`), carry the deciding rule in `error.data.rule` (`policy.toml:<line>`, with ` (<id>)` when the rule has one, or `default-deny`), and say what is missing:
+**Refusals** are classified `refused_policy` (or `approval_required` / `refused_ticket`), carry the deciding rule in `error.data.rule` (`policy.toml:<line>`, with ` (<id>)` when the rule has one, or `default-deny`), and say what is missing:
 
 ```
 refused_policy: agent builder has no grant for ssh_sudo_exec (root-capable) on build-2 (no rule matched;
@@ -261,11 +261,60 @@ prompto policy check --agent builder --host build-2 --tool file_write --sudo
 ```
 
 - **Lint errors:** unknown agents, unknown hosts, host groups no host is in, unknown tools.
-- **Lint warnings:** agent groups nobody is in yet, globs that match nothing, revoked agents, `approval` rules (always refused for now), exec grants without `sudo = true` on hosts where that shell can become root (one warning per rule, naming the tools and each host: `ssh_user is root`, `nopasswd_sudo = true`, or `nopasswd_sudo unset`; hosts lacking the tools' capability are skipped), and rules that can never decide a call. Lint finds those by enumerating every agent × host × tool × root combination: a rule is either *shadowed* (an earlier rule always wins; the warning names it), or matches nothing at all (for example `sudo = true` on tools that are never root-capable).
+- **Lint warnings:** agent groups nobody is in yet, globs that match nothing, revoked agents, exec grants without `sudo = true` on hosts where that shell can become root (one warning per rule, naming the tools and each host: `ssh_user is root`, `nopasswd_sudo = true`, or `nopasswd_sudo unset`; hosts lacking the tools' capability are skipped), and rules that can never decide a call. Lint finds those by enumerating every agent × host × tool × root combination: a rule is either *shadowed* (an earlier rule always wins; the warning names it), or matches nothing at all (for example `sudo = true` on tools that are never root-capable).
 - `policy check` evaluates policy only; capability and the self-targeting guard are checked at call time, before policy.
 - `cargo run --example inv_check -- prompto.toml policy.toml agents.toml` runs the same lint.
 
 **Kill one agent on one host:** drop the host from its rules; the next call sees the change. The broader scopes need no policy edit: see [kill switches](#kill-switches).
+
+## Tickets and approvals
+
+A policy rule can demand more than a match: `approval = "ticket"` (the call must be prechecked) or `approval = "human"` (a person must approve this exact call). The proof is a **ticket**: a short string prompto signs, which the client passes back as the call's `ticket` argument. Every tool accepts it; it is not in the tools' advertised schemas (it would cost every client tokens on every `tools/list`); the Claude Code plugin (roadmap E7) will add it for you. Enforcement is always prompto's: a call without a valid ticket is refused wherever policy demands one, whatever the client does.
+
+**The flow:**
+
+```
+call without ticket ──► approval_required (the message says which endpoint to use)
+POST /v1/precheck  {tool, arguments}           ──► allow + ticket   (approval = "ticket")
+                                                ──► ask             (approval = "human")
+POST /v1/approve   {tool, arguments, approver, totp_code[, scope_minutes]} ──► ticket
+call with {…arguments, "ticket": "pt1.…"}      ──► runs, once
+```
+
+**`POST /v1/precheck`** (same bearer token and `X-Prompto-Session` as `/mcp`; body `{"tool": …, "arguments": {…}, "session": optional}`) runs the call's whole authorization — kill switches, host, capability, self-targeting guard, policy, and any `ticket` already in `arguments` — and **runs nothing**: no SSH, no ticket spent. It answers `{"decision": "allow" | "deny" | "ask", "rule", "reason", "approval", "request_id"}`, plus `error_class` on `deny` and `ticket` + `expires_at` when a `ticket` rule allowed it. `session` in the body, if sent, must match the header.
+
+**`POST /v1/approve`** (body `{"tool", "arguments", "session"?, "approver", "totp_code", "scope_minutes"?}`) re-runs the same authorization (no approval for a call policy denies; `409` when no approval is needed), checks the approver's code, and returns a ticket with `approval = "human"` and `approved_by = <approver>`. Status: `200`; `403` deny or wrong code; `429` approver locked out; `400` bad request; `503` tickets unavailable.
+
+**Why TOTP.** The agent and the plugin run as the same OS user with the same bearer token: anything the plugin can send, the agent can send too. So an approval must carry something the agent can't produce, and the first such factor is a TOTP code from the approver's phone (RFC 6238: SHA-1, 6 digits, 30 s, ±1 step). Each code is accepted once per approver (a code for a step at or below the last accepted one is refused), and 5 wrong codes within 15 minutes lock that approver out for 15 minutes (even a correct code is refused meanwhile; other approvers are unaffected). An unknown or revoked approver fails exactly like a wrong code. The approver mechanism is pluggable (`approvers::Factor`): approval from a separate device or a Kanidm-authenticated page can come later.
+
+**Approvers** live in `$PROMPTO_APPROVERS` (default `/etc/prompto/approvers.toml`), re-read at every approval (no reload):
+
+```bash
+# secret in vault KV v2 (field totp_secret) — needs PROMPTO_VAULT_* with a token that may write there
+sudo PROMPTO_VAULT_TOKEN=… prompto approver add alice --vault-path prompto/approvers/alice
+# or in an owner-only file; create the directory owned by the service user first
+sudo install -d -o prompto -g prompto -m 0700 /etc/prompto/approvers.d
+sudo prompto approver add bob                     # → /etc/prompto/approvers.d/bob.totp
+prompto approver list
+sudo prompto approver revoke bob                  # disabled = true; codes refused from the next approval
+sudo prompto approver add bob --replace           # re-enroll (lost phone)
+```
+
+`add` prints the `otpauth://` URI and a terminal QR code **once**: scan it now. prompto never stores the secret anywhere but where the entry points, reads it at each approval, and refuses a secret file that its group or others can read.
+
+**What "approve similar calls" means.** With `scope_minutes` (1–60), the ticket is valid until it expires for **any number of calls by the same agent, in the same session, to the same tool, on the same host** (for `rsync_sync`: the same source *and* dest host), **whatever the other arguments are**. A different tool, host, session or agent needs a new approval. It requires a session (`X-Prompto-Session` or `session`): without one it would cover every session of the agent role. Remember the session ID is context, not proof of identity: anyone with the role's token who learns the session ID can use the scope. Use it for "let me watch it restart these five units", not for open-ended trust.
+
+**The ticket.** `pt1.<kid>.<claims>.<mac>`: `kid` names the signing key (8 hex digits of its SHA-256); `claims` is base64url JSON `{agent, session, tool, host, dest_host?, args_sha256, approval, approved_by, iat, exp, nonce, scoped}`; `mac` is HMAC-SHA256 over the first three parts. `host` is the canonical inventory name (an alias in the call resolves to it). An ordinary ticket lives **120 s** and is **single-use**: its nonce is recorded when a call uses it, and a replay is `refused_ticket … already used`. A call is checked, in order, for: form and signature, expiry, agent, session, tool, host(s), arguments digest (unless scoped), approval level (`human` satisfies a `ticket` rule, not the reverse), then the nonce. A failed check spends nothing. A ticket on a call whose rule needs no approval is ignored.
+
+**Canonical arguments.** `args_sha256` is the SHA-256 (hex) of the call's `arguments` object **without its top-level `ticket`**, in [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON (JCS): keys sorted by UTF-16 code units, no whitespace, minimal string escaping, numbers as ECMAScript prints them (`5.0` → `5`). Absent arguments count as `{}`. So any re-serialization of the same JSON value gets the same ticket, and any change of value (an extra argument, even a default one; one more space in a command) needs a new one. Clients never compute it — prompto does on both sides — but for reference, `{"host":"sbx-t2","cmd":"id -u","ticket":"…"}` canonicalizes to `{"cmd":"id -u","host":"sbx-t2"}`, digest `f77f3663236062c05147ca8f5a6b7a5b77f98a38dae2f3db5935c8f271ebeeca`.
+
+**Keys.** `PROMPTO_TICKET_KEY_VAULT_PATH` names a KV v2 secret (same vault client, token and CA as the sudo passwords) with fields `current` and, during a rotation, `previous`; `PROMPTO_TICKET_KEY_FILE` is the same in a file (current key on the first line, previous on the second, mode `0600`), used when no vault path is set or vault can't be read. A key is base64 of at least 32 random bytes: `prompto ticket keygen`. Tickets are signed with `current` and both are accepted. **Rotation:** move the old key to `previous`, put a new one in `current`, then SIGHUP (or wait: keys are re-read every minute); drop `previous` once outstanding tickets have expired (2 minutes, up to an hour for scoped approvals). Setting neither variable disables tickets: approval rules refuse their calls as before.
+
+**Continuity across restarts.** The key lives in vault or a file, never in the process, so a ticket minted just before a deploy works just after it. Used nonces and the last accepted TOTP step per approver are appended to `$PROMPTO_APPROVAL_STATE` (default `/var/lib/prompto/approval-state`, `0600`) before the call proceeds, and reloaded at startup (expired entries are dropped), so a restart can't reopen a used ticket or code either. If that file can't be written, calls that need a ticket are refused (`internal`) and the rest run normally; if no key can be read at startup, prompto starts anyway, refuses ticketed calls saying so, and retries every minute. Lockout counters are in memory and reset on restart.
+
+**Audit.** A call's record never contains the ticket: `args` has it removed, and `ticket_sha256` holds its SHA-256; `approval` is the rule's demand and `approved_by` the approver the ticket names. Prechecks and approvals have their own records, `"type": "precheck"` (`decision` `allow`/`deny`/`ask`) and `"type": "approve"` (wrong codes and lockouts included, `approved_by` = the approver named, `scope_minutes`), with the `ticket_sha256` of what they minted, so a call can be joined to the precheck or approval behind it.
+
+**Not covered.** `GET /log` takes no ticket: a `service_logs` rule with an approval refuses it there (use the tool). With `PROMPTO_AUTH=off` there is no policy, so nothing needs or checks a ticket.
 
 ## `GET /log`
 
@@ -280,7 +329,7 @@ Plain-text journal tail for scripts and dashboards. It has the same gate as `ser
 
 ## Audit log
 
-Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (default `/var/lib/prompto/audit.jsonl`), whatever `PROMPTO_AUTH` says. That includes refusals (`killed`, `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`), calls whose arguments don't parse, `GET /log` (recorded as `service_logs`), and every 401. It is separate from the token-savings usage log.
+Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (default `/var/lib/prompto/audit.jsonl`), whatever `PROMPTO_AUTH` says. That includes refusals (`killed`, `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`), calls whose arguments don't parse, `GET /log` (recorded as `service_logs`), every 401, and every precheck and approval (`"type": "precheck"` / `"approve"`, see [Tickets and approvals](#tickets-and-approvals)). It is separate from the token-savings usage log.
 
 ```json
 {"ts":"2026-10-09T11:50:02.113Z","type":"tool","request_id":"01M4G…","agent":"builder","agent_groups":["ops"],
@@ -293,7 +342,7 @@ Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (
 - **Who:** `agent` (`anonymous`, `local` for stdio, `-` with auth off), its `agent_groups`, the client's `session_id`, `client_ip` and `user_agent`.
 - **What, where:** `tool`; `host` is the inventory name the call resolved to and `queried_as` what the caller typed when that differs (an alias, or an unknown name, with `host` then `null`). `rsync_sync` adds `dest_host` / `dest_queried_as`. `ssh_batch` is one record with the whole `commands` list.
 - **`args`:** commands are recorded **in full**: `cmd`, `commands`, every interpreter's `script` (`bash_exec`, `python_exec`, `node_exec`, `ruby_exec`, `perl_exec`, `deno_exec`), `claude_exec`'s `task`. A string over 16 KiB becomes `{"sha256": …, "len": …, "truncated": true}`, and so do whole `args` over 64 KiB. File contents (`file_write`'s `content`) are always `{"sha256": …, "len": …}`. A field *named* like a secret becomes `"[redacted]"`: the name, case- and `-`/`_`-insensitive, is or ends with `password`, `passwd`, `passphrase`, `token`, `secret`, `credential(s)`, `api_key`/`apikey`, `private_key`, `access_key`, `secret_key`, `signing_key`, `auth_key`, `authorization`, `cookie`, `_pwd`, `_pass`, `_pw`, or is `pass`/`pw` (so `dest_key`, a path, is kept). Every kept string is also **scrubbed** of secret *values*: URL userinfo (`https://***@host`), secret-named query parameters (`?token=***`), `Authorization:` and other secret-named headers (`Authorization: ***`), `Bearer ***`, secret-named long flags (`--password ***`, `--api-key=***`, and `["--password", "***"]` in an argv list), assignments (`export TOKEN=***`, `X_API_KEY=***`) and quoted literals in code or JSON (`password = "***"`, `"token": "***"`). A secret the scrubber can't recognise (a positional argument, `-p x`, an innocently named variable) stays: don't put secrets in commands. The vault sudo password is never an argument: it is fetched inside the SSH layer, after the record's arguments were taken from the request.
-- **Decision:** `decision` is `allow` (authorization passed), `deny` (refused before anything ran) or `null` (the arguments were invalid before authorization). `rule` is the deciding policy rule, `approval` its approval mode; `approved_by` is always `null` until approvals ship.
+- **Decision:** `decision` is `allow` (authorization passed), `deny` (refused before anything ran) or `null` (the arguments were invalid before authorization). `rule` is the deciding policy rule, `approval` its approval mode; `approved_by` is the approver named in the call's ticket, and `ticket_sha256` the SHA-256 of the ticket it carried (the ticket itself is removed from `args`).
 - **Outcome:** `ok` means the call did what was asked: no error *and* any remote command exited 0 without timing out. It is stricter than the gain log's notion of success, since `ssh_exec` returns a non-zero exit as a result, not an error. When `ok` is false, `error_class` says why (below) and `exit_code` carries the exit status when there is one. `bytes` is the size of the response.
 - **401s** have no tool call; they are `"type":"auth"` records with `reason` (`missing bearer token`, `invalid bearer token`, `revoked token`, `session belongs to another agent`) and `path`. They come from unauthenticated peers, so they are rate-limited per client (an IP, or an IPv6 /64: a burst of 10, then one every 10 s; the 4096 most recent clients are tracked) under a global ceiling (a burst of 60, then one per second). One client flooding can't crowd out another's revoked-token 401. The next record written says how many were dropped (`suppressed`). A hijack attempt adds `mcp_session`, the other agent's session ID shortened as in the journal; `session_id` is shortened the same way there. The journal keeps its own warning line for each.
 - **`auth_note`:** with `PROMPTO_AUTH=optional`, a caller whose token is revoked or invalid runs as `anonymous`; its records say so (`"auth_note": "revoked token for builder"` / `"invalid token"`).
@@ -302,7 +351,7 @@ Every tool call is recorded, one JSON object per line, in `$PROMPTO_AUDIT_LOG` (
 - **Kill switch changes** made with `prompto kill`/`unkill` are `"type": "kill"` records written by the CLI: `{"ts":…,"type":"kill","request_id":…,"action":"on","scope":"host","target":"build-1","reason":"disk failing","file":"/etc/prompto/kill.d/host-build-1","by":{"uid":0,"user":"root","sudo_user":"alice"}}`. See [kill switches](#kill-switches).
 - **`aborted`:** a call cut off before it finished (prompto shut down or the handler panicked mid-call) still gets its record, with `error_class: "aborted"`. Whether the action took effect is unknown.
 
-**`error_class`** is one enum for every failure of every tool, the same one MCP errors carry in `error.data.error_class`: `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`, `invalid_args`, `ssh_connect`, `ssh_auth`, `timeout`, `sudo_guard` (the vault sudo guard, exit 97: the host has a passwordless rule), `remote_nonzero`, `vault`, `upstream` (the apytti gateway behind `claude_exec`), `internal`, `aborted` (audit only, see above), `killed` (a [kill switch](#kill-switches)), rsync's `rsync_*` / `dest_ssh_*`, and the reserved `refused_ticket`. An error that reaches the end of a tool without a class is a bug: it is reported as `internal` and logged as `BUG: tool error without an error_class`; a test drives every tool into every failure it can force and fails on one.
+**`error_class`** is one enum for every failure of every tool, the same one MCP errors carry in `error.data.error_class`: `unknown_host`, `refused_capability`, `refused_self_target`, `refused_policy`, `approval_required`, `invalid_args`, `ssh_connect`, `ssh_auth`, `timeout`, `sudo_guard` (the vault sudo guard, exit 97: the host has a passwordless rule), `remote_nonzero`, `vault`, `upstream` (the apytti gateway behind `claude_exec`), `internal`, `aborted` (audit only, see above), `killed` (a [kill switch](#kill-switches)), rsync's `rsync_*` / `dest_ssh_*`, and `refused_ticket` (a ticket that is malformed, forged, expired, already used or for another call; also a refused approval). An error that reaches the end of a tool without a class is a bug: it is reported as `internal` and logged as `BUG: tool error without an error_class`; a test drives every tool into every failure it can force and fails on one.
 
 **journald.** The same record is a `tracing` event at target `prompto::audit`. Under systemd it goes to the journal as structured fields prefixed `AUDIT_` (`journalctl -u prompto AUDIT_AGENT=builder AUDIT_DECISION=deny`, `-o verbose` to see them; the record's `type` is `AUDIT_RECORD_TYPE`). Outside systemd it is a log line on stderr. It is emitted before the file is written, so the journal has the record even if the write fails.
 
@@ -403,6 +452,10 @@ Powered by the standalone [`mcp-gain`](https://github.com/calibrae/mcp-gain) cra
 | `PROMPTO_AUDIT_GROUP` | unset | Group (name or gid) for an audit file prompto creates itself. |
 | `PROMPTO_KILL_FILE` | `/etc/prompto/kill` | The global [kill switch](#kill-switches). Also used by `prompto kill`. |
 | `PROMPTO_KILL_DIR` | `<PROMPTO_KILL_FILE>.d` | Agent, host and session kill switches. |
+| `PROMPTO_TICKET_KEY_VAULT_PATH` | unset | KV v2 path of the [ticket](#tickets-and-approvals) signing keys (fields `current`, `previous`). Setting this or the next enables tickets (with `PROMPTO_AUTH` on). |
+| `PROMPTO_TICKET_KEY_FILE` | unset | The same keys in an owner-only file (current, then previous). The fallback when vault can't be read. |
+| `PROMPTO_APPROVERS` | `/etc/prompto/approvers.toml` | Human approvers and where their TOTP secrets are. Read at every approval. Also used by `prompto approver`. |
+| `PROMPTO_APPROVAL_STATE` | `/var/lib/prompto/approval-state` | Used ticket nonces and TOTP steps, kept across restarts. |
 | `PROMPTO_GAIN_ENABLED` | `true` | Toggle gain tracking. |
 | `RUST_LOG` | `prompto=info` | Log level. |
 
@@ -416,6 +469,7 @@ CLI:
 - `policy check|lint` dry-runs a call against the policy, or lints it, and exits.
 - `audit [filters]` queries the audit log and exits.
 - `kill on|off|status`, `kill agent|host|session <name> [reason]`, `unkill agent|host|session <name>` set and lift [kill switches](#kill-switches) and exit.
+- `approver add|list|revoke` manages [approvers](#tickets-and-approvals) and exits; `ticket keygen` prints a fresh ticket key.
 
 ## Registering with Claude Code
 

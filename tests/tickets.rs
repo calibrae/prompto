@@ -1318,3 +1318,43 @@ async fn mixed_rules_take_the_strictest_approval() {
         "{r}"
     );
 }
+
+/// The minting layer refuses a scope without a session by itself, not
+/// only behind the HTTP handler's own check.
+#[tokio::test]
+async fn mint_refuses_a_scope_without_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ApprovalConfig {
+        key_vault_path: None,
+        key_file: None,
+        approvers_path: write_approvers(dir.path(), 1),
+        state_path: dir.path().join("approval-state"),
+    };
+    let a = Approvals::with_keys(cfg, keyset(7));
+    let mut ctx = prompto::ctx::CallCtx::new(None).with_identity(prompto::agent::Identity {
+        agent: Some(prompto::ctx::Agent {
+            name: "alpha".into(),
+            groups: vec![],
+        }),
+        session_id: None,
+        auth_note: None,
+    });
+    ctx.call = Some(prompto::audit::CallScope::new(
+        "ssh_exec",
+        exec("t1").as_object().cloned(),
+    ));
+    let e = a
+        .mint(None, &ctx, Approval::Human, Some("ap0".into()), Some(5))
+        .unwrap_err();
+    assert!(e.contains("needs a session"), "{e}");
+    for bad in [0, ticket::MAX_SCOPE_MINUTES + 1] {
+        ctx.session_id = Some(SESSION.into());
+        assert!(
+            a.mint(None, &ctx, Approval::Human, None, Some(bad))
+                .is_err()
+        );
+    }
+    a.mint(None, &ctx, Approval::Human, None, Some(5)).unwrap();
+    ctx.session_id = None;
+    a.mint(None, &ctx, Approval::Ticket, None, None).unwrap();
+}

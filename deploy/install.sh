@@ -41,6 +41,8 @@ if [[ -d /etc/logrotate.d && -f "$HERE/logrotate.d/prompto-audit" ]]; then
 fi
 install -d -m 0755 /opt/prompto /opt/prompto/bin
 install -d -o root -g prompto -m 0750 /etc/prompto /etc/prompto/keys
+# Approvers' TOTP secret files (`prompto approver add`), service-user only.
+install -d -o prompto -g prompto -m 0700 /etc/prompto/approvers.d
 
 # Binary.
 install -m 0755 "$BIN" /opt/prompto/bin/prompto

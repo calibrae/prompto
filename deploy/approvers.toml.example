@@ -1,0 +1,15 @@
+# /etc/prompto/approvers.toml — humans who may approve calls whose policy
+# rule says approval = "human" (POST /v1/approve with their TOTP code).
+# Manage with `prompto approver add|list|revoke`; read at every approval,
+# so edits apply to the next one. Each approver has exactly one factor.
+
+# TOTP secret in vault KV v2, field totp_secret (prompto's token must read it).
+[approver.alice]
+totp_vault_path = "prompto/approvers/alice"
+created = "2026-10-10T12:00:00Z"
+
+# TOTP secret (base32) in a file readable only by the service user (0600).
+[approver.bob]
+totp_file = "/etc/prompto/approvers.d/bob.totp"
+created = "2026-10-10T12:00:00Z"
+disabled = true    # revoked: codes refused

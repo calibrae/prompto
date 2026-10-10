@@ -645,12 +645,11 @@ fn approval_required_message(
             "{head} A human must approve it: POST /v1/precheck with this exact call (it answers \
              `ask`), then POST /v1/approve with the approver's name and their current TOTP \
              code; retry with the returned ticket as the `ticket` argument (single-use, \
-             120 s). The prompto Claude Code plugin does this for you."
+             120 s)."
         ),
         _ => format!(
             "{head} POST /v1/precheck with this exact call returns a ticket; retry with it as \
-             the `ticket` argument (single-use, 120 s). The prompto Claude Code plugin does \
-             this for you."
+             the `ticket` argument (single-use, 120 s)."
         ),
     }
 }
