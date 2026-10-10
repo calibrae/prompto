@@ -796,11 +796,13 @@ fn check_kill_switches(kill: &KillSwitch) -> Result<()> {
 
 const KILL_USAGE: &str = "\
 Usage: prompto kill on [reason…]                stop every tool call (global)
-       prompto kill off                         lift the global kill
+       prompto kill off                         lift the global kill (the file's and
+                                                one set over HTTP)
        prompto kill agent <name> [reason…]      stop one agent's calls
        prompto kill host <name> [reason…]       stop every call to one host
        prompto kill session <id> [reason…]      stop one X-Prompto-Session
-       prompto unkill agent|host|session <name> lift a scoped kill
+       prompto unkill agent|host|session <name> lift a scoped kill (session: also
+                                                agents' own kills of it)
        prompto kill status                      list what is stopped (as root)
 
 The global switch is $PROMPTO_KILL_FILE (default /etc/prompto/kill); scoped
@@ -814,7 +816,13 @@ who, what, reason) in $PROMPTO_AUDIT_LOG; if that fails the switch still
 applies and a warning says so. A server that can't check a switch
 refuses to start, and refuses calls as `killed` if it can't later.
 Agent and session kills need PROMPTO_AUTH=optional or required: with off,
-calls carry no agent or session.";
+calls carry no agent or session.
+
+POST /v1/kill (the Claude Code plugin's /prompto kill) writes switches the
+server itself may write, in $PROMPTO_KILL_API_DIR (default
+/var/lib/prompto/kill.d): an agent's kill of its own session
+(session-<agent>.<session>) and, with an approver's TOTP code, the global
+one (global). Only this CLI lifts them.";
 
 /// Record who set or lifted a switch in the audit log. The switch is
 /// already applied: a record that can't be written is reported, never

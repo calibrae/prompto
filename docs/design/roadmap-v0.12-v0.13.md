@@ -167,6 +167,12 @@ A market survey found nothing that combines typed machine tools, per-agent ident
 - **S7.5 Commands:** `/prompto audit` (this session's calls, live pane), `/prompto kill` (session kill; global kill with confirmation), `/prompto whoami`.
 - **S7.6 Tests** with `claude plugin test`: allow / deny / ask flows against a stubbed `$.http`; fail-closed path.
 - **S7.7 Deployment:** a local marketplace dir and managed settings with `prependPlugins` (+ `sec-default@builtin`) on agent machines. Document `--safe-mode` / crash behaviour: no mod → no ticket → refused where required.
+- **Done (task 019, Claude Code 2.1.295).** Decisions (details in the README's *Claude Code plugin*):
+  - Session context: Claude Code's MCP connection runs its `headersHelper` once, before the hooks module loads, and gives it no session ID. A nested `claude` would inherit the parent's `CLAUDE_CODE_SESSION_ID`, and a mod can't force a reconnect or add headers. So by default the mod sends prompto calls itself over HTTP (`transport = "mod"`) with `X-Prompto-Session`, honouring Claude Code's permission verdict (`$.tool.check`; an `ask` goes to the person). `transport = "engine"` keeps the native connection (settings hooks, classifier), without a session.
+  - Precheck unreachable → **fail open**: sent without a ticket, prompto decides, and an `approval_required` refusal says why no ticket was requested. Nothing can be sent (no token, hook failed) → refused (`.catch`).
+  - The pane waits inside the `tool.call` hook: a hook's 10 s budget runs while it awaits its own promise and stops during a `$` call, so it polls with `$.process.run(["sleep", "0.25"])`. Up to 10 min, then refused.
+  - The TOTP code lives in one module variable from keystroke to `POST /v1/approve`; never `$.state`/`$.store`/logs/transcript. Code-shaped text in the name or reason field is refused. `Input` has no masking in this version.
+  - New prompto endpoints: `GET /v1/whoami`, `GET /v1/audit` (own records; host-gated by policy visibility), `POST /v1/kill` (own agent+session, or global with a TOTP code), written to `PROMPTO_KILL_API_DIR` because `/etc` is read-only to the service. Precheck says `root`.
 
 ### E8 — Per-call SSH certificates (v0.13.0)
 - **S8.1 Vault SSH engine (infra):** mount `ssh-client-signer`, role `prompto` (allowed users = inventory `ssh_user`s, max TTL 10 m, key-id template). Add `update` on `…/sign/prompto` to the `prompto-read` policy.

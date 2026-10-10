@@ -15,6 +15,14 @@ Precheck and signed tickets (roadmap E6): policy `approval = "ticket" | "human"`
 - **CLI:** `prompto approver add|list|revoke` (prints the `otpauth://` URI and a terminal QR code once; `--i-know`), `prompto ticket keygen`.
 - **Audit:** the ticket is removed from `args` and recorded as `ticket_sha256`; `approved_by` is filled in; new record types `precheck` and `approve`.
 
+### Claude Code plugin (roadmap E7)
+
+- **`claude-plugin/`**: a Claude Code plugin (mod) for prompto. It prechecks every prompto call with exactly the arguments it sends and attaches the ticket. For `approval = "human"` rules it opens an **approval pane**: host, tool, exact command, rule, a diff for `file_write` (read through prompto), the agent's recent calls there; approver name + TOTP code; Approve once / Approve N minutes (root only with an explicit toggle) / Deny with a reason. It sends `X-Prompto-Session` on every call (`transport = "mod"`, the default; `engine` keeps Claude Code's own connection, without a session). It adds `/prompto whoami|audit|kill [global]|approve` and a skill for agents. Enforcement stays prompto's. Tests: `claude plugin test claude-plugin`. See the README's *Claude Code plugin*; managed-settings example in `deploy/claude-managed-settings.example.json`.
+- **`GET /v1/whoami`**: the agent, its groups and the session prompto sees.
+- **`GET /v1/audit?host=&session=&limit=`**: the caller's own audit records; with `host`, only where policy grants the agent something; never for `anonymous` or with `PROMPTO_AUTH=off`.
+- **`POST /v1/kill`**: `scope: "session"` stops the caller's own calls in its own session; `scope: "global"` stops every call and needs an approver's TOTP code. Written to `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`); lifted only with `prompto kill off` / `prompto unkill session <id>`. Audited as `type: kill` with `by.agent`.
+- **`/v1/precheck`** answers also say `root` (whether the call is root-capable) on `allow` and `ask`.
+
 ### macOS and FreeBSD targets
 
 - **`file_list`** no longer drops entries whose mode carries an indicator (BSD `@` extended attributes, `+` ACL; GNU `+`, `.` SELinux): they come back with `xattrs` / `acl` / `security_context: true`. Device files are listed (`device: "major,minor"`, size 0), symlinks get `link_target`, names keep runs of spaces. A line that still can't be parsed is returned in `unparsed` (at most 20, with `unparsed_count`) instead of vanishing. A path that is a symlink to a directory lists the directory (macOS `/tmp`); on BSD/macOS a symlink to a file is listed as that file. New fields are left out when unset.
@@ -37,7 +45,8 @@ With neither ticket variable set, nothing is minted or accepted: `approval` rule
 2. Two new routes, `POST /v1/precheck` and `POST /v1/approve`, behind the same authentication as `/mcp` (unauthenticated with `PROMPTO_AUTH=off`, where they report every call as needing no approval).
 3. Audit records may carry `ticket_sha256` / `scope_minutes`, and `args.ticket` is never recorded.
 4. `serde_json`'s `float_roundtrip` is on: JSON numbers in arguments now always parse to the nearest double (needed for stable argument digests).
-5. `file_list` on a path that is a symlink to a directory lists the directory (it used to list the link alone); results may carry the new optional fields above, and exec-style results always carry `error_class`.
+5. Three more routes, `GET /v1/whoami`, `GET /v1/audit` and `POST /v1/kill`. Each call also `stat`s `PROMPTO_KILL_API_DIR` (default `/var/lib/prompto/kill.d`; absent = nothing set), which the startup probe checks like `kill.d`. `prompto kill off` and `unkill session` also lift what was set there. Kill records may carry `scope: "agent_session"` and an `agent`.
+6. `file_list` on a path that is a symlink to a directory lists the directory (it used to list the link alone); results may carry the new optional fields above, and exec-style results always carry `error_class`.
 6. **`ssh_sudo_exec` on `sudo -n` hosts**: a compound command now needs sudo to allow `sh` (`sudo -n -- sh -s`). A host whose sudoers allows only specific commands refuses it (`sudo: a password is required`, `remote_nonzero`) where the first part used to run as root and the rest as `ssh_user`. Plain-word commands are unchanged.
 7. **Approval secrets on `PROMPTO_VAULT_MOUNT`**: with `PROMPTO_PRIVATE_MOUNT` set to the same mount as `PROMPTO_VAULT_MOUNT`, approvals are now off whatever the path (it used to be only under `prompto/`, `infra/`, `nxp/`). The private mount is the only valid home. A `PROMPTO_AGENT_READABLE_VAULT_PREFIXES` that names prefixes on `PROMPTO_VAULT_MOUNT` still works (they are covered already); it can no longer narrow the shared mount.
 8. `interpreter_missing` replaces `remote_nonzero` for a missing interpreter, in results and the audit log.
