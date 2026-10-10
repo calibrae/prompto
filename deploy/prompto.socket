@@ -1,0 +1,23 @@
+# Optional: systemd socket activation for prompto (E11).
+#
+# systemd holds the listening socket, so it survives a plain
+# `systemctl restart prompto` or a crash: connections made meanwhile wait
+# in the kernel's queue instead of being refused, and the next process
+# serves them. A binary upgrade still uses the handover (SIGUSR2, see
+# prompto.service), which needs no restart at all.
+#
+# ListenStream replaces PROMPTO_BIND (prompto then ignores it).
+#   sudo install -m 0644 prompto.socket /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl stop prompto && sudo systemctl enable --now prompto.socket
+#   sudo systemctl start prompto
+[Unit]
+Description=prompto listening socket
+
+[Socket]
+ListenStream=127.0.0.1:6337
+Backlog=1024
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

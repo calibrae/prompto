@@ -112,7 +112,14 @@ pub fn needs_root_shell(cmd: &str) -> bool {
 /// command, so host-side logs can be joined with prompto's.
 pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
 
-/// Shell text exporting [`REQUEST_ID_ENV`], put in front of every remote
+/// Environment variable naming the call's session on the host: the login
+/// shell's `$$`, which sshd made a session leader. Set next to
+/// [`REQUEST_ID_ENV`] where prompto writes the command line (the export
+/// prefix, the vault sudo path), for the drain deadline's reaper
+/// (`crate::drain::reap_script`).
+pub const CALL_SID_ENV: &str = "PROMPTO_CALL_SID";
+
+/// Shell text exporting [`REQUEST_ID_ENV`] (and [`CALL_SID_ENV`]), put in front of every remote
 /// command on hosts whose [`RequestIdEnv`] is `export`. That is the
 /// default where the login shell is known to be POSIX-ish (sh, bash, zsh:
 /// Linux and macOS). Elsewhere the default is `setenv`: on
@@ -133,21 +140,25 @@ pub const REQUEST_ID_ENV: &str = "PROMPTO_REQUEST_ID";
 /// `rid` must be a ULID (Crockford base32): it is spliced in unquoted.
 pub fn request_id_export(mode: RequestIdEnv, rid: &str) -> Option<String> {
     match mode {
-        RequestIdEnv::Export => Some(format!("export {REQUEST_ID_ENV}={rid}; ")),
+        RequestIdEnv::Export => Some(format!("export {REQUEST_ID_ENV}={rid} {CALL_SID_ENV}=$$; ")),
         RequestIdEnv::Setenv | RequestIdEnv::Off => None,
     }
 }
 
-/// `cmd` run under `env PROMPTO_REQUEST_ID=<id>`, for the slot after the
-/// sudo guard's `exec "$@"` — the root side of the vault sudo path, where
-/// sudo has already reset the environment. Plain words, so the login
-/// shell (even csh) passes them through untouched. `cmd` unchanged on
-/// `off` hosts.
+/// `cmd` run under `env PROMPTO_REQUEST_ID=<id> PROMPTO_CALL_SID=$$`, for
+/// the slot after the sudo guard's `exec "$@"` — the root side of the
+/// vault sudo path, where sudo has already reset the environment. Plain
+/// words, so the login shell (even csh) passes them through, expanding
+/// only `$$` (its own PID: the call's session). `cmd` unchanged on `off`
+/// hosts.
 pub fn with_request_id(ctx: &CallCtx, host: &HostConfig, cmd: &str) -> String {
     match host.request_id_env() {
         RequestIdEnv::Off => cmd.to_string(),
         RequestIdEnv::Export | RequestIdEnv::Setenv => {
-            format!("env {REQUEST_ID_ENV}={} {cmd}", ctx.request_id())
+            format!(
+                "env {REQUEST_ID_ENV}={} {CALL_SID_ENV}=$$ {cmd}",
+                ctx.request_id()
+            )
         }
     }
 }
@@ -158,6 +169,8 @@ pub struct SshClient {
     pub default_timeout: Duration,
     pub connect_timeout: Duration,
     vault: Option<Arc<VaultClient>>,
+    /// In-flight remote commands, for the drain deadline (`crate::drain`).
+    drain: crate::drain::Drain,
 }
 
 impl SshClient {
@@ -167,7 +180,18 @@ impl SshClient {
             default_timeout,
             connect_timeout: Duration::from_secs(5),
             vault: None,
+            drain: Default::default(),
         }
+    }
+
+    /// Register remote commands with this server's drain.
+    pub fn with_drain(mut self, drain: crate::drain::Drain) -> Self {
+        self.drain = drain;
+        self
+    }
+
+    pub fn drain(&self) -> &crate::drain::Drain {
+        &self.drain
     }
 
     /// Enable vault-backed sudo for hosts that declare
@@ -202,20 +226,27 @@ impl SshClient {
                 let input = sudo_stdin_payload(&pw, cmd.as_bytes());
                 let remote = sudo_guarded(&with_request_id(ctx, host, "sh -s"));
                 return self
-                    .run(ctx, host, &remote, Some(&input), cmd_timeout)
+                    .run(ctx, host, &remote, Some(&input), cmd_timeout, true)
                     .await;
             }
             if needs_root_shell(cmd) {
                 let input = sudo_n_shell_payload(ctx, host, cmd);
                 return self
-                    .run(ctx, host, SUDO_N_SHELL, Some(&input), cmd_timeout)
+                    .run(ctx, host, SUDO_N_SHELL, Some(&input), cmd_timeout, true)
                     .await;
             }
             return self
-                .run(ctx, host, &format!("sudo -n -- {cmd}"), None, cmd_timeout)
+                .run(
+                    ctx,
+                    host,
+                    &format!("sudo -n -- {cmd}"),
+                    None,
+                    cmd_timeout,
+                    true,
+                )
                 .await;
         }
-        self.run(ctx, host, cmd, None, cmd_timeout).await
+        self.run(ctx, host, cmd, None, cmd_timeout, false).await
     }
 
     /// Run a remote command and feed `stdin_bytes` into its stdin. Used by
@@ -246,15 +277,15 @@ impl SshClient {
                 input.extend_from_slice(stdin_bytes);
                 let remote = sudo_guarded(&with_request_id(ctx, host, cmd));
                 return self
-                    .run(ctx, host, &remote, Some(&input), cmd_timeout)
+                    .run(ctx, host, &remote, Some(&input), cmd_timeout, true)
                     .await;
             }
             let remote = format!("sudo -n -- {cmd}");
             return self
-                .run(ctx, host, &remote, Some(stdin_bytes), cmd_timeout)
+                .run(ctx, host, &remote, Some(stdin_bytes), cmd_timeout, true)
                 .await;
         }
-        self.run(ctx, host, cmd, Some(stdin_bytes), cmd_timeout)
+        self.run(ctx, host, cmd, Some(stdin_bytes), cmd_timeout, false)
             .await
     }
 
@@ -294,6 +325,12 @@ impl SshClient {
     }
 
     /// The one place that spawns ssh.
+    ///
+    /// ssh runs in a process group of its own, killed whole if the call
+    /// is dropped before ssh exits (timeout, drain deadline, client gone),
+    /// so a `ProxyCommand` goes with it. The remote command is registered
+    /// with the drain (`crate::drain`) until then; `sudo` says whether it
+    /// runs as root, for the reaper.
     async fn run(
         &self,
         ctx: &CallCtx,
@@ -301,9 +338,11 @@ impl SshClient {
         remote: &str,
         stdin_bytes: Option<&[u8]>,
         cmd_timeout: Option<Duration>,
+        sudo: bool,
     ) -> Result<ExecOutput> {
         use tokio::io::AsyncWriteExt;
 
+        let _remote = self.drain.track(ctx, host, sudo)?;
         let mut command = Command::new(&self.ssh_bin);
         command
             .args(self.ssh_args(ctx, host, remote))
@@ -314,6 +353,7 @@ impl SshClient {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
 
         let dur = cmd_timeout.unwrap_or(self.default_timeout);
@@ -321,6 +361,7 @@ impl SshClient {
             .spawn()
             .context("spawn ssh")
             .class(ErrorClass::Internal)?;
+        let mut group = KillGroup(child.id());
 
         if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, child.stdin.take()) {
             if let Err(e) = stdin.write_all(bytes).await {
@@ -336,7 +377,18 @@ impl SshClient {
             drop(stdin);
         }
 
-        match timeout(dur, child.wait_with_output()).await {
+        let waited = timeout(dur, child.wait_with_output()).await;
+        if matches!(waited, Ok(Ok(_))) {
+            // ssh exited and was reaped: its PID may be reused.
+            group.0 = None;
+        }
+        // Past the drain deadline the reaper may have ended the remote
+        // side (`crate::drain`): what came back is not the command's own
+        // outcome.
+        if self.drain.past_deadline() {
+            return Err(crate::drain::aborted_error().into());
+        }
+        match waited {
             Ok(Ok(out)) => Ok(ExecOutput {
                 stdout: String::from_utf8_lossy(&out.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).to_string(),
@@ -389,6 +441,22 @@ impl SshClient {
             remote.into(),
         ]);
         args
+    }
+}
+
+/// SIGKILLs a process group on drop, unless disarmed (`None`). Only
+/// armed while the group's leader is unreaped (alive or a zombie), so its
+/// PID — the group ID — cannot have been reused.
+struct KillGroup(Option<u32>);
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.and_then(|p| libc::pid_t::try_from(p).ok()) {
+            // SAFETY: killpg has no memory-safety preconditions.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -570,7 +638,7 @@ mod tests {
     fn request_id_export_only_in_export_mode() {
         assert_eq!(
             request_id_export(RequestIdEnv::Export, "01ABC").as_deref(),
-            Some("export PROMPTO_REQUEST_ID=01ABC; ")
+            Some("export PROMPTO_REQUEST_ID=01ABC PROMPTO_CALL_SID=$$; ")
         );
         for m in [RequestIdEnv::Setenv, RequestIdEnv::Off] {
             assert_eq!(request_id_export(m, "01ABC"), None);
@@ -616,7 +684,7 @@ mod tests {
                 "{extra}: {args:?}"
             );
             let want = if export {
-                format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+                format!("export PROMPTO_REQUEST_ID={rid} PROMPTO_CALL_SID=$$; uptime")
             } else {
                 "uptime".to_string()
             };
@@ -635,7 +703,7 @@ mod tests {
         let (args, rid) = argv("platform = \"freebsd\"\nrequest_id_env = \"export\"");
         assert_eq!(
             args.last().unwrap(),
-            &format!("export PROMPTO_REQUEST_ID={rid}; uptime")
+            &format!("export PROMPTO_REQUEST_ID={rid} PROMPTO_CALL_SID=$$; uptime")
         );
     }
 

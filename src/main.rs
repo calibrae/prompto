@@ -9,6 +9,8 @@ use prompto::approval::{ApprovalConfig, Approvals};
 use prompto::audit::{self, Audit, AuditLog};
 use prompto::baselines::BASELINES;
 use prompto::caller;
+use prompto::drain::Drain;
+use prompto::handover::{self, Inherited};
 use prompto::inventory::InventoryStore;
 use prompto::kill::{KillSwitch, Scope as KillScope};
 use prompto::mcp::Prompto;
@@ -17,7 +19,7 @@ use prompto::server::{AllowedHosts, HttpParams, build_router};
 use prompto::ssh::SshClient;
 use prompto::vault::VaultClient;
 use rmcp::{ServiceExt, transport::stdio};
-use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1286,8 +1288,18 @@ fn run_gain_cli(cfg: &Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // First, while this is the only thread: a socket handed over by a
+    // predecessor or systemd (`prompto::handover`).
+    let inherited = Inherited::take();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run(inherited))
+}
+
+async fn run(inherited: Inherited) -> Result<()> {
     let cfg = Config::from_env();
     let raw_args: Vec<String> = std::env::args().collect();
 
@@ -1385,7 +1397,9 @@ async fn main() -> Result<()> {
         log_policy_lint(&live, &store.snapshot(), &agents.snapshot());
         Some(policy)
     };
-    let mut ssh_client = SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout);
+    let drain = Drain::default();
+    let mut ssh_client =
+        SshClient::new(cfg.ssh_bin.clone(), cfg.default_timeout).with_drain(drain.clone());
     let mut vault_client = None;
     let needs_vault: Vec<String> = store
         .snapshot()
@@ -1449,6 +1463,9 @@ async fn main() -> Result<()> {
     let audit = open_audit(&cfg, auth_mode)?;
 
     let ssh = Arc::new(ssh_client);
+    let ssh_for_reap = ssh.clone();
+    let reap_audit = audit.clone();
+    let reap_store = store.clone();
     let tracker = Arc::new(Tracker::new(
         cfg.usage_log.clone(),
         cfg.gain_enabled,
@@ -1487,16 +1504,30 @@ async fn main() -> Result<()> {
             .context("stdio serve")?;
         service.waiting().await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&cfg.bind)
-            .await
-            .with_context(|| format!("bind {}", cfg.bind))?;
+        let listener = match inherited.listener {
+            Some(Ok((l, source))) => {
+                let l = tokio::net::TcpListener::from_std(l).context("inherited socket")?;
+                tracing::info!(
+                    source = source.as_str(),
+                    "listening socket inherited (PROMPTO_BIND is not used)"
+                );
+                l
+            }
+            Some(Err(e)) => anyhow::bail!("inherited listening socket: {e}"),
+            None => tokio::net::TcpListener::bind(&cfg.bind)
+                .await
+                .with_context(|| format!("bind {}", cfg.bind))?,
+        };
         // The bound address, not `cfg.bind`: with port 0 it is the only
         // place the port shows up (the tests read it from here).
         let local = listener
             .local_addr()
             .map_or_else(|_| cfg.bind.clone(), |a| a.to_string());
         tracing::info!("transport: streamable-http on {local}");
+        // `cancel` cuts rmcp's streams off (last, after the drain);
+        // `stop` only stops accepting connections.
         let cancel = CancellationToken::new();
+        let stop = CancellationToken::new();
 
         // Peers allowed to speak for someone else via X-Real-IP /
         // X-Forwarded-For. Defaults to loopback because prompto binds
@@ -1574,20 +1605,255 @@ async fn main() -> Result<()> {
             cancel: cancel.clone(),
         });
 
-        let cancel_for_signal = cancel.clone();
+        let listen_fd = listener.as_raw_fd();
+        let stop_accepting = stop.clone();
+        let serve = prompto::server::serve(listener, app, stop_accepting);
+        // Cancelled once every connection is closed (after `stop`).
+        let served = CancellationToken::new();
+        let served_tx = served.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            cancel_for_signal.cancel();
+            if let Err(e) = serve.await {
+                tracing::error!(error = %e, "http serve");
+            }
+            served_tx.cancel();
         });
 
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+        let handover_ok = handover::refusal(
+            std::env::var("INVOCATION_ID").ok().as_deref(),
+            std::env::var("NOTIFY_SOCKET").ok().as_deref(),
         )
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await
-        .context("http serve")?;
+        .is_none();
+        match inherited.ready {
+            // A successor: the predecessor, still systemd's main process
+            // (the only one `NotifyAccess=main` hears), makes this one main.
+            Some(pipe) => {
+                handover::signal_ready(pipe);
+                tracing::info!(predecessor = ?inherited.predecessor, "handover: serving; the predecessor drains");
+            }
+            None => handover::notify(&format!(
+                "READY=1\nSTATUS=serving on {local}{}",
+                if handover_ok {
+                    "; SIGUSR2 = binary handover"
+                } else {
+                    ""
+                }
+            )),
+        }
+
+        let env_file = std::env::var_os(handover::ENV_FILE_ENV).map(PathBuf::from);
+        let env_at_start = env_file
+            .as_deref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| handover::parse_env_file(&t))
+            .unwrap_or_default();
+        let mut signals = Signals::new()?;
+        let handed_over = loop {
+            match signals.next().await {
+                Sig::Stop => break false,
+                Sig::Handover => {
+                    if let Some(why) = handover::refusal(
+                        std::env::var("INVOCATION_ID").ok().as_deref(),
+                        std::env::var("NOTIFY_SOCKET").ok().as_deref(),
+                    ) {
+                        tracing::error!("SIGUSR2: handover refused: {why}");
+                        continue;
+                    }
+                    let mut successor = match start_successor(
+                        &raw_args,
+                        listen_fd,
+                        env_file.as_deref(),
+                        &env_at_start,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "SIGUSR2: handover failed — still serving here"
+                            );
+                            continue;
+                        }
+                    };
+                    // This process accepts throughout; a stop meanwhile
+                    // abandons the successor and drains here.
+                    let proven = tokio::select! {
+                        r = successor.proven(handover::PROBATION) => r,
+                        () = signals.stop() => {
+                            tracing::warn!("stop signal during a handover: abandoning the successor");
+                            successor.abandon();
+                            break false;
+                        }
+                    };
+                    match proven {
+                        Ok(pid) => {
+                            successor.detach();
+                            handover::notify(&format!(
+                                "MAINPID={pid}\nSTATUS=serving on {local} (handed over from PID \
+                                 {}); SIGUSR2 = binary handover",
+                                std::process::id()
+                            ));
+                            tracing::info!("handover done: successor PID {pid} serves; draining");
+                            break true;
+                        }
+                        Err(e) => {
+                            successor.detach();
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "SIGUSR2: handover failed — still serving here"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        drain.begin(handed_over);
+        if !handed_over {
+            handover::notify("STOPPING=1");
+        }
+        stop.cancel();
+        let budget = prompto::drain::drain_secs_from_env();
+        tracing::info!(
+            calls_in_flight = drain.calls(),
+            drain_secs = budget.as_secs(),
+            handed_over,
+            "draining: no new connections; waiting for the calls in flight"
+        );
+        let finished = async {
+            if legacy_session_mode {
+                // Legacy sessions hold GET streams open until `cancel`:
+                // once no call is in flight, give the rest a moment.
+                tokio::select! {
+                    () = served.cancelled() => {}
+                    () = async {
+                        drain.idle().await;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } => {}
+                }
+            } else {
+                served.cancelled().await;
+            }
+            drain.idle().await;
+        };
+        let clean = tokio::select! {
+            () = finished => true,
+            () = tokio::time::sleep(budget) => false,
+            () = signals.stop() => {
+                tracing::warn!("second stop signal: cutting the drain short");
+                false
+            }
+        };
+        if clean {
+            tracing::info!("drained: every call finished");
+        } else {
+            // Reaped while their ssh connections are still up (the
+            // reaper tells the call's login shell by its sshd parent),
+            // then cut off.
+            let remote = drain.deadline();
+            tracing::warn!(
+                calls = drain.calls(),
+                remote_commands = remote.len(),
+                "drain deadline: reaping the remote side of the calls still running, then \
+                 aborting them"
+            );
+            let inv = reap_store.snapshot();
+            let mut reaps = tokio::task::JoinSet::new();
+            for r in remote {
+                let ssh = ssh_for_reap.clone();
+                let audit = reap_audit.clone();
+                let name = inv
+                    .hosts
+                    .iter()
+                    .find(|(_, h)| {
+                        h.ip == r.host.ip
+                            && h.ssh_port == r.host.ssh_port
+                            && h.ssh_user == r.host.ssh_user
+                    })
+                    .map(|(n, _)| n.clone());
+                reaps.spawn(async move {
+                    prompto::drain::reap(&ssh, &audit, &r, name.as_deref()).await
+                });
+            }
+            while reaps.join_next().await.is_some() {}
+            drain.abort();
+            // The aborted answers go out on their connections.
+            let _ = tokio::time::timeout(Duration::from_secs(10), served.cancelled()).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), served.cancelled()).await;
+        // A successor stopped while its predecessor still drains waits for
+        // it: systemd kills what is left of the unit once this exits.
+        if let Some(pid) = inherited.predecessor {
+            tokio::select! {
+                () = handover::predecessor_gone(pid) => {}
+                () = tokio::time::sleep(budget) => {}
+            }
+        }
+        tracing::info!("prompto stopped");
     }
 
     Ok(())
+}
+
+/// What the signal handlers asked for.
+enum Sig {
+    /// SIGTERM or SIGINT: drain and exit.
+    Stop,
+    /// SIGUSR2: hand the socket to a successor (`prompto::handover`).
+    Handover,
+}
+
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate()).context("SIGTERM handler")?,
+            int: signal(SignalKind::interrupt()).context("SIGINT handler")?,
+            usr2: signal(SignalKind::user_defined2()).context("SIGUSR2 handler")?,
+        })
+    }
+
+    async fn next(&mut self) -> Sig {
+        tokio::select! {
+            _ = self.term.recv() => Sig::Stop,
+            _ = self.int.recv() => Sig::Stop,
+            _ = self.usr2.recv() => Sig::Handover,
+        }
+    }
+
+    /// SIGTERM or SIGINT; a second one while draining.
+    async fn stop(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
+    }
+}
+
+/// Start the successor of a handover (`handover::Successor::proven` then
+/// says when it may take over).
+fn start_successor(
+    args: &[String],
+    listen_fd: std::os::fd::RawFd,
+    env_file: Option<&std::path::Path>,
+    env_at_start: &std::collections::BTreeMap<String, String>,
+) -> Result<handover::Successor> {
+    let exe = handover::successor_exe()?;
+    let (set, remove) = match env_file {
+        Some(f) => handover::successor_env(f, env_at_start)?,
+        None => Default::default(),
+    };
+    tracing::info!(
+        exe = %exe.display(),
+        env_file = ?env_file,
+        env_set = set.len(),
+        env_removed = ?remove,
+        "SIGUSR2: starting the successor"
+    );
+    handover::spawn_successor(&exe, &args[1..], listen_fd, &set, &remove)
 }

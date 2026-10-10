@@ -5,15 +5,45 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Continuity (E11) — see "Restarts and deploys" in the README.
+#  - notify: prompto says when it serves, and after a binary handover
+#    (SIGUSR2) which process is the service's main one. NotifyAccess=main:
+#    only that process may — never an ssh child.
+#  - reload = SIGHUP: inventory, agents, policy, ticket keys re-read.
+#  - upgrade with no gap, after replacing the binary:
+#      systemctl kill -s SIGUSR2 --kill-whom=main prompto
+#    the new binary takes over the listening socket (after a 5 s
+#    probation, both accepting) while the old process drains its calls in
+#    flight. A deploy tool, not a revocation one: agents.toml, policy.toml
+#    and kill switches apply in every running process on the next request.
+#  - stop/restart = SIGTERM to prompto alone (KillMode=mixed): it stops
+#    accepting, lets the calls in flight finish for up to
+#    PROMPTO_DRAIN_SECS (default 600), aborts and reaps the rest, exits.
+#    Its ssh children must NOT get the SIGTERM (KillMode=control-group
+#    would kill every running call at once); whatever is left when
+#    TimeoutStopSec expires gets SIGKILL.
+#  - a stop takes at most PROMPTO_DRAIN_SECS + ~40 s (remote reaps <= 25 s,
+#    aborted answers <= 10 s, close 2 s), so TimeoutStopSec must be at
+#    least PROMPTO_DRAIN_SECS + 60: raise both together.
+Type=notify
+NotifyAccess=main
 User=prompto
 Group=prompto
 ExecStart=/opt/prompto/bin/prompto
 ExecReload=/bin/kill -HUP $MAINPID
+# After a handover the main process is not systemd's child, and systemd
+# then sends its stop SIGTERM without waiting for the drain: ExecStop
+# sends it and waits until prompto (which first waits for a draining
+# predecessor) has exited.
+ExecStop=/bin/sh -c 'kill -TERM $$1 2>/dev/null; while kill -0 $$1 2>/dev/null; do sleep 0.2; done' prompto-stop $MAINPID
+KillMode=mixed
+TimeoutStopSec=660
 Restart=on-failure
 RestartSec=5
 
 EnvironmentFile=-/etc/prompto/env
+# Re-read by a handover's successor, so edits apply as on a restart.
+Environment=PROMPTO_ENV_FILE=/etc/prompto/env
 Environment=RUST_LOG=prompto=info
 
 # Hardening — prompto needs:

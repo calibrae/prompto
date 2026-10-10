@@ -1,0 +1,23 @@
+# Task 022: the load generator's twelve agents (group loadgen), appended to
+# the sandbox /etc/prompto/policy.toml. bash_exec on sbx-t1 needs a precheck
+# ticket; root on sbx-t1 (passwordless) and sbx-t2 (vault-held password);
+# nothing on sbx-bsd, whose ssh_sudo_exec is the deliberately refused call.
+[[rule]]
+id = "loadgen-ticket-t1"
+agents = ["group:loadgen"]
+hosts = ["sbx-t1"]
+tools = ["bash_exec"]
+approval = "ticket"
+
+[[rule]]
+id = "loadgen-exec"
+agents = ["group:loadgen"]
+hosts = ["sbx-t1", "sbx-t2"]
+tools = ["ssh_exec", "file_read", "file_write", "file_stat", "inventory_list"]
+
+[[rule]]
+id = "loadgen-root"
+agents = ["group:loadgen"]
+hosts = ["sbx-t1", "sbx-t2"]
+tools = ["ssh_sudo_exec"]
+sudo = true

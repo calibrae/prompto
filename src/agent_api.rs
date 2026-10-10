@@ -162,11 +162,12 @@ fn tail(path: &std::path::Path, max: u64) -> std::io::Result<(String, bool)> {
 }
 
 /// Is `rec` one of `agent`'s own records? Its calls, prechecks and
-/// approvals, and the kills it set over HTTP.
+/// approvals, the reaps of its calls cut off at a drain deadline, and
+/// the kills it set over HTTP.
 fn is_own(rec: &Value, agent: &str) -> bool {
     let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     match s(rec, "type").as_deref() {
-        Some("tool" | "precheck" | "approve") => s(rec, "agent").as_deref() == Some(agent),
+        Some("tool" | "precheck" | "approve" | "reap") => s(rec, "agent").as_deref() == Some(agent),
         Some("kill") => rec
             .get("by")
             .and_then(|b| s(b, "agent"))
